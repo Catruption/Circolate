@@ -17,6 +17,62 @@ use super::engine::{gains, Scheduled, VstNote};
 
 const TAIL_SECONDS: f64 = 0.05;
 
+use crate::sources::trackscript::ShimEvent;
+
+/// Expand Tempo shim events into `(absolute_row, bpm, ramp_rows)` tuples
+/// for `TempoMap`.  Each shim generates `count` steps; the ramp is 0
+/// because a step change is instant at its row.  A later shim for the
+/// same target overrides any earlier one from its start row onwards.
+fn tempo_shims_to_events(
+    shims: &[ShimEvent],
+    rows_per_measure: f64,
+) -> Vec<(f64, f64, f64)> {
+    // Turn each shim into (absolute_row, shim_ref), sorted.
+    let mut ordered: Vec<(f64, &ShimEvent)> = shims
+    .iter()
+    .filter(|s| s.target == "Tempo")
+    .map(|s| (s.line as f64 * rows_per_measure + s.row, s))
+    .collect();
+    ordered.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut out: Vec<(f64, f64, f64)> = Vec::new();
+
+    for (base_row, shim) in ordered {
+        // Later shim wins: drop any earlier events at or after this row.
+        out.retain(|(r, _, _)| *r < base_row);
+
+        // The shim's own start value is the tempo from here on.
+        out.push((base_row, shim.start_value, 0.0));
+
+        let count = shim.count.unwrap_or(1);
+        let interval = if shim.interval_rows > 0.0 {
+            shim.interval_rows
+        } else {
+            rows_per_measure  // defensive: no interval means "per measure"
+        };
+
+        let mut value = shim.start_value;
+        for i in 0..count {
+            let row = base_row + (i as f64 + 1.0) * interval;
+            match shim.op.as_str() {
+                "+" => value += shim.amount,
+                "-" => value -= shim.amount,
+                "*" => value *= shim.amount,
+                "±" => {
+                    // Triangle: alternate down/up around start_value.
+                    let dir = if i % 2 == 0 { -1.0 } else { 1.0 };
+                    value = shim.start_value + dir * shim.amount;
+                }
+                _ => {}
+            }
+            out.push((row, value, 0.0));
+        }
+    }
+
+    out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    out
+}
+
 // ── samples.json ───────────────────────────────────────────────────────
 
 #[derive(Deserialize, Debug)]
@@ -703,7 +759,20 @@ pub(crate) fn load_project(
 
     let sr = sample_rate as f64;
     let rows_per_measure = cfg.time_signature.0 as f64 * cfg.subdivisions.max(1) as f64;
-    let tempo = TempoMap::new(cfg.bpm, &parsed.tempo_events, cfg.subdivisions);
+
+    // Tempo comes from two sources during the 1.10 → 1.11 migration:
+    //   * the legacy `Tempo { ... }` section (still emitted by the IT converter)
+    //   * `@<..., ƒTempo>` shim events on BlockList lines
+    // Both expand into the same (row, bpm, ramp_rows) shape.
+    let mut tempo_events = parsed.tempo_events.clone();
+    let shim_tempo = tempo_shims_to_events(&parsed.shims, rows_per_measure);
+    if !shim_tempo.is_empty() {
+        println!("  tempo shims: {} event(s)", shim_tempo.len());
+        tempo_events.extend(shim_tempo);
+        tempo_events.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
+    let tempo = TempoMap::new(cfg.bpm, &tempo_events, cfg.subdivisions);
     let total_rows = parsed.block_list.len() as f64 * rows_per_measure;
     tempo.prepare(total_rows);
     let render_end_sec = tempo.time_at_row(total_rows) + TAIL_SECONDS;

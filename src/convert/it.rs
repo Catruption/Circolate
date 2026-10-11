@@ -33,7 +33,7 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Path};
 
 use super::{AuxFile, ConvertOptions, Converted, PitchMode, SampleOut};
 use crate::sources::it::{ITEnvelope, Instrument, Module, NoteTermination, PatternEvent};
@@ -41,6 +41,10 @@ use crate::sources::it::{ITEnvelope, Instrument, Module, NoteTermination, Patter
 const ROWS_PER_BEAT: u32 = 4;
 const RPB: f64 = ROWS_PER_BEAT as f64;
 const MEASURE_ROWS: f64 = RPB * 4.0;
+
+/// Re-split measures into shared pair parts + remainders (smaller output,
+/// but two columns per sample on the same line).
+const FACTOR_REPEATED_PAIRS: bool = false;
 const C5_HZ: f64 = 523.2511306;
 const NOTE_NAMES: [&str; 12] = [
     "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
@@ -200,10 +204,10 @@ fn read_cell(c: &Option<PatternEvent>) -> Option<Cell> {
     let p = c.as_ref()?;
     Some(Cell {
         note: p.note,
-        inst: p.instrument,
-        volc: p.volume,
-        cmd: p.command.unwrap_or(0),
-        par: p.parameter,
+         inst: p.instrument,
+         volc: p.volume,
+         cmd: p.command.unwrap_or(0),
+         par: p.parameter,
     })
 }
 
@@ -405,7 +409,7 @@ struct ExecutedRow {
 /// (time, duration, target) in row units, in time order.
 fn lane_eval<I>(initial: f64, start: f64, events: I, t: f64) -> f64
 where
-    I: Iterator<Item = (f64, f64, f64)>,
+I: Iterator<Item = (f64, f64, f64)>,
 {
     let mut segment_start = start;
     let mut segment_end = start;
@@ -442,12 +446,12 @@ where
 impl<'a> Converter<'a> {
     fn new(m: &'a Module, pitch_mode: PitchMode) -> Self {
         let ch = (0..64)
-            .map(|i| {
-                let pan = m.chnpan.get(i).copied().unwrap_or(32);
-                let vol = m.chnvol.get(i).copied().unwrap_or(64);
-                ChannelState::new(pan, vol)
-            })
-            .collect();
+        .map(|i| {
+            let pan = m.chnpan.get(i).copied().unwrap_or(32);
+            let vol = m.chnvol.get(i).copied().unwrap_or(64);
+            ChannelState::new(pan, vol)
+        })
+        .collect();
 
         Converter {
             m,
@@ -559,11 +563,11 @@ impl<'a> Converter<'a> {
             initial,
             voice.start,
             voice
-                .points
-                .iter()
-                .filter(|p| p.1 == prop)
-                .map(|&(et, _, target, dur)| (et, dur, target)),
-            t,
+            .points
+            .iter()
+            .filter(|p| p.1 == prop)
+            .map(|&(et, _, target, dur)| (et, dur, target)),
+                  t,
         )
     }
 
@@ -574,7 +578,7 @@ impl<'a> Converter<'a> {
             // later event must never stretch it.
             v.end = Some(match v.end {
                 Some(e) => e.min(t),
-                None => t,
+                         None => t,
             });
         }
     }
@@ -864,7 +868,7 @@ impl<'a> Converter<'a> {
         };
 
         let toneporta =
-            matches!(c, Some('G') | Some('L')) || matches!(vcol, Some(("G", _)));
+        matches!(c, Some('G') | Some('L')) || matches!(vcol, Some(("G", _)));
 
         let mut is_note = matches!(note, Some(n) if n < 120);
 
@@ -950,7 +954,7 @@ impl<'a> Converter<'a> {
 
                 self.ch[ch].target = Some(match mapped {
                     Some(mp) => mp.2 as f64,
-                    None => note_v as f64,
+                                          None => note_v as f64,
                 });
 
                 // An instrument number next to a tone-portamento note does
@@ -1032,11 +1036,11 @@ impl<'a> Converter<'a> {
             st.vib_on = false;
 
             st.gscale = (smp.gvl as f64 / 64.0)
-                * if m.use_instruments {
-                    gbv as f64 / 128.0
-                } else {
-                    1.0
-                };
+            * if m.use_instruments {
+                gbv as f64 / 128.0
+            } else {
+                1.0
+            };
         }
 
         // --------------------------------------------------------------
@@ -1269,10 +1273,10 @@ impl<'a> Converter<'a> {
                     || oi == vi
                     || old.start >= t
                     || old.end.map_or(false, |e| e <= t)
-                {
-                    continue;
-                }
-                let current = Self::value_at(old, "vol", t);
+                    {
+                        continue;
+                    }
+                    let current = Self::value_at(old, "vol", t);
                 self.point(oi, t, "vol", current * start_ratio, 0.0);
                 if end_ratio != start_ratio {
                     self.point(oi, t, "vol", current * end_ratio, ramp_dur);
@@ -1354,7 +1358,7 @@ impl<'a> Converter<'a> {
         }
 
         let is_vib_cmd = matches!(c, Some('H') | Some('K') | Some('U'))
-            || matches!(vcol, Some(("H", _)));
+        || matches!(vcol, Some(("H", _)));
 
         if (base_end - base).abs() > 1e-6 && !is_vib_cmd {
             if !stair.is_empty() {
@@ -1398,8 +1402,8 @@ impl<'a> Converter<'a> {
             // libopenmpt/IT: vibrato delta is (sine * depth*4) >> 7, or >> 6
             // with "old effects" -- i.e. old effects are twice as deep.
             let peak = self.ch[ch].vib_dep
-                * VIB_PEAK_PER_DEPTH
-                * if m.old_effects { 1.0 } else { 0.5 };
+            * VIB_PEAK_PER_DEPTH
+            * if m.old_effects { 1.0 } else { 0.5 };
 
             let step = self.ch[ch].vib_spd as f64 * 4.0;
             let mut pos = self.ch[ch].vib_pos;
@@ -1423,7 +1427,7 @@ impl<'a> Converter<'a> {
                         tau,
                         "pitch",
                         hz(base_end + off),
-                        (64.0 / step) / speed as f64,
+                               (64.0 / step) / speed as f64,
                     );
 
                     k += 1;
@@ -1461,7 +1465,7 @@ impl<'a> Converter<'a> {
             ));
         } else {
             self.comments
-                .push((t, format!("Z{:02X}: MIDI macro {:X}", p, p - 0x80)));
+            .push((t, format!("Z{:02X}: MIDI macro {:X}", p, p - 0x80)));
         }
 
         self.note_warn("Z filter/MIDI macros written as comments only");
@@ -1516,10 +1520,10 @@ impl<'a> Converter<'a> {
         let voice = &mut self.voices[vi];
 
         let mut points: Vec<(f64, f64)> = envelope
-            .points
-            .iter()
-            .map(|&(tick, value)| (tick as f64, value as f64))
-            .collect();
+        .points
+        .iter()
+        .map(|&(tick, value)| (tick as f64, value as f64))
+        .collect();
         points.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         let vspeed = voice.speed.max(1) as f64;
@@ -1542,11 +1546,11 @@ impl<'a> Converter<'a> {
 
         // (time, duration, value) of the voice's volume lane.
         let volume_events: Vec<(f64, f64, f64)> = voice
-            .points
-            .iter()
-            .filter(|p| p.1 == "vol")
-            .map(|&(time, _, value, duration)| (time, duration, value))
-            .collect();
+        .points
+        .iter()
+        .filter(|p| p.1 == "vol")
+        .map(|&(time, _, value, duration)| (time, duration, value))
+        .collect();
 
         let vstart = voice.start;
 
@@ -1599,11 +1603,11 @@ impl<'a> Converter<'a> {
         let ordered = sort_dedup(sampled);
 
         let mut volume_points: Vec<(f64, &'static str, f64, f64)> = voice
-            .points
-            .iter()
-            .filter(|p| p.1 != "vol")
-            .copied()
-            .collect();
+        .points
+        .iter()
+        .filter(|p| p.1 != "vol")
+        .copied()
+        .collect();
 
         for w in ordered.windows(2) {
             let (left, right) = (w[0], w[1]);
@@ -1679,7 +1683,7 @@ impl<'a> Converter<'a> {
         let ordered = sort_dedup(sampled);
 
         let mut new_points: Vec<(f64, &'static str, f64, f64)> =
-            voice.points.iter().filter(|p| p.1 != "vol").copied().collect();
+        voice.points.iter().filter(|p| p.1 != "vol").copied().collect();
         for w in ordered.windows(2) {
             let (left, right) = (w[0], w[1]);
             let epsilon = 1e-6f64.min((right - left) / 4.0);
@@ -1696,7 +1700,7 @@ impl<'a> Converter<'a> {
 
         for prop in ["vol", "pan", "pitch"] {
             let pts: Vec<(f64, &'static str, f64, f64)> =
-                v.points.iter().filter(|p| p.1 == prop).copied().collect();
+            v.points.iter().filter(|p| p.1 == prop).copied().collect();
 
             let mut i = 0;
 
@@ -1708,10 +1712,10 @@ impl<'a> Converter<'a> {
                         && pts[j + 1].3 == 0.0
                         && (pts[j + 1].0 - pts[j].0 - 1.0).abs() < 1e-6
                         && (j + 1 == i + 1
-                            || ((pts[j + 1].2 - pts[j].2) - (pts[i + 1].2 - pts[i].2)).abs() < 1e-6)
-                    {
-                        j += 1;
-                    }
+                        || ((pts[j + 1].2 - pts[j].2) - (pts[i + 1].2 - pts[i].2)).abs() < 1e-6)
+                        {
+                            j += 1;
+                        }
                 }
 
                 if j - i >= 2 {
@@ -1728,8 +1732,8 @@ impl<'a> Converter<'a> {
         // Stable, like Python's sort on (row, property).
         out.sort_by(|a, b| {
             a.0.partial_cmp(&b.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.1.cmp(b.1))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.cmp(b.1))
         });
 
         v.points = out;
@@ -1850,9 +1854,9 @@ fn build_safe_spans(total_rows: f64) -> Vec<(f64, f64)> {
     let total = total_rows as usize;
     let step = MEASURE_ROWS as usize;
     (0..total)
-        .step_by(step)
-        .map(|s| (s as f64, (s as f64 + MEASURE_ROWS).min(total_rows)))
-        .collect()
+    .step_by(step)
+    .map(|s| (s as f64, (s as f64 + MEASURE_ROWS).min(total_rows)))
+    .collect()
 }
 
 struct PartDefinition {
@@ -1888,14 +1892,14 @@ impl<'a> Converter<'a> {
             voices.sort_by(|&a, &b| {
                 let (va, vb) = (&self.voices[a], &self.voices[b]);
                 va.start
-                    .partial_cmp(&vb.start)
+                .partial_cmp(&vb.start)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    va.end
+                    .unwrap_or(1e18)
+                    .partial_cmp(&vb.end.unwrap_or(1e18))
                     .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| {
-                        va.end
-                            .unwrap_or(1e18)
-                            .partial_cmp(&vb.end.unwrap_or(1e18))
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
+                })
             });
         }
 
@@ -1927,7 +1931,7 @@ impl<'a> Converter<'a> {
         let mut fields = vec![
             pos_str(v.start - local_start),
             format!("#{}", pitch_text(v.init["pitch"], mode)),
-            format!("~{}", fmt(dur_beats, 2)),
+                format!("~{}", fmt(dur_beats, 2)),
         ];
 
         if (v.init["vol"] - 100.0).abs() > 1e-9 {
@@ -1951,12 +1955,12 @@ impl<'a> Converter<'a> {
         for &(pt, prop, val, d) in &v.points {
             let key = (key3(pt), key3(d));
             groups
-                .entry(key)
-                .or_insert_with(|| {
-                    order.push(key);
-                    Vec::new()
-                })
-                .push((prop, val));
+            .entry(key)
+            .or_insert_with(|| {
+                order.push(key);
+                Vec::new()
+            })
+            .push((prop, val));
         }
 
         order.sort_by_key(|k| k.0); // stable
@@ -2071,10 +2075,10 @@ impl<'a> Converter<'a> {
             let groups = self.group_span_voices(start, end);
 
             let mut ordered: Vec<(u32, Vec<usize>)> = groups.into_iter().collect();
-            let min_start = |vs: &Vec<usize>| {
+            let _min_start = |vs: &Vec<usize>| {
                 vs.iter()
-                    .map(|&i| self.voices[i].start)
-                    .fold(f64::INFINITY, f64::min)
+                .map(|&i| self.voices[i].start)
+                .fold(f64::INFINITY, f64::min)
             };
             ordered.sort_by(|a, b| {
                 let ra = first_start.get(&a.0).copied().unwrap_or(f64::INFINITY);
@@ -2091,9 +2095,9 @@ impl<'a> Converter<'a> {
                 // Channel number is deliberately excluded.
                 let rendered = self.render_part(&voices, start, sample_files);
                 let last_end = voices
-                    .iter()
-                    .map(|&i| self.voices[i].end.unwrap_or(0.0) - start)
-                    .fold(0.0f64, f64::max);
+                .iter()
+                .map(|&i| self.voices[i].end.unwrap_or(0.0) - start)
+                .fold(0.0f64, f64::max);
                 let sig = (
                     vec![sample_index],
                     rendered,
@@ -2112,7 +2116,7 @@ impl<'a> Converter<'a> {
                         end,
                         sample_index,
                         name: String::new(),
-                        rendered,
+                               rendered,
                     });
                     part_by_signature.insert(sig, parts.len() - 1);
                     parts.len() - 1
@@ -2126,8 +2130,15 @@ impl<'a> Converter<'a> {
             placements.push((span_parts, start, end));
         }
 
-        let (parts, placements) = factor_repeated_event_pairs(parts, placements);
-        merge_same_line_parts(parts, placements)
+        // Splitting one sample's measure into a shared "pair" part plus a
+        // per-measure remainder puts two parts of the same sample on one
+        // BlockList line, which then reads as a pattern with an extra
+        // pattern grafted on.  Off by default: one part per sample per measure.
+        if FACTOR_REPEATED_PAIRS {
+            let (parts, placements) = factor_repeated_event_pairs(parts, placements);
+            return merge_same_line_parts(parts, placements);
+        }
+        (parts, placements)
     }
 }
 
@@ -2161,13 +2172,10 @@ fn split_rendered_events(rendered: &str) -> Vec<String> {
     groups.into_iter().filter(|g| !g.is_empty()).collect()
 }
 
+/// Render a list of event groups as a single comma-joined line.
+/// The header and terminator come from `spec::part_definition`.
 fn render_event_groups(groups: &[String]) -> String {
-    let mut lines = vec!["@4/4[".to_string()];
-    if !groups.is_empty() {
-        lines.push(format!("    {}", groups.join(", ")));
-    }
-    lines.push("]".to_string());
-    lines.join("\n")
+    groups.join(", ")
 }
 
 /// Merge parts that share a sample_index AND appear on exactly the same
@@ -2317,23 +2325,23 @@ fn factor_repeated_event_pairs(
     type PairKey = (u32, String, String);
 
     let event_groups: Vec<Vec<String>> =
-        parts.iter().map(|p| split_rendered_events(&p.rendered)).collect();
+    parts.iter().map(|p| split_rendered_events(&p.rendered)).collect();
 
     let mut pair_owners: HashMap<PairKey, HashSet<usize>> = HashMap::new();
     for (pi, groups) in event_groups.iter().enumerate() {
         for i in 0..groups.len().saturating_sub(1) {
             pair_owners
-                .entry((parts[pi].sample_index, groups[i].clone(), groups[i + 1].clone()))
-                .or_default()
-                .insert(pi);
+            .entry((parts[pi].sample_index, groups[i].clone(), groups[i + 1].clone()))
+            .or_default()
+            .insert(pi);
         }
     }
 
     let reusable: HashSet<PairKey> = pair_owners
-        .into_iter()
-        .filter(|(_, owners)| owners.len() >= 2)
-        .map(|(k, _)| k)
-        .collect();
+    .into_iter()
+    .filter(|(_, owners)| owners.len() >= 2)
+    .map(|(k, _)| k)
+    .collect();
     if reusable.is_empty() {
         return (parts, placements);
     }
@@ -2361,18 +2369,18 @@ fn factor_repeated_event_pairs(
         let key: PairKey = (
             sample_index,
             groups[pair_index].clone(),
-            groups[pair_index + 1].clone(),
+                            groups[pair_index + 1].clone(),
         );
         let pair_idx = match pair_parts.get(&key) {
             Some(&i) => i,
             None => {
                 new_parts.push(PartDefinition {
                     voices: Vec::new(),
-                    start: part.start,
-                    end: part.end,
-                    sample_index,
-                    name: String::new(),
-                    rendered: render_event_groups(&[key.1.clone(), key.2.clone()]),
+                               start: part.start,
+                               end: part.end,
+                               sample_index,
+                               name: String::new(),
+                               rendered: render_event_groups(&[key.1.clone(), key.2.clone()]),
                 });
                 pair_parts.insert(key, new_parts.len() - 1);
                 new_parts.len() - 1
@@ -2390,7 +2398,7 @@ fn factor_repeated_event_pairs(
                 end: part.end,
                 sample_index,
                 name: String::new(),
-                rendered: render_event_groups(&remainder),
+                           rendered: render_event_groups(&remainder),
             });
             pieces.push(new_parts.len() - 1);
         }
@@ -2398,15 +2406,15 @@ fn factor_repeated_event_pairs(
     }
 
     let expanded = placements
-        .into_iter()
-        .map(|(ps, s, e)| {
-            (
-                ps.into_iter().flat_map(|p| replacement[p].clone()).collect(),
-                s,
-                e,
-            )
-        })
-        .collect();
+    .into_iter()
+    .map(|(ps, s, e)| {
+        (
+            ps.into_iter().flat_map(|p| replacement[p].clone()).collect(),
+         s,
+         e,
+        )
+    })
+    .collect();
 
     (new_parts, expanded)
 }
@@ -2495,41 +2503,32 @@ fn emit(
 
     let wps = tempo_lane(conv);
 
-    if !wps.is_empty() {
-        out.push("Tempo".into());
-        out.push("{".into());
+    // Tempo is emitted as shim events on the BlockList lines rather than
+    // a `Tempo { ... }` section.  Measure 0 always carries the initial
+    // tempo; each later BPM change lands on its own measure.
+    let mut tempo_by_measure: HashMap<usize, Vec<String>> = HashMap::new();
+    tempo_by_measure
+    .entry(0)
+    .or_default()
+    .push(crate::spec::tempo_shim("§1/1", &fmt(first_bpm, 2)));
 
-        let measure_count = ((conv.total_rows / MEASURE_ROWS).ceil() as usize).max(1);
+    for &(row, bpm, _ramp) in &wps {
+        let measure = (row / MEASURE_ROWS).floor() as usize;
+        let local = row - measure as f64 * MEASURE_ROWS;
 
-        let mut tempo_by_measure: HashMap<usize, Vec<String>> = HashMap::new();
+        // Skip a redundant change at the very start of the song; the
+        // initial shim already covers it.
+        if measure == 0 && local < 1e-9 {
+            continue;
+        }
 
         tempo_by_measure
-            .entry(0)
-            .or_default()
-            .push(format!("<§1/1,#{}>", fmt(first_bpm, 2)));
-
-        for &(row, bpm, d) in &wps {
-            let measure = (row / MEASURE_ROWS).floor() as usize;
-            let local = row - measure as f64 * MEASURE_ROWS;
-
-            let mut ev = format!("&<{},#{}", pos_str(local), fmt(bpm, 2));
-            if d != 0.0 {
-                ev.push_str(&format!(",~{}", fmt(d / RPB, 2)));
-            }
-            ev.push('>');
-            tempo_by_measure.entry(measure).or_default().push(ev);
-        }
-
-        for measure in 0..measure_count {
-            let line = tempo_by_measure
-                .get(&measure)
-                .map(|v| v.join(" "))
-                .unwrap_or_default();
-            out.push(format!("    {}", line));
-        }
-
-        out.push("}".into());
-        out.push(String::new());
+        .entry(measure)
+        .or_default()
+        .push(crate::spec::tempo_shim(
+            &pos_str(local),
+                                      &fmt(bpm, 2),
+        ));
     }
 
     // ------------------------------------------------------------------
@@ -2539,17 +2538,26 @@ fn emit(
     out.push("BlockList()".into());
     out.push("{".into());
 
-    for (measure_parts, _start, _end) in &placements {
+    for (measure, (measure_parts, _start, _end)) in placements.iter().enumerate() {
         let calls: Vec<String> = measure_parts
-            .iter()
-            .map(|&pi| format!("ƒ{};", parts[pi].name))
-            .collect();
+        .iter()
+        .map(|&pi| crate::spec::call(&parts[pi].name, ""))
+        .collect();
 
-        if calls.is_empty() {
-            out.push("    ;".into());
+        let mut line = if calls.is_empty() {
+            ";".to_string()
         } else {
-            out.push(format!("    {}", calls.join(" ")));
+            calls.join(" ")
+        };
+
+        if let Some(shims) = tempo_by_measure.get(&measure) {
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(&shims.join(" "));
         }
+
+        out.push(format!("    {}", line));
     }
 
     out.push("}".into());
@@ -2562,22 +2570,20 @@ fn emit(
     out.push("BlockArray()".into());
     out.push("{".into());
 
-    // Pattern definitions are direct BlockList targets. Each generated
-    // pattern contains one measure; repeated material is repeated in the list.
     for part in &parts {
         let file = sample_files
-            .get(&part.sample_index)
-            .map(String::as_str)
-            .unwrap_or("");
+        .get(&part.sample_index)
+        .map(String::as_str)
+        .unwrap_or("");
 
-        out.push(format!("    {} = ƒ'{}'():", part.name, file));
-        out.push("    {".into());
-
-        for line in part.rendered.lines() {
-            out.push(format!("        {}", line));
-        }
-
-        out.push("    }".into());
+        let args = crate::spec::source_arg(file, None);
+        out.push("    ".to_string() + &crate::spec::part_definition(
+            &part.name,
+            &args,
+            4,
+            4,
+            &part.rendered,
+        ));
         out.push(String::new());
     }
 
@@ -2598,7 +2604,7 @@ fn emit(
     out.push("//".into());
     out.push(
         "// The generated structure is based on reusable musical parts rather than IT channels."
-            .into(),
+        .into(),
     );
 
     if !wps.is_empty() {
@@ -2649,7 +2655,7 @@ fn make_report(
     conv: &mut Converter,
     source_name: &str,
     runs: &[(f64, f64, f64)],
-    sample_files: &HashMap<u32, String>,
+               sample_files: &HashMap<u32, String>,
 ) -> String {
     let m = conv.m;
 
@@ -2667,31 +2673,31 @@ fn make_report(
     r.push(format!(
         "orders: {}   patterns: {}   rows played: {}",
         m.orders.len(),
-        m.patterns.len(),
-        conv.total_rows
+                   m.patterns.len(),
+                   conv.total_rows
     ));
     r.push(format!(
         "instruments: {}   samples: {}",
         m.instruments.len(),
-        m.samples.len()
+                   m.samples.len()
     ));
 
     let shown: Vec<String> = runs
-        .iter()
-        .take(8)
-        .map(|x| format!("{} BPM", fmt(x.2, 2)))
-        .collect();
+    .iter()
+    .take(8)
+    .map(|x| format!("{} BPM", fmt(x.2, 2)))
+    .collect();
     r.push(format!(
         "timing sections: {} ({}{})",
-        runs.len(),
-        shown.join(", "),
-        if runs.len() > 8 { " ..." } else { "" }
+                   runs.len(),
+                   shown.join(", "),
+                   if runs.len() > 8 { " ..." } else { "" }
     ));
 
     r.push(format!(
         "notes converted: {}   waypoints: {}",
         conv.voices.len(),
-        conv.voices.iter().map(|v| v.points.len()).sum::<usize>()
+                   conv.voices.iter().map(|v| v.points.len()).sum::<usize>()
     ));
 
     r.push(String::new());
@@ -2716,10 +2722,10 @@ fn make_report(
     warns.sort_by(|a, b| b.1.cmp(&a.1));
     for (k, n) in &warns {
         let extra = conv
-            .warn_detail
-            .get(k)
-            .map(|d| format!("  -- {}", d))
-            .unwrap_or_default();
+        .warn_detail
+        .get(k)
+        .map(|d| format!("  -- {}", d))
+        .unwrap_or_default();
         r.push(format!("  {:5} x {}{}", n, k, extra));
     }
 
@@ -2727,31 +2733,31 @@ fn make_report(
 
     for (i, ins) in m.instruments.iter().enumerate() {
         let used: Vec<&str> = ["volume", "pan", "pitch"]
-            .into_iter()
-            .filter(|n| ins.envelopes.get(*n).map_or(false, |e| e.enabled))
-            .collect();
+        .into_iter()
+        .filter(|n| ins.envelopes.get(*n).map_or(false, |e| e.enabled))
+        .collect();
 
         if !used.is_empty() && ins.keymap.iter().any(|&(_, s)| s != 0) {
             let statuses: Vec<String> = used
-                .iter()
-                .map(|&name| {
-                    let envelope = &ins.envelopes[name];
-                    if name == "volume"
-                        && !envelope.points.is_empty()
-                        && !envelope.loop_enabled
-                        && !envelope.sustain_enabled
+            .iter()
+            .map(|&name| {
+                let envelope = &ins.envelopes[name];
+                if name == "volume"
+                    && !envelope.points.is_empty()
+                    && !envelope.loop_enabled
+                    && !envelope.sustain_enabled
                     {
                         "volume converted to approximate automation".to_string()
                     } else {
                         format!("{} playback not converted", name)
                     }
-                })
-                .collect();
+            })
+            .collect();
             envs.push(format!(
                 "  instrument {:02} {}: {}; source data retained in samples.json",
                 i + 1,
                 py_repr(&ins.name),
-                statuses.join("; ")
+                              statuses.join("; ")
             ));
         }
     }
@@ -2760,7 +2766,7 @@ fn make_report(
         r.push(String::new());
         r.push(
             "instrument envelope playback status (all source envelope data retained in samples.json):"
-                .into(),
+            .into(),
         );
         r.extend(envs);
     }
@@ -2776,18 +2782,18 @@ fn write_wav(s: &crate::sources::it::Sample) -> Vec<u8> {
     let (data, bits): (Vec<u8>, u16) = if s.is16 {
         (
             s.pcm
-                .iter()
-                .flat_map(|&x| (x.clamp(i16::MIN as i32, i16::MAX as i32) as i16).to_le_bytes())
-                .collect(),
-            16,
+            .iter()
+            .flat_map(|&x| (x.clamp(i16::MIN as i32, i16::MAX as i32) as i16).to_le_bytes())
+            .collect(),
+         16,
         )
     } else {
         (
             s.pcm
-                .iter()
-                .map(|&x| ((x + 128).clamp(0, 255)) as u8)
-                .collect(),
-            8,
+            .iter()
+            .map(|&x| ((x + 128).clamp(0, 255)) as u8)
+            .collect(),
+         8,
         )
     };
 
@@ -2830,10 +2836,10 @@ fn write_wav(s: &crate::sources::it::Sample) -> Vec<u8> {
         for v in [
             0u32,
             if s.pingpong { 1 } else { 0 },
-            s.loop_beg as u32,
-            (s.loop_end - 1) as u32,
-            0,
-            0,
+                s.loop_beg as u32,
+                (s.loop_end - 1) as u32,
+                0,
+                0,
         ] {
             smpl.extend_from_slice(&v.to_le_bytes());
         }
@@ -2872,11 +2878,11 @@ fn decoded_row_events(module: &Module) -> Vec<Value> {
                     "channel": ch,
                     "note_raw": c.note,
                     "note": note_name_from_it(c.note),
-                    "instrument": c.inst,
-                    "volume_column": c.volc,
-                    "effect": effect,
-                    "effect_raw": c.cmd,
-                    "parameter": c.par,
+                                  "instrument": c.inst,
+                                  "volume_column": c.volc,
+                                  "effect": effect,
+                                  "effect_raw": c.cmd,
+                                  "parameter": c.par,
                 }));
             }
             if !events.is_empty() {
@@ -2889,55 +2895,55 @@ fn decoded_row_events(module: &Module) -> Vec<Value> {
 
 fn voice_semantics(conv: &Converter) -> Vec<Value> {
     conv.voices
-        .iter()
-        .enumerate()
-        .map(|(i, v)| {
-            let pitch_hz = v.init.get("pitch").copied();
-            let pitch = pitch_hz
-                .filter(|&h| h > 0.0)
-                .map(|h| round_even(60.0 + 12.0 * (h / C5_HZ).log2()) as i64);
-            json!({
-                "voice": i,
-                "channel": v.ch,
-                "start_row": v.start,
-                "end_row": v.end,
-                "end_reason": if v.natural_rows.is_some() && v.end.is_some() { "natural_end" } else { "channel_end" },
-                "sample": v.sample,
-                "note": note_name_from_it(Some(v.note)),
-                "pitch": pitch,
-                "pitch_hz": pitch_hz,
-                "volume": v.init.get("vol"),
-                "pan": v.init.get("pan"),
-                "offset": v.offset,
-                "fade": v.fade.map(|(a, b)| vec![a, b]),
-                "waypoints": v.points.iter().map(|&(pt, prop, val, dur)| json!({
-                    "row": pt, "property": prop, "value": val, "duration": dur,
-                })).collect::<Vec<_>>(),
-            })
+    .iter()
+    .enumerate()
+    .map(|(i, v)| {
+        let pitch_hz = v.init.get("pitch").copied();
+        let pitch = pitch_hz
+        .filter(|&h| h > 0.0)
+        .map(|h| round_even(60.0 + 12.0 * (h / C5_HZ).log2()) as i64);
+        json!({
+            "voice": i,
+            "channel": v.ch,
+            "start_row": v.start,
+            "end_row": v.end,
+            "end_reason": if v.natural_rows.is_some() && v.end.is_some() { "natural_end" } else { "channel_end" },
+              "sample": v.sample,
+              "note": note_name_from_it(Some(v.note)),
+              "pitch": pitch,
+              "pitch_hz": pitch_hz,
+              "volume": v.init.get("vol"),
+              "pan": v.init.get("pan"),
+              "offset": v.offset,
+              "fade": v.fade.map(|(a, b)| vec![a, b]),
+              "waypoints": v.points.iter().map(|&(pt, prop, val, dur)| json!({
+                  "row": pt, "property": prop, "value": val, "duration": dur,
+              })).collect::<Vec<_>>(),
         })
-        .collect()
+    })
+    .collect()
 }
 
 fn channel_semantics(conv: &Converter) -> Vec<Value> {
     conv.ch
-        .iter()
-        .enumerate()
-        .map(|(i, st)| {
-            json!({
-                "channel": i,
-                "instrument": st.inst,
-                "volume": st.vol,
-                "channel_volume": st.chanvol,
-                "pan": st.pan,
-                "pitch": st.pitch,
-                "global_scale": st.gscale,
-                "sample_offset": st.mem_o,
-                "vibrato_speed": st.vib_spd,
-                "vibrato_depth": st.vib_dep,
-                "active_voice": st.voice,
-            })
+    .iter()
+    .enumerate()
+    .map(|(i, st)| {
+        json!({
+            "channel": i,
+            "instrument": st.inst,
+            "volume": st.vol,
+            "channel_volume": st.chanvol,
+            "pan": st.pan,
+            "pitch": st.pitch,
+            "global_scale": st.gscale,
+            "sample_offset": st.mem_o,
+            "vibrato_speed": st.vib_spd,
+            "vibrato_depth": st.vib_dep,
+            "active_voice": st.voice,
         })
-        .collect()
+    })
+    .collect()
 }
 
 fn build_semantics_json(
@@ -2946,11 +2952,11 @@ fn build_semantics_json(
     source_name: &str,
 ) -> Result<String> {
     let tempo_events: Vec<Value> = conv
-        .rowlog
-        .iter()
-        .filter(|r| r.1 == 0 && r.2 == 0 && r.3 == 0)
-        .map(|r| json!({ "row": r.0, "bpm": r.4 }))
-        .collect();
+    .rowlog
+    .iter()
+    .filter(|r| r.1 == 0 && r.2 == 0 && r.3 == 0)
+    .map(|r| json!({ "row": r.0, "bpm": r.4 }))
+    .collect();
 
     let data = json!({
         "format": "trackscript-semantics",
@@ -2958,53 +2964,53 @@ fn build_semantics_json(
         "source": source_name,
         "converter": "it2trackscript",
         "source_archive": format!("source/{}", source_name),
-        "module": {
-            "title": module.title,
-            "initial_speed": module.speed,
-            "initial_tempo": module.tempo,
-            "global_volume": module.gv,
-            "mix_volume": module.mv,
-            "stereo_separation": module.sep,
-            "pitch_wheel_depth": module.pwd,
-            "flags": module.flags,
-            "special_flags": module.special,
-            "linear_pitch": module.linear,
-            "old_effects": module.old_effects,
-            "orders_raw": module.orders,
-            "channel_pan_raw": module.chnpan,
-            "channel_volume_raw": module.chnvol,
-            "message": module.message,
-            "orders": module.orders.len(),
-            "patterns": module.patterns.len(),
-            "instruments": module.instruments.len(),
-            "samples": module.samples.len(),
-        },
-        "it_decode": {
-            "pattern_count": module.patterns.len(),
-            "instrument_count": module.instruments.len(),
-            "sample_count": module.samples.len(),
-            "rows_with_events": decoded_row_events(module),
-        },
-        "simulation": {
-            "total_rows": conv.total_rows,
-            "rows_per_beat": ROWS_PER_BEAT,
-            "rows_per_measure": ROWS_PER_BEAT * 4,
-            "initial_bpm": conv.bpm(),
-            "final_speed": conv.speed,
-            "final_tempo": conv.tempo,
-            "final_global_volume": conv.gvol,
-            "tempo_events": tempo_events,
-            "channels": channel_semantics(conv),
-            "executed_rows": conv.executed_rows,
-            "voices": voice_semantics(conv),
-        },
-        "effects": {
-            "seen": {},
-            "represented": {},
-            "approximated": {},
-            "dropped": {},
-        },
-        "warnings": conv.warn.iter().cloned().collect::<BTreeMap<String, u32>>(),
+                     "module": {
+                         "title": module.title,
+                         "initial_speed": module.speed,
+                         "initial_tempo": module.tempo,
+                         "global_volume": module.gv,
+                         "mix_volume": module.mv,
+                         "stereo_separation": module.sep,
+                         "pitch_wheel_depth": module.pwd,
+                         "flags": module.flags,
+                         "special_flags": module.special,
+                         "linear_pitch": module.linear,
+                         "old_effects": module.old_effects,
+                         "orders_raw": module.orders,
+                         "channel_pan_raw": module.chnpan,
+                         "channel_volume_raw": module.chnvol,
+                         "message": module.message,
+                         "orders": module.orders.len(),
+                     "patterns": module.patterns.len(),
+                     "instruments": module.instruments.len(),
+                     "samples": module.samples.len(),
+                     },
+                     "it_decode": {
+                         "pattern_count": module.patterns.len(),
+                     "instrument_count": module.instruments.len(),
+                     "sample_count": module.samples.len(),
+                     "rows_with_events": decoded_row_events(module),
+                     },
+                     "simulation": {
+                         "total_rows": conv.total_rows,
+                         "rows_per_beat": ROWS_PER_BEAT,
+                         "rows_per_measure": ROWS_PER_BEAT * 4,
+                         "initial_bpm": conv.bpm(),
+                     "final_speed": conv.speed,
+                     "final_tempo": conv.tempo,
+                     "final_global_volume": conv.gvol,
+                     "tempo_events": tempo_events,
+                     "channels": channel_semantics(conv),
+                     "executed_rows": conv.executed_rows,
+                     "voices": voice_semantics(conv),
+                     },
+                     "effects": {
+                         "seen": {},
+                         "represented": {},
+                         "approximated": {},
+                         "dropped": {},
+                     },
+                     "warnings": conv.warn.iter().cloned().collect::<BTreeMap<String, u32>>(),
     });
 
     Ok(serde_json::to_string_pretty(&data)?)
@@ -3036,13 +3042,13 @@ fn build_samples_json(
         if s.r#loop && s.loop_end > s.loop_beg {
             loops.insert(
                 "main".into(),
-                json!({ "start": s.loop_beg, "end": s.loop_end, "pingpong": s.pingpong }),
+                         json!({ "start": s.loop_beg, "end": s.loop_end, "pingpong": s.pingpong }),
             );
         }
         if s.sus_loop && s.sus_end > s.sus_beg {
             loops.insert(
                 "sustain".into(),
-                json!({ "start": s.sus_beg, "end": s.sus_end, "pingpong": false }),
+                         json!({ "start": s.sus_beg, "end": s.sus_end, "pingpong": false }),
             );
         }
         if !loops.is_empty() {
@@ -3051,35 +3057,35 @@ fn build_samples_json(
 
         entry.insert(
             "volume".into(),
-            json!({
-                "default": s.vol as u32 * 4,
-                "global": s.gvl,
-                "panning": (s.dfp & 0x7F) as u32 * 4,
-            }),
+                     json!({
+                         "default": s.vol as u32 * 4,
+                         "global": s.gvl,
+                         "panning": (s.dfp & 0x7F) as u32 * 4,
+                     }),
         );
         entry.insert(
             "source_it".into(),
-            json!({
-                "global_volume": s.gvl,
-                "default_volume": s.vol,
-                "flags": s.flg,
-                "conversion_flags": s.cvt,
-                "default_pan": s.dfp,
-                "length_frames": s.length,
-                "loop_start": s.loop_beg,
-                "loop_end": s.loop_end,
-                "c5_speed": s.c5,
-                "sustain_loop_start": s.sus_beg,
-                "sustain_loop_end": s.sus_end,
-                "has_data": s.has_data,
-                "is_16_bit": s.is16,
-                "stereo": s.stereo,
-                "compressed": s.compressed,
-                "loop": s.r#loop,
-                "pingpong_loop": s.pingpong,
-                "sustain_loop": s.sus_loop,
-                "pingpong_sustain": s.pingpong_sus,
-            }),
+                     json!({
+                         "global_volume": s.gvl,
+                         "default_volume": s.vol,
+                         "flags": s.flg,
+                         "conversion_flags": s.cvt,
+                         "default_pan": s.dfp,
+                         "length_frames": s.length,
+                         "loop_start": s.loop_beg,
+                         "loop_end": s.loop_end,
+                         "c5_speed": s.c5,
+                         "sustain_loop_start": s.sus_beg,
+                         "sustain_loop_end": s.sus_end,
+                         "has_data": s.has_data,
+                         "is_16_bit": s.is16,
+                         "stereo": s.stereo,
+                         "compressed": s.compressed,
+                         "loop": s.r#loop,
+                         "pingpong_loop": s.pingpong,
+                         "sustain_loop": s.sus_loop,
+                         "pingpong_sustain": s.pingpong_sus,
+                     }),
         );
         samples.push(Value::Object(entry));
     }
@@ -3092,18 +3098,18 @@ fn build_samples_json(
             if let Some(env) = ins.envelopes.get(name) {
                 envelopes.insert(
                     name.into(),
-                    json!({
-                        "enabled": env.enabled,
-                        "loop_enabled": env.loop_enabled,
-                        "sustain_enabled": env.sustain_enabled,
-                        "loop_start_index": env.loop_start,
-                        "loop_end_index": env.loop_end,
-                        "sustain_start_index": env.sustain_start,
-                        "sustain_end_index": env.sustain_end,
-                        "points": env.points.iter()
-                            .map(|&(tick, value)| json!({ "tick": tick, "value": value }))
-                            .collect::<Vec<_>>(),
-                    }),
+                                 json!({
+                                     "enabled": env.enabled,
+                                     "loop_enabled": env.loop_enabled,
+                                     "sustain_enabled": env.sustain_enabled,
+                                     "loop_start_index": env.loop_start,
+                                     "loop_end_index": env.loop_end,
+                                     "sustain_start_index": env.sustain_start,
+                                     "sustain_end_index": env.sustain_end,
+                                     "points": env.points.iter()
+                                     .map(|&(tick, value)| json!({ "tick": tick, "value": value }))
+                                     .collect::<Vec<_>>(),
+                                 }),
                 );
             }
         }
@@ -3117,9 +3123,9 @@ fn build_samples_json(
             "global_volume": ins.gbv,
             "default_pan": ins.dfp,
             "keymap": ins.keymap.iter()
-                .map(|&(note, sample)| json!({ "note": note, "sample": sample }))
-                .collect::<Vec<_>>(),
-            "envelopes": envelopes,
+            .map(|&(note, sample)| json!({ "note": note, "sample": sample }))
+            .collect::<Vec<_>>(),
+                               "envelopes": envelopes,
         }));
     }
 
@@ -3143,13 +3149,13 @@ pub(super) fn convert(
     opts: &ConvertOptions,
 ) -> Result<Converted> {
     let base = src_path
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "song".into());
+    .file_stem()
+    .map(|s| s.to_string_lossy().into_owned())
+    .unwrap_or_else(|| "song".into());
     let source_name = src_path
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| base.clone());
+    .file_name()
+    .map(|s| s.to_string_lossy().into_owned())
+    .unwrap_or_else(|| base.clone());
 
     // Samples: decode PCM into WAV bytes, in memory.
     let mut sample_files: HashMap<u32, String> = HashMap::new();
@@ -3185,12 +3191,12 @@ pub(super) fn convert(
         opts.with_message,
     );
     let runs = build_sections(&conv);
-    let report = make_report(&mut conv, &source_name, &runs, &sample_files);
-    let semantics = build_semantics_json(module, &conv, &source_name)?;
+    let _report = make_report(&mut conv, &source_name, &runs, &sample_files);
+    let _semantics = build_semantics_json(module, &conv, &source_name)?;
 
     // Byte-exact copy of the source, kept for unsupported/reserved data.
     let source_bytes = fs::read(src_path)
-        .with_context(|| format!("reading {}", src_path.display()))?;
+    .with_context(|| format!("reading {}", src_path.display()))?;
     let aux = vec![AuxFile {
         rel_path: format!("source/{}", source_name),
         bytes: source_bytes,
@@ -3198,10 +3204,8 @@ pub(super) fn convert(
 
     Ok(Converted {
         trackscript,
-        samples: sample_outs,
-        samples_json,
-        aux,
-        report,
-        semantics_json: Some(semantics),
+       samples: sample_outs,
+       samples_json,
+       aux,
     })
 }

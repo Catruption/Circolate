@@ -702,7 +702,8 @@ pub(super) fn convert(
             } else {
                 out.push_str("    ");
                 for &idx in row {
-                    out.push_str(&format!("ƒ{};", parts[idx].name));
+                    out.push_str(&crate::spec::call(&parts[idx].name, ""));
+                    out.push(' ');
                 }
                 out.push('\n');
             }
@@ -711,19 +712,20 @@ pub(super) fn convert(
 
         out.push_str("BlockArray()\n{\n");
         for part in &parts {
-            let source = match part.kind {
-                "sample" => format!("ƒ'{}'()", sample_files[&part.iid]),
-                "instrument" => format!("ƒ'{}'()", sidecar_path[&part.iid]),
+            let args = match part.kind {
+                "sample" => crate::spec::source_arg(&sample_files[&part.iid], None),
+                "instrument" => crate::spec::source_arg(&sidecar_path[&part.iid], None),
                 _ => unreachable!(),
             };
-            out.push_str(&format!("    {} = {}:\n", part.name, source));
-            out.push_str("    {\n");
-            for line in part.rendered.lines() {
-                out.push_str("        ");
-                out.push_str(line);
-                out.push('\n');
-            }
-            out.push_str("    }\n\n");
+            out.push_str("    ");
+            out.push_str(&crate::spec::part_definition(
+                &part.name,
+                &args,
+                4,
+                subs,
+                &part.rendered,
+            ));
+            out.push('\n');
         }
         out.push_str("}\n");
 
@@ -821,7 +823,5 @@ pub(super) fn convert(
             samples: sample_outs,
             samples_json,
             aux: aux_files,
-            report: String::new(),
-           semantics_json: None,
         })
 }

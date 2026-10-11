@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::convert::{fmt, identifier, note_name, pos_str};
 use crate::sources::flp::Channel;
+use crate::spec::PART_HEADER_SIGIL;
 
 use super::place::Placed;
 use super::{MAX_FULL_BEATS, PLAY_FULL_SAMPLE};
@@ -32,9 +33,6 @@ pub(super) struct NoteStyle {
     pub(super) bpm: f64,
     pub(super) vol_scale: f64,
     pub(super) pan_offset: f64,
-    /// Sample rate of the target file, in Hz.  Used to convert clip
-    /// offsets from milliseconds to sample frames.  0 means unknown;
-    /// in that case clip offsets are not emitted.
     pub(super) sample_rate: u32,
 }
 
@@ -87,9 +85,6 @@ fn render_part(
             let n = &p.note;
             let key = n.key as i32 + style.transpose;
             let mut dur_beats = (n.length as f64 / ppq as f64).max(0.05);
-            // Audio clips (clip_offset_ms is Some) are already cut to the clip
-            // length on the playlist; stretching them to the whole file would
-            // make them bleed past their end.
             if let (false, Some(secs), None) =
                 (PLAY_FULL_SAMPLE, style.full_secs, p.clip_offset_ms)
                 {
@@ -110,8 +105,6 @@ fn render_part(
                 if pan.abs() > 0.01 {
                     fields.push(format!("¶{}", fmt(pan, 2)));
                 }
-                // Audio clips carry a source offset so playback starts at the
-                // right point inside the file rather than always at sample 0.
                 if let Some(ms) = p.clip_offset_ms {
                     if ms > 0.0 && style.sample_rate > 0 && !source_path.is_empty() {
                         let samples =
@@ -125,7 +118,7 @@ fn render_part(
         }
     }
 
-    let mut out = format!("@4/{}[\n", subs);
+    let mut out = format!("{}4/{}[\n", PART_HEADER_SIGIL, subs);
     if !pieces.is_empty() {
         out.push_str("    ");
         out.push_str(&pieces.join(", "));

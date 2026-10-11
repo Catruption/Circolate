@@ -3,8 +3,8 @@
 //!
 //! One public entry point: `convert_file` takes any supported source and
 //! returns a `Converted` bundle.  Nothing touches the disk except reading
-//! the source.  `export` writes the bundle; `play` and `test` consume it
-//! in memory.
+//! the source.  Callers (`export`, `play`, `test`) write the bundle
+//! themselves.
 
 mod flp;
 mod it;
@@ -66,8 +66,6 @@ pub struct Converted {
     pub samples: Vec<SampleOut>,
     pub samples_json: String,
     pub aux: Vec<AuxFile>,
-    pub report: String,
-    pub semantics_json: Option<String>,
 }
 
 pub fn convert_file(src: &Path, opts: &ConvertOptions) -> Result<Converted> {
@@ -88,46 +86,9 @@ pub fn convert_file(src: &Path, opts: &ConvertOptions) -> Result<Converted> {
                 samples: Vec::new(),
                samples_json: String::new(),
                aux: Vec::new(),
-               report: String::new(),
-               semantics_json: None,
             })
         }
     }
-}
-
-pub fn export(src: &Path, out_dir: &Path, opts: &ConvertOptions) -> Result<PathBuf> {
-    let converted = convert_file(src, opts)?;
-    let stem = output_stem(src);
-    std::fs::create_dir_all(out_dir)?;
-
-    let ts_path = out_dir.join(format!("{stem}.trackscript"));
-    std::fs::write(&ts_path, &converted.trackscript)?;
-
-    for s in &converted.samples {
-        let p = out_dir.join(&s.rel_path);
-        if let Some(parent) = p.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&p, &s.wav)?;
-    }
-    for a in &converted.aux {
-        let p = out_dir.join(&a.rel_path);
-        if let Some(parent) = p.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&p, &a.bytes)?;
-    }
-    if !converted.samples_json.is_empty() {
-        std::fs::write(out_dir.join("samples.json"), &converted.samples_json)?;
-    }
-    if let Some(sem) = &converted.semantics_json {
-        std::fs::write(out_dir.join(format!("{stem}.semantics.json")), sem)?;
-    }
-    if !converted.report.is_empty() {
-        std::fs::write(out_dir.join("conversion_report.txt"), &converted.report)?;
-    }
-
-    Ok(ts_path)
 }
 
 pub fn output_stem(src: &Path) -> String {

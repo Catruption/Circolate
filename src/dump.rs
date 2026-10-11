@@ -1,8 +1,8 @@
 //! `trackscript-player dump` — print a source file's parsed structure.
 //!
 //! Prints the *source* IR, not the trackscript translation.  For `.flp` and
-//! `.it` this is the raw parse; a converted file's structure is not what
-//! this verb shows.
+//! `.it` this is the raw parse; for `.trackscript` it is the parsed
+//! structure as JSON.
 //!
 //! By default, also writes every plugin state blob to `<file>.states/`
 //! next to the source, so binary payloads (Zenology, Arcade, DirectWave,
@@ -78,10 +78,8 @@ pub fn run(argv: &[String]) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&module)?);
         }
         SourceKind::Trackscript => {
-            // For now: parse and print the AST as Debug.  A nicer JSON
-            // form will come once the IR carries `Serialize`.
             let parsed = crate::sources::trackscript::parse_file(path)?;
-            println!("{parsed:#?}");
+            println!("{}", serde_json::to_string_pretty(&parsed)?);
         }
     }
     Ok(())

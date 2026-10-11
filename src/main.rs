@@ -2,9 +2,10 @@
 //!
 //! One job: route argv to a subcommand.  Everything else lives in the
 //! subcommand modules.
+#![allow(dead_code)]
 
-mod convert;
 mod display;
+mod convert;
 mod dump;
 mod effects;
 mod export;
@@ -21,6 +22,7 @@ mod timing;
 mod tui;
 mod vst_host_ffi;
 mod vst_smoke;
+mod spec;
 
 use anyhow::{bail, Result};
 
