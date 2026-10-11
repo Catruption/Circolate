@@ -1,19 +1,5 @@
 // src/convert/flp.rs
 //! FLP → Trackscript converter.
-//!
-//! Sampler channels become sample-sourced blocks.  Native channels:
-//!   1. If the plugin state blob contains embedded audio (DirectWave and
-//!      friends), extract and treat as a sampler.
-//!   2. Else if a same-named `.sf2` sits next to the FLP, emit an
-//!      `.instrument` sidecar pointing at it.  The player loads the SF2
-//!      and picks the right sample per note (key + velocity ranges).
-//!   3. Else emit a `vst3` sidecar with the raw state blob.
-//!
-//! Submodules:
-//!   * `place`  — playlist + pattern → absolute-tick placements
-//!   * `render` — placements → `@beats/subs[...]` blocks
-//!   * `sf2`    — name matching for native → external `.sf2`
-//!   * `wav`    — WAV decoding and sample-path lookup
 
 mod place;
 mod render;
@@ -28,6 +14,8 @@ use super::{
     fmt, identifier, safe_name, AuxFile, ConvertOptions, Converted, SampleJsonEntry, SampleOut,
     SamplesJson,
 };
+use crate::fallbacks::FallbackTable;
+use crate::plugins::PluginIndex;
 use crate::sources::flp::{self as flp_src, Channel};
 use crate::sources::flp_audio;
 
@@ -45,8 +33,6 @@ const MIN_EMBEDDED_BYTES: usize = 512;
 const FL_C5_MIDI: i32 = 60;
 const FL_C5_KEY: u16 = 60;
 
-// ── helpers ────────────────────────────────────────────────────────────
-
 pub(super) fn debug_on() -> bool {
     std::env::var_os("FLP_DEBUG").is_some()
 }
@@ -60,47 +46,107 @@ pub(super) fn hex(b: &[u8]) -> String {
 
 // ── VST sidecar ────────────────────────────────────────────────────────
 
-fn vst_sidecar(base_name: &str, chan: &Channel) -> Result<Vec<AuxFile>> {
+/// What resolution ended up choosing for one channel.
+enum Resolved {
+    /// Exact plugin found installed.  Load original state.
+    Exact { name: String, path: PathBuf },
+    /// Fallback substituted.  Do not load original state.
+    Fallback { name: String, path: Option<PathBuf>, replaces: String },
+    /// Nothing found, no fallback.  Channel is dead.
+    Unresolved { name: String },
+}
+
+fn resolve_plugin(
+    plugin: &flp_src::Plugin,
+    index: &PluginIndex,
+    fallbacks: Option<&FallbackTable>,
+) -> Resolved {
+    let display = if !plugin.display_name.is_empty() {
+        plugin.display_name.clone()
+    } else {
+        plugin.internal_name.clone()
+    };
+
+    // (a) Exact match?
+    if let Some(path) = index.find_vst3(&display) {
+        return Resolved::Exact { name: display, path: path.clone() };
+    }
+
+    // (b) Configured fallback?
+    if let Some(table) = fallbacks {
+        if let Some((_m, target)) = table.resolve(&plugin.vst_path, &display) {
+            let target_path = index.find_vst3(&target.name).cloned();
+            return Resolved::Fallback {
+                name: target.name.clone(),
+                path: target_path,
+                replaces: display,
+            };
+        }
+    }
+
+    // (c) Nothing.
+    Resolved::Unresolved { name: display }
+}
+
+fn vst_sidecar(base_name: &str, chan: &Channel, resolved: &Resolved) -> Result<Vec<AuxFile>> {
     let plugin = chan.plugin.as_ref().expect("caller checked plugin presence");
 
-    let state_rel = format!("instruments/{}.state", base_name);
-    let inst_rel = format!("instruments/{}.instrument", base_name);
-
     let mut lines = vec![
-        format!("Instrument {}", base_name),
+        format!("Instrument {base_name}"),
             "{".to_string(),
             "    Kind: vst3;".to_string(),
     ];
+
+    match resolved {
+        Resolved::Exact { name, path } => {
+            lines.push(format!("    Plugin: '{}';", name));
+            lines.push(format!("    Path: '{}';", path.display()));
+            if !plugin.state.is_empty() {
+                lines.push(format!("    State: '{base_name}.state';"));
+            }
+        }
+        Resolved::Fallback { name, path, replaces } => {
+            lines.push(format!("    Plugin: '{}';", name));
+            if let Some(p) = path {
+                lines.push(format!("    Path: '{}';", p.display()));
+            } else {
+                lines.push("    Unresolved: true;".to_string());
+            }
+            lines.push(format!("    Replaces: '{}';", replaces));
+            lines.push("    Fallback: true;".to_string());
+        }
+        Resolved::Unresolved { name } => {
+            lines.push(format!("    Plugin: '{}';", name));
+            lines.push("    Unresolved: true;".to_string());
+        }
+    }
+
     if !plugin.internal_name.is_empty() {
-        lines.push(format!("    Plugin: '{}';", plugin.internal_name));
+        lines.push(format!("    OriginalPlugin: '{}';", plugin.internal_name));
     }
-    if !plugin.vst_path.is_empty() {
-        let normalized = plugin.vst_path.replace('\\', "/");
-        let vst_name = Path::new(&normalized)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("?");
-        lines.push(format!("    Path: '{}';", vst_name));
-    }
-    if !plugin.display_name.is_empty() {
-        lines.push(format!("    DisplayName: '{}';", plugin.display_name));
-    }
-    lines.push(format!("    State: '{}.state';", base_name));
     lines.push(format!("    SourceChannel: {};", chan.iid));
     lines.push("}".to_string());
 
     let inst_text = lines.join("\n") + "\n";
+    let inst_rel = format!("instruments/{base_name}.instrument");
 
-    Ok(vec![
-        AuxFile {
-            rel_path: state_rel,
-            bytes: plugin.state.clone(),
-        },
-       AuxFile {
-           rel_path: inst_rel,
-           bytes: inst_text.into_bytes(),
-       },
-    ])
+    let mut files = vec![AuxFile {
+        rel_path: inst_rel,
+        bytes: inst_text.into_bytes(),
+    }];
+
+    // Only write the raw state blob when we're loading the exact plugin
+    // it came from.  Zenology state fed to Surge XT corrupts the load.
+    if let Resolved::Exact { .. } = resolved {
+        if !plugin.state.is_empty() {
+            files.push(AuxFile {
+                rel_path: format!("instruments/{base_name}.state"),
+                       bytes: plugin.state.clone(),
+            });
+        }
+    }
+
+    Ok(files)
 }
 
 // ── main entry ─────────────────────────────────────────────────────────
@@ -126,6 +172,18 @@ pub(super) fn convert(
 
     let (placed, used_playlist, dropped_notes) = place_notes(prj);
 
+    // One scan, one fallback load, shared across every channel.
+    let plugin_index = PluginIndex::scan();
+    let fallback_table = match FallbackTable::load_default() {
+        Ok(t) => Some(t),
+        Err(e) => {
+            if debug_on() {
+                eprintln!("flp: no fallbacks.json ({e})");
+            }
+            None
+        }
+    };
+
     if debug_on() {
         eprintln!(
             "flp: ppq {} tempo {} playlist items {}",
@@ -147,15 +205,14 @@ pub(super) fn convert(
         }
     }
 
-    // Declared up here so the channel loop can populate them.
     let mut sidecar_path: HashMap<u16, String> = HashMap::new();
     let mut aux_files: Vec<AuxFile> = Vec::new();
 
     let mut usable_samples: Vec<(&Channel, PathBuf)> = Vec::new();
     let mut usable_embedded: Vec<(&Channel, EmbeddedSample)> = Vec::new();
     let mut usable_natives: Vec<&Channel> = Vec::new();
-    // Channels matched to an external .sf2 (sidecar already emitted).
     let mut usable_sf2: Vec<&Channel> = Vec::new();
+    let mut resolved_map: HashMap<u16, Resolved> = HashMap::new();
     let mut skipped: Vec<(&Channel, String)> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
@@ -205,6 +262,7 @@ pub(super) fn convert(
                 }
                 continue;
         }
+
         match chan.channel_type.as_str() {
             "sampler" | "instrument" => {
                 if chan.sample_path.is_empty() {
@@ -326,8 +384,7 @@ pub(super) fn convert(
                                            bytes,
                             });
 
-                            let inst_rel =
-                            format!("instruments/{}.instrument", base);
+                            let inst_rel = format!("instruments/{}.instrument", base);
                             let inst_text = format!(
                                 "Instrument {}\n{{\n    Kind: sf2;\n    File: '{}';\n    SourceChannel: {};\n}}\n",
                                 base, sf2_rel, chan.iid
@@ -348,13 +405,45 @@ pub(super) fn convert(
                     continue;
                 }
 
-                // 3. VST sidecar.
+                // 3. VST — resolve to installed plugin, fallback, or warn.
                 let has_state =
                 chan.plugin.as_ref().map_or(false, |p| !p.state.is_empty());
                 if !has_state {
                     skipped.push((chan, "native channel without saved state".into()));
                     continue;
                 }
+
+                let plugin = chan.plugin.as_ref().unwrap();
+                let resolved = resolve_plugin(plugin, &plugin_index, fallback_table.as_ref());
+
+                match &resolved {
+                    Resolved::Exact { name, path } => {
+                        warnings.push(format!(
+                            "[{:2}] {}: using installed plugin at {}",
+                            chan.iid,
+                            name,
+                            path.display()
+                        ));
+                    }
+                    Resolved::Fallback { name, path, replaces } => {
+                        let path_str = path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "<not found>".into());
+                        warnings.push(format!(
+                            "[{:2}] {}: not installed, falling back to {} ({})",
+                                              chan.iid, replaces, name, path_str
+                        ));
+                    }
+                    Resolved::Unresolved { name } => {
+                        warnings.push(format!(
+                            "[{:2}] {}: not installed and no fallback configured — channel will be silent",
+                            chan.iid, name
+                        ));
+                    }
+                }
+
+                resolved_map.insert(chan.iid, resolved);
                 usable_natives.push(chan);
             }
             other => {
@@ -499,7 +588,7 @@ pub(super) fn convert(
             });
         }
 
-        // VST sidecars (only for channels that fell through to usable_natives).
+        // VST sidecars for every usable native channel.
         {
             let mut used: HashMap<String, u32> = HashMap::new();
             for chan in &usable_natives {
@@ -517,7 +606,10 @@ pub(super) fn convert(
                 } else {
                     format!("{}{:02}", base, count)
                 };
-                let files = vst_sidecar(&sidecar_name, chan)?;
+                let resolved = resolved_map
+                .get(&chan.iid)
+                .expect("every usable native has a resolution");
+                let files = vst_sidecar(&sidecar_name, chan, resolved)?;
                 aux_files.extend(files);
                 sidecar_path.insert(
                     chan.iid,

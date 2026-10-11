@@ -1,3 +1,14 @@
+//! Fallback plugin mappings — read from `fallbacks.json` at the repo root.
+//!
+//! When the converter hits a channel whose plugin isn't installed, this
+//! table says what to substitute.  Lookup is by VST basename first, then
+//! by display name.
+//!
+//! Each mapping may also carry an `acquire` block describing how to fetch
+//! the fallback plugin if it's missing.  Two forms: a declarative
+//! `{ url, archive, extract_to }` for the common download-and-extract
+//! case, or a `{ script }` escape hatch for plugins that need real logic.
+
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -34,6 +45,44 @@ pub struct FallbackTarget {
     pub kind: String,
     #[serde(default)]
     pub path: String,
+    #[serde(default)]
+    pub acquire: Option<Acquire>,
+}
+
+/// How to fetch a missing fallback plugin.
+///
+/// Tagged as `untagged` so the JSON can be either form without an
+/// explicit discriminator.  Serde tries variants in declaration order;
+/// putting `Script` first means a download block (which has no `script`
+/// field) falls through to `Download` cleanly.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum Acquire {
+    Script {
+        script: String,
+        provides: String,
+    },
+    Download {
+        url: String,
+        /// One of: tar.gz, tar.xz, tar.bz2, tgz, zip, 7z
+        archive: String,
+        extract_to: String,
+        provides: String,
+        #[serde(default)]
+        sha256: Option<String>,
+    },
+}
+
+impl Acquire {
+    /// The path that must exist after a successful fetch.  Used both as
+    /// the idempotence check ("already present?") and the post-run
+    /// verification ("did the script actually put something there?").
+    pub fn provides(&self) -> &str {
+        match self {
+            Acquire::Script { provides, .. } => provides,
+            Acquire::Download { provides, .. } => provides,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -79,18 +128,46 @@ impl FallbackTable {
         })
     }
 
+    /// Look for `fallbacks.json` in the usual places.  Called once at
+    /// converter start, not per channel.
+    pub fn load_default() -> Result<Self> {
+        for p in candidate_paths() {
+            if p.exists() {
+                return Self::load(&p);
+            }
+        }
+        anyhow::bail!("fallbacks.json not found in any search path")
+    }
+
     pub fn resolve(&self, vst_path: &str, display_name: &str)
     -> Option<(&Mapping, &FallbackTarget)>
     {
         if !vst_path.is_empty() {
-            let base = Path::new(vst_path)
+            // FLP stores Windows paths; backslashes aren't separators on
+            // Linux, so Path::new would return the whole string as one
+            // component.  Normalize first.
+            let normalized = vst_path.replace('\\', "/");
+            let base = Path::new(&normalized)
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
+
             if let Some(&i) = self.by_basename.get(&base) {
                 return Some((&self.entries[i], &self.entries[i].fallback));
             }
+
+            // Also try stripping the extension, so matchers can be keyed
+            // either as "ZENOLOGY.vst" or "ZENOLOGY".
+            if let Some(stem) = base
+                .strip_suffix(".vst")
+                .or_else(|| base.strip_suffix(".vst3"))
+                .or_else(|| base.strip_suffix(".dll"))
+                {
+                    if let Some(&i) = self.by_basename.get(stem) {
+                        return Some((&self.entries[i], &self.entries[i].fallback));
+                    }
+                }
         }
         if !display_name.is_empty() {
             let d = display_name.to_ascii_lowercase();
@@ -102,4 +179,18 @@ impl FallbackTable {
     }
 
     pub fn default_rule(&self) -> &DefaultRule { &self.default }
+
+    /// All mappings, in file order.  Used by the `fetch` subcommand.
+    pub fn entries(&self) -> &[Mapping] { &self.entries }
+}
+
+fn candidate_paths() -> Vec<PathBuf> {
+    let mut v = vec![PathBuf::from("fallbacks.json")];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            v.push(dir.join("fallbacks.json"));
+            v.push(dir.join("../../fallbacks.json"));
+        }
+    }
+    v
 }

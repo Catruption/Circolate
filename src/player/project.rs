@@ -6,14 +6,14 @@ use serde::Deserialize;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::sf2::Sf2File;
 use crate::sources::trackscript::{parse_file, TrackscriptEvent, TrackscriptPart, C5_HZ};
 use crate::timing::{AutomationLane, TempoMap, Waypoint};
 
-use super::engine::{gains, Scheduled};
+use super::engine::{gains, Scheduled, VstNote};
 
 const TAIL_SECONDS: f64 = 0.05;
 
@@ -62,6 +62,15 @@ impl Sample {
     }
 }
 
+/// A VST3 instrument discovered in the project's `instruments/` directory.
+/// One per channel that needs a synth.
+pub(crate) struct VstInstrument {
+    pub(crate) iid: u16,
+    pub(crate) plugin_path: PathBuf,
+    pub(crate) state_bytes: Vec<u8>,
+    pub(crate) fallback: bool,
+}
+
 // ── SF2 instrument ─────────────────────────────────────────────────────
 
 struct Sf2ZoneEntry {
@@ -79,12 +88,6 @@ struct Sf2Instrument {
 }
 
 impl Sf2Instrument {
-    /// Returns (sample_id, pitch_hz) for the given key + velocity.
-    /// Later zones take precedence (SF2 layering rule).  If no zone
-    /// contains the key, the nearest zone by edge distance takes over,
-    /// so notes below the bank's coverage still play pitched instead of
-    /// dropping silently.  Velocity mismatches are ignored as a last
-    /// resort for the same reason.
     fn resolve(&self, key: u8, vel: u8) -> Option<(u32, f64)> {
         let key_dist = |z: &Sf2ZoneEntry| -> i32 {
             if key < z.key_lo {
@@ -96,7 +99,6 @@ impl Sf2Instrument {
             }
         };
 
-        // Pass 1: exact match on key and velocity, latest zone wins.
         let mut best: Option<(&Sf2ZoneEntry, i32)> = None;
         for z in self.zones.iter().rev() {
             if vel < z.vel_lo || vel > z.vel_hi {
@@ -111,7 +113,6 @@ impl Sf2Instrument {
                 best = Some((z, d));
             }
         }
-        // Pass 2: if velocity filtered everything out, ignore velocity.
         if best.is_none() {
             for z in self.zones.iter().rev() {
                 let d = key_dist(z);
@@ -194,8 +195,20 @@ struct TVoice {
     pan_wp: Vec<Waypoint>,
 }
 
+/// A note destined for a VST host.  Rows are relative to the pattern
+/// start; converted to absolute samples in `prepare_line`.
+#[derive(Clone)]
+struct VstNoteProto {
+    rel_row: f64,
+    dur_rows: f64,
+    pitch_midi: u8,
+    velocity: u8,
+    iid: u16,
+}
+
 struct PartTemplate {
     voices: Vec<TVoice>,
+    vst_notes: Vec<VstNoteProto>,
 }
 
 fn build_template(
@@ -203,10 +216,12 @@ fn build_template(
     path_to_id: &HashMap<String, u32>,
     samples: &HashMap<u32, Arc<Sample>>,
     sf2_instruments: &HashMap<String, Arc<Sf2Instrument>>,
+    vst_instruments: &HashMap<String, Arc<VstInstrument>>,
 ) -> PartTemplate {
     let default_sid = path_to_id.get(&part.sample_path).copied();
     let subs = part.subs_per_beat as f64;
     let mut voices: Vec<TVoice> = Vec::new();
+    let mut vst_notes: Vec<VstNoteProto> = Vec::new();
     let mut last: Option<usize> = None;
 
     for ev in &part.events {
@@ -242,6 +257,22 @@ fn build_template(
                     continue;
                 }
             }
+
+            // Path 2: VST instrument sidecar.
+            if let Some(inst) = vst_instruments.get(lookup_path) {
+                let pitch = ev.pitch_midi.unwrap_or(60).clamp(0, 127) as u8;
+                let vol_pct = ev.vol.unwrap_or(100.0).clamp(0.0, 100.0);
+                let vel = (vol_pct * 127.0 / 100.0).round().clamp(1.0, 127.0) as u8;
+                vst_notes.push(VstNoteProto {
+                    rel_row: ev.row,
+                    dur_rows: dur_beats * subs,
+                    pitch_midi: pitch,
+                    velocity: vel,
+                    iid: inst.iid,
+                });
+                continue;
+            }
+
             if std::env::var_os("SF2_TRACE").is_some() && sf2_instruments.contains_key(lookup_path) {
                 eprintln!(
                     "sf2trace: part={} lookup={} key={:?} vol={:?}",
@@ -258,7 +289,7 @@ fn build_template(
                     );
                 }
             }
-            // Path 2: SF2 instrument sidecar.
+            // Path 3: SF2 instrument sidecar.
             if let Some(inst) = sf2_instruments.get(lookup_path) {
                 let key = ev.pitch_midi.unwrap_or(60).clamp(0, 127) as u8;
                 let vel_pct = ev.vol.unwrap_or(100.0).clamp(0.0, 100.0);
@@ -283,7 +314,6 @@ fn build_template(
                 }
             }
 
-            // Nothing matched.
             continue;
         } else {
             let Some(idx) = last else { continue };
@@ -300,7 +330,7 @@ fn build_template(
             }
         }
     }
-    PartTemplate { voices }
+    PartTemplate { voices, vst_notes }
 }
 
 #[inline]
@@ -388,6 +418,7 @@ impl Cache {
         path_to_id: &HashMap<String, u32>,
         samples: &HashMap<u32, Arc<Sample>>,
         sf2_instruments: &HashMap<String, Arc<Sf2Instrument>>,
+        vst_instruments: &HashMap<String, Arc<VstInstrument>>,
     ) -> Arc<PartTemplate> {
         if self.enabled {
             if let Some(t) = self.map.get(&hash) {
@@ -396,7 +427,13 @@ impl Cache {
             }
         }
         self.misses += 1;
-        let t = Arc::new(build_template(part, path_to_id, samples, sf2_instruments));
+        let t = Arc::new(build_template(
+            part,
+            path_to_id,
+            samples,
+            sf2_instruments,
+            vst_instruments,
+        ));
         if self.enabled {
             self.map.insert(hash, Arc::clone(&t));
         }
@@ -426,6 +463,7 @@ pub(crate) struct Project {
     samples: HashMap<u32, Arc<Sample>>,
     path_to_id: HashMap<String, u32>,
     sf2_instruments: HashMap<String, Arc<Sf2Instrument>>,
+    pub(crate) vst_instruments: HashMap<String, Arc<VstInstrument>>,
     lines: Vec<LineInfo>,
     order: Vec<usize>,
     tempo: TempoMap,
@@ -446,18 +484,14 @@ impl Project {
         self.lines.len()
     }
 
-    /// Total playable seconds (already accounts for the tail).
     pub(crate) fn total_secs(&self) -> f64 {
         self.total_samples as f64 / self.sample_rate as f64
     }
 
-    /// Part names on BlockList line `i`, or `&[]` if out of range.
     pub(crate) fn line_parts(&self, i: usize) -> &[String] {
         self.lines.get(i).map(|l| l.parts.as_slice()).unwrap_or(&[])
     }
 
-    /// Index of the BlockList line whose first voice starts at or before
-    /// `pos` (in samples) and whose end is after `pos`, if any.
     pub(crate) fn current_line(&self, pos: i64) -> Option<usize> {
         let mut lo = 0usize;
         let mut hi = self.order.len();
@@ -480,22 +514,18 @@ impl Project {
         }
     }
 
-    /// One measure's worth of rows, per config.
     pub(crate) fn rows_per_measure(&self) -> f64 {
         self.rows_per_measure
     }
 
-    /// Sample index where BlockList line `li` begins.
     pub(crate) fn line_start_sample(&self, li: usize) -> i64 {
         self.lines.get(li).map(|l| l.min_start).unwrap_or(0)
     }
 
-    /// Sample index where BlockList line `li` ends.
     pub(crate) fn line_end_sample(&self, li: usize) -> i64 {
         self.lines.get(li).map(|l| l.max_end).unwrap_or(0)
     }
 
-    /// Raw events of a named part (composite or direct).
     pub(crate) fn part_events(&self, name: &str) -> &[TrackscriptEvent] {
         self.parts
         .get(name)
@@ -503,12 +533,10 @@ impl Project {
         .unwrap_or(&[])
     }
 
-    /// subs_per_beat of a named part, defaulting to 4 if unknown.
     pub(crate) fn part_subs_per_beat(&self, name: &str) -> u32 {
         self.parts.get(name).map(|p| p.subs_per_beat).unwrap_or(4)
     }
 
-    /// Sample duration of the measure that starts at BlockList line `li`.
     pub(crate) fn line_measure_samples(&self, li: usize) -> i64 {
         let start_row = li as f64 * self.rows_per_measure;
         let end_row = start_row + self.rows_per_measure;
@@ -597,8 +625,9 @@ pub(crate) fn load_project(
     }
     println!("  loaded {} samples", samples.len());
 
-    // ── Load SF2 instruments ──────────────────────────────────────────
+    // ── Load instrument sidecars ──────────────────────────────────────
     let mut sf2_instruments: HashMap<String, Arc<Sf2Instrument>> = HashMap::new();
+    let mut vst_instruments: HashMap<String, Arc<VstInstrument>> = HashMap::new();
     let mut next_sf2_id: u32 = 10_000;
     let inst_dir = base.join("instruments");
     if let Ok(entries) = std::fs::read_dir(&inst_dir) {
@@ -608,34 +637,69 @@ pub(crate) fn load_project(
                 continue;
             }
             let Ok(inst) = crate::instruments::load(&p) else { continue };
-            if !inst.is_sf2() {
-                continue;
-            }
-            // `File:` is relative to the trackscript root (like samples.json).
-            let sf2_path = if inst.sf2_path.is_absolute() {
-                inst.sf2_path.clone()
-            } else {
-                base.join(&inst.sf2_path)
-            };
-            match load_sf2_instrument(&sf2_path, next_sf2_id, &mut samples) {
-                Ok(obj) => {
-                    next_sf2_id += obj.zones.len() as u32 + 1;
-                    if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                        let rel = format!("instruments/{}.instrument", stem);
+            let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else { continue };
+            let rel = format!("instruments/{}.instrument", stem);
+
+            if inst.is_sf2() {
+                let sf2_path = if inst.sf2_path.is_absolute() {
+                    inst.sf2_path.clone()
+                } else {
+                    base.join(&inst.sf2_path)
+                };
+                match load_sf2_instrument(&sf2_path, next_sf2_id, &mut samples) {
+                    Ok(obj) => {
+                        next_sf2_id += obj.zones.len() as u32 + 1;
                         sf2_instruments.insert(rel, Arc::new(obj));
                     }
+                    Err(e) => {
+                        eprintln!(
+                            "  (failed to load SF2 {}: {:#})",
+                                  sf2_path.display(),
+                                  e
+                        );
+                    }
                 }
-                Err(e) => {
+            } else if inst.is_vst3() {
+                if inst.unresolved {
+                    eprintln!("  (skipping unresolved VST: {})", p.display());
+                    continue;
+                }
+                if inst.vst_path.is_empty() {
+                    eprintln!("  (VST sidecar has no Path: {})", p.display());
+                    continue;
+                }
+                let plugin_path = PathBuf::from(&inst.vst_path);
+                if !plugin_path.exists() {
                     eprintln!(
-                        "  (failed to load SF2 {}: {:#})",
-                              sf2_path.display(),
-                              e
+                        "  (VST sidecar points at missing file: {})",
+                              plugin_path.display()
                     );
+                    continue;
                 }
+                let state_bytes = if inst.state_path.as_os_str().is_empty() {
+                    Vec::new()
+                } else if inst.state_path.exists() {
+                    std::fs::read(&inst.state_path).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                vst_instruments.insert(
+                    rel,
+                    Arc::new(VstInstrument {
+                        iid: inst.source_channel,
+                        plugin_path,
+                        state_bytes,
+                        fallback: inst.fallback,
+                    }),
+                );
             }
         }
     }
-    println!("  loaded {} sf2 instruments", sf2_instruments.len());
+    println!(
+        "  loaded {} sf2 instruments, {} vst instruments",
+        sf2_instruments.len(),
+             vst_instruments.len()
+    );
 
     let sr = sample_rate as f64;
     let rows_per_measure = cfg.time_signature.0 as f64 * cfg.subdivisions.max(1) as f64;
@@ -672,11 +736,18 @@ pub(crate) fn load_project(
                     &path_to_id,
                     &samples,
                     &sf2_instruments,
+                    &vst_instruments,
                 );
                 for tv in &tpl.voices {
                     let start_row = placement_row + tv.rel_row;
                     min_row = min_row.min(start_row);
                     max_end_row = max_end_row.max(start_row + tv.dur_rows);
+                    total_voices += 1;
+                }
+                for vn in &tpl.vst_notes {
+                    let start_row = placement_row + vn.rel_row;
+                    min_row = min_row.min(start_row);
+                    max_end_row = max_end_row.max(start_row + vn.dur_rows);
                     total_voices += 1;
                 }
                 names.push(name);
@@ -725,6 +796,7 @@ pub(crate) fn load_project(
         samples,
         path_to_id,
         sf2_instruments,
+        vst_instruments,
         lines,
         order,
         tempo,
@@ -744,6 +816,12 @@ pub(crate) fn load_project(
 
 // ── loader ─────────────────────────────────────────────────────────────
 
+/// One batch of voices: sample voices and VST notes for the same window.
+pub(crate) struct Loaded {
+    pub(crate) samples: Vec<Scheduled>,
+    pub(crate) vsts: Vec<VstNote>,
+}
+
 pub(crate) struct Loader {
     project: Arc<Project>,
     pub(crate) cache: Cache,
@@ -759,24 +837,28 @@ impl Loader {
         }
     }
 
-    pub(crate) fn load_due(&mut self, horizon: i64) -> Vec<Scheduled> {
+    pub(crate) fn load_due(&mut self, horizon: i64) -> Loaded {
         let project = Arc::clone(&self.project);
-        let mut out = Vec::new();
+        let mut samples = Vec::new();
+        let mut vsts = Vec::new();
         while self.cursor < project.order.len() {
             let li = project.order[self.cursor];
             if project.lines[li].min_start > horizon {
                 break;
             }
             self.cursor += 1;
-            out.extend(prepare_line(&project, &mut self.cache, li, i64::MIN));
+            let batch = prepare_line(&project, &mut self.cache, li, i64::MIN);
+            samples.extend(batch.samples);
+            vsts.extend(batch.vsts);
         }
-        out
+        Loaded { samples, vsts }
     }
 
-    pub(crate) fn seek(&mut self, to: i64, horizon: i64) -> Vec<Scheduled> {
+    pub(crate) fn seek(&mut self, to: i64, horizon: i64) -> Loaded {
         let project = Arc::clone(&self.project);
         self.cursor = 0;
-        let mut out = Vec::new();
+        let mut samples = Vec::new();
+        let mut vsts = Vec::new();
         while self.cursor < project.order.len() {
             let li = project.order[self.cursor];
             let line = &project.lines[li];
@@ -787,17 +869,25 @@ impl Loader {
             if line.max_end <= to {
                 continue;
             }
-            out.extend(prepare_line(&project, &mut self.cache, li, to));
+            let batch = prepare_line(&project, &mut self.cache, li, to);
+            samples.extend(batch.samples);
+            vsts.extend(batch.vsts);
         }
-        out
+        Loaded { samples, vsts }
     }
 }
 
-fn prepare_line(project: &Project, cache: &mut Cache, li: usize, min_end: i64) -> Vec<Scheduled> {
+fn prepare_line(
+    project: &Project,
+    cache: &mut Cache,
+    li: usize,
+    min_end: i64,
+) -> Loaded {
     let sr = project.sample_rate as f64;
     let placement_row = li as f64 * project.rows_per_measure;
     let tempo = &project.tempo;
-    let mut out = Vec::new();
+    let mut samples = Vec::new();
+    let mut vsts = Vec::new();
     let mut seq = 0u32;
 
     for name in &project.lines[li].parts {
@@ -808,7 +898,9 @@ fn prepare_line(project: &Project, cache: &mut Cache, li: usize, min_end: i64) -
             &project.path_to_id,
             &project.samples,
             &project.sf2_instruments,
+            &project.vst_instruments,
         );
+
         for tv in &tpl.voices {
             seq += 1;
             let start_row = placement_row + tv.rel_row;
@@ -832,7 +924,7 @@ fn prepare_line(project: &Project, cache: &mut Cache, li: usize, min_end: i64) -
                 .collect();
                 Some(AutomationLane::new(initial, start_row, &abs, tempo))
             };
-            out.push(Scheduled {
+            samples.push(Scheduled {
                 start,
                 end,
                 line: li as u32,
@@ -843,11 +935,31 @@ fn prepare_line(project: &Project, cache: &mut Cache, li: usize, min_end: i64) -
                 vol: tv.vol,
                 pan: tv.pan,
                 pitch_lane: mk(&tv.pitch_wp, tv.pitch_hz),
-                     vol_lane: mk(&tv.vol_wp, tv.vol),
-                     pan_lane: mk(&tv.pan_wp, tv.pan),
-                     const_gain: gains(tv.vol, tv.pan, project.song_volume, project.linear_pan),
+                         vol_lane: mk(&tv.vol_wp, tv.vol),
+                         pan_lane: mk(&tv.pan_wp, tv.pan),
+                         const_gain: gains(tv.vol, tv.pan, project.song_volume, project.linear_pan),
+            });
+        }
+
+        for vn in &tpl.vst_notes {
+            seq += 1;
+            let start_row = placement_row + vn.rel_row;
+            let end_row = start_row + vn.dur_rows;
+            let start = (tempo.time_at_row(start_row) * sr) as i64;
+            let end = (tempo.time_at_row(end_row).min(project.render_end_sec) * sr) as i64;
+            if end <= start || end <= min_end {
+                continue;
+            }
+            vsts.push(VstNote {
+                start,
+                end,
+                iid: vn.iid,
+                note: vn.pitch_midi,
+                velocity: vn.velocity,
+                line: li as u32,
+                seq,
             });
         }
     }
-    out
+    Loaded { samples, vsts }
 }

@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use super::engine::Engine;
 use super::project::{Cache, Loader, Project};
+use crate::vst_host_ffi::VstHost;
 
 const BLOCK: usize = 4096;
 
@@ -16,10 +17,43 @@ pub(crate) fn render_offline(
 ) -> (Vec<f32>, Vec<f32>, Cache) {
     let lookahead = project.sample_rate as i64;
     let start = start.clamp(0, project.total_samples);
+
     let mut loader = Loader::new(Arc::clone(project), cache);
     let mut engine = Engine::new(project);
+
+    // Install VST hosts before any rendering.  One per channel iid.
+    for (name, vinst) in &project.vst_instruments {
+        let path_str = match vinst.plugin_path.to_str() {
+            Some(s) => s,
+            None => {
+                eprintln!("  (skipping VST with non-UTF8 path: {})", name);
+                continue;
+            }
+        };
+        match VstHost::load(path_str, &vinst.state_bytes, project.sample_rate) {
+            Ok(host) => {
+                let tag = if vinst.fallback { "fallback" } else { "exact" };
+                println!(
+                    "  loaded VST [{}] {} ({})",
+                         vinst.iid,
+                         vinst.plugin_path
+                         .file_stem()
+                         .and_then(|s| s.to_str())
+                         .unwrap_or("?"),
+                         tag
+                );
+                engine.install_host(vinst.iid, host);
+            }
+            Err(e) => {
+                eprintln!("  failed to load VST {} ({:#})", name, e);
+            }
+        }
+    }
+    println!("  installed {} VST host(s)", engine.host_count());
+
     let first = loader.seek(start, start + lookahead);
-    engine.apply_seek(start, first);
+    engine.apply_seek(start, first.samples);
+    engine.ingest_vst(first.vsts);
 
     let total = (project.total_samples - start) as usize;
     let mut l = vec![0f32; total];
@@ -27,8 +61,9 @@ pub(crate) fn render_offline(
     let mut i = 0;
     while i < total {
         let n = (total - i).min(BLOCK);
-        let v = loader.load_due(engine.pos + lookahead);
-        engine.ingest(v);
+        let batch = loader.load_due(engine.pos + lookahead);
+        engine.ingest(batch.samples);
+        engine.ingest_vst(batch.vsts);
         engine.render(&mut l[i..i + n], &mut r[i..i + n]);
         i += n;
     }

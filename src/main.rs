@@ -8,6 +8,7 @@ mod display;
 mod dump;
 mod export;
 mod fallbacks;
+mod fetch;
 mod instruments;
 mod play;
 mod player;
@@ -23,6 +24,9 @@ mod vst_smoke;
 use anyhow::{bail, Result};
 
 fn main() -> Result<()> {
+    // Exit quietly on SIGPIPE (e.g. `dump foo | head` closing the reader
+    // early).  Without this, the default Rust runtime turns SIGPIPE into a
+    // panic, which is neither useful nor a real error.
     #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
@@ -30,6 +34,8 @@ fn main() -> Result<()> {
 
     let mut args: Vec<String> = std::env::args().collect();
 
+    // Pull out the pause flag wherever it appears, so it doesn't confuse
+    // the subcommand parsers.
     let pause = args.iter().any(|a| a == "--pause");
     args.retain(|a| a != "--pause");
 
@@ -41,11 +47,13 @@ fn main() -> Result<()> {
         Some("dump")      => dump::run(rest),
         Some("test")      => test::run(rest),
         Some("plugins")   => plugins::run(rest),
+        Some("fetch")     => fetch::run(rest),
         Some("vst-smoke") => vst_smoke::run(rest),
         Some("-h") | Some("--help") | None => {
             print_help();
             Ok(())
         }
+        // Back-compat: `trackscript-player song.trackscript` still plays.
         Some(other) if std::path::Path::new(other).exists() => play::run(&args[1..]),
         Some(other) => bail!("unknown command: {other}"),
     };
@@ -67,6 +75,8 @@ fn print_help() {
     println!("  dump      <file>            print a file's parsed structure as JSON");
     println!("  test      <file>            run diagnostics");
     println!("  plugins   [--paths]         list discovered VST3 / LV2 / CLAP");
+    println!("  fetch     [--dry] [--only NAME]");
+    println!("                              download missing fallback plugins");
     println!("  vst-smoke <plugin.vst3>     load a VST3, play a note, report peak");
     println!();
     println!("  --pause                     hold the terminal open on exit (.desktop use)");

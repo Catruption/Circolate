@@ -1,15 +1,16 @@
 //! Voice scheduling, mixer, and DSP primitives.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::f64::consts::{FRAC_PI_4, PI};
 use std::sync::{Arc, OnceLock};
 
 use crate::sources::trackscript::C5_HZ;
 use crate::timing::AutomationLane;
+use crate::vst_host_ffi::VstHost;
 
 use super::project::{Project, Sample};
 
-// ── scheduled voice ────────────────────────────────────────────────────
+// ── scheduled sample voice ─────────────────────────────────────────────
 
 pub(crate) struct Scheduled {
     pub(crate) start: i64,
@@ -28,6 +29,26 @@ pub(crate) struct Scheduled {
 }
 
 impl Scheduled {
+    fn key(&self) -> (i64, u32, u32) {
+        (self.start, self.line, self.seq)
+    }
+}
+
+// ── scheduled VST note ─────────────────────────────────────────────────
+
+/// A single MIDI note destined for one channel's VST host.
+#[derive(Clone, Debug)]
+pub(crate) struct VstNote {
+    pub(crate) start: i64,
+    pub(crate) end: i64,
+    pub(crate) iid: u16,
+    pub(crate) note: u8,
+    pub(crate) velocity: u8,
+    pub(crate) line: u32,
+    pub(crate) seq: u32,
+}
+
+impl VstNote {
     fn key(&self) -> (i64, u32, u32) {
         (self.start, self.line, self.seq)
     }
@@ -167,9 +188,15 @@ struct Active {
 }
 
 pub(crate) enum Msg {
-    Batch { epoch: u64, voices: Vec<Scheduled> },
-    Seek { epoch: u64, pos: i64, voices: Vec<Scheduled> },
+    Batch { epoch: u64, samples: Vec<Scheduled>, vsts: Vec<VstNote> },
+    Seek  { epoch: u64, pos: i64, samples: Vec<Scheduled>, vsts: Vec<VstNote> },
 }
+
+/// Sample chunk used when driving VST hosts.  Notes are dispatched at
+/// sample offsets within the chunk; the shim supports per-event offsets,
+/// so this value controls the minimum scheduling granularity, not an
+/// audible quantization.
+const VST_BLOCK: i64 = 512;
 
 pub(crate) struct Engine {
     sr: f64,
@@ -181,6 +208,13 @@ pub(crate) struct Engine {
     epoch: u64,
     pending: VecDeque<Scheduled>,
     active: Vec<Active>,
+
+    // VST hosting — one instance per channel, keyed by channel iid.
+    hosts: HashMap<u16, VstHost>,
+    vst_pending: VecDeque<VstNote>,
+    vst_active: Vec<VstNote>,
+    vst_scratch_l: Vec<f32>,
+    vst_scratch_r: Vec<f32>,
 }
 
 impl Engine {
@@ -195,8 +229,25 @@ impl Engine {
             epoch: 0,
             pending: VecDeque::new(),
             active: Vec::new(),
+            hosts: HashMap::new(),
+            vst_pending: VecDeque::new(),
+            vst_active: Vec::new(),
+            vst_scratch_l: vec![0.0; VST_BLOCK as usize],
+            vst_scratch_r: vec![0.0; VST_BLOCK as usize],
         }
     }
+
+    /// Install a live VST host for one channel.  Called by the loader
+    /// after resolving the channel's `.instrument` sidecar.
+    pub(crate) fn install_host(&mut self, iid: u16, host: VstHost) {
+        self.hosts.insert(iid, host);
+    }
+
+    pub(crate) fn host_count(&self) -> usize {
+        self.hosts.len()
+    }
+
+    pub(crate) fn sample_rate(&self) -> f64 { self.sr }
 
     fn raw_pos_at(&self, v: &Scheduled, to: i64) -> f64 {
         if to <= v.start {
@@ -242,24 +293,53 @@ impl Engine {
         }
     }
 
+    /// Queue VST notes.  Notes that start before `pos` are pinned to `pos`
+    /// so their `note_on` fires at seek time and the plugin plays from the
+    /// seek point.
+    pub(crate) fn ingest_vst(&mut self, mut notes: Vec<VstNote>) {
+        notes.sort_by_key(VstNote::key);
+        let mut future = Vec::new();
+        for mut n in notes {
+            if n.end <= self.pos {
+                continue;
+            }
+            if n.start < self.pos {
+                n.start = self.pos;
+                self.vst_active.push(n);
+            } else {
+                future.push(n);
+            }
+        }
+        if !future.is_empty() {
+            let mut all: Vec<VstNote> = self.vst_pending.drain(..).collect();
+            all.extend(future);
+            all.sort_by_key(VstNote::key);
+            self.vst_pending = all.into();
+        }
+    }
+
     pub(crate) fn apply_seek(&mut self, to: i64, voices: Vec<Scheduled>) {
         self.pos = to.clamp(0, self.total);
         self.active.clear();
         self.pending.clear();
+        self.vst_active.clear();
+        self.vst_pending.clear();
         self.ready = true;
         self.ingest(voices);
     }
 
     pub(crate) fn handle(&mut self, m: Msg) {
         match m {
-            Msg::Batch { epoch, voices } => {
+            Msg::Batch { epoch, samples, vsts } => {
                 if epoch == self.epoch {
-                    self.ingest(voices);
+                    self.ingest(samples);
+                    self.ingest_vst(vsts);
                 }
             }
-            Msg::Seek { epoch, pos, voices } => {
+            Msg::Seek { epoch, pos, samples, vsts } => {
                 self.epoch = epoch;
-                self.apply_seek(pos, voices);
+                self.apply_seek(pos, samples);
+                self.ingest_vst(vsts);
             }
         }
     }
@@ -279,6 +359,7 @@ impl Engine {
         let block_end = block_start + out_l.len() as i64;
         let sr = self.sr;
 
+        // ── sample voices ──────────────────────────────────────────────
         while self.pending.front().map_or(false, |v| v.start < block_end) {
             let v = self.pending.pop_front().unwrap();
             let raw_pos = v.offset;
@@ -333,6 +414,83 @@ impl Engine {
             v.end > block_end
         });
 
+        // ── VST voices ─────────────────────────────────────────────────
+        if !self.hosts.is_empty() {
+            self.render_vsts(out_l, out_r, block_start);
+        }
+
         self.pos = block_end;
+    }
+
+    /// Drive every installed VST host for this block.  Chunked because the
+    /// shim was created with a fixed max block size; notes are dispatched
+    /// with sample offsets so timing stays exact within the chunk.
+    fn render_vsts(&mut self, out_l: &mut [f32], out_r: &mut [f32], block_start: i64) {
+        let block_len = out_l.len() as i64;
+        let mut chunk_start = block_start;
+        let block_end = block_start + block_len;
+
+        while chunk_start < block_end {
+            let chunk_len =
+            ((block_end - chunk_start) as usize).min(VST_BLOCK as usize);
+            let chunk_end = chunk_start + chunk_len as i64;
+
+            // Note-ons whose start falls in this chunk.
+            while self
+                .vst_pending
+                .front()
+                .map_or(false, |n| n.start < chunk_end)
+                {
+                    let n = self.vst_pending.pop_front().unwrap();
+                    if let Some(host) = self.hosts.get_mut(&n.iid) {
+                        let offset = (n.start - chunk_start).max(0) as i32;
+                        host.note_on_at(n.note, n.velocity, offset);
+                    }
+                    self.vst_active.push(n);
+                }
+
+                // Note-offs for anything ending in this chunk.
+                let mut i = 0;
+                while i < self.vst_active.len() {
+                    if self.vst_active[i].end <= chunk_end {
+                        let n = self.vst_active.remove(i);
+                        if let Some(host) = self.hosts.get_mut(&n.iid) {
+                            let offset = (n.end - chunk_start).max(0) as i32;
+                            host.note_off_at(n.note, offset);
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+
+                // Zero scratch for this chunk.
+                for s in self.vst_scratch_l[..chunk_len].iter_mut() {
+                    *s = 0.0;
+                }
+                for s in self.vst_scratch_r[..chunk_len].iter_mut() {
+                    *s = 0.0;
+                }
+
+                // Sum every host into scratch.  Disjoint borrows for the field
+                // split — hosts, scratch_l, scratch_r are three separate fields.
+                let hosts = &mut self.hosts;
+                let scratch_l = &mut self.vst_scratch_l;
+                let scratch_r = &mut self.vst_scratch_r;
+                for host in hosts.values_mut() {
+                    host.process(
+                        &mut scratch_l[..chunk_len],
+                        &mut scratch_r[..chunk_len],
+                    );
+                }
+
+                // Sum scratch into the output at the right offset.
+                let out_off = (chunk_start - block_start) as usize;
+                for j in 0..chunk_len {
+                    out_l[out_off + j] += self.vst_scratch_l[j];
+                    out_r[out_off + j] += self.vst_scratch_r[j];
+                }
+
+                chunk_start = chunk_end;
+        }
     }
 }

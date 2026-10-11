@@ -1,42 +1,102 @@
-//! `trackscript-player plugins` — scan search paths for VST3 / LV2 / CLAP
-//! plugins and print what was found.
-//!
-//! No loading, no hosting.  Just discovery, so we can confirm the local
-//! `plugins/` dir is visible before wiring it into the VST host.
+//! Plugin discovery.  `plugins` subcommand prints what was found; the
+//! converter uses `PluginIndex` to resolve names to bundle paths.
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
+pub struct PluginIndex {
+    pub vst3: Vec<PathBuf>,
+    pub lv2:  Vec<PathBuf>,
+    pub clap: Vec<PathBuf>,
+    pub vst2: Vec<PathBuf>,
+}
+
+impl PluginIndex {
+    pub fn scan() -> Self {
+        let (mut vst3, mut lv2, mut clap, mut vst2) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for root in search_paths() {
+            scan(&root, &mut vst3, &mut lv2, &mut clap, &mut vst2);
+        }
+
+        // Canonicalize before dedup so `target/release/../../plugins/x`
+        // and `/abs/path/plugins/x` collapse to the same entry.
+        for v in [&mut vst3, &mut lv2, &mut clap, &mut vst2] {
+            for p in v.iter_mut() {
+                if let Ok(c) = p.canonicalize() {
+                    *p = c;
+                }
+            }
+            v.sort();
+            v.dedup();
+        }
+
+        PluginIndex { vst3, lv2, clap, vst2 }
+    }
+
+    /// Match a VST3 bundle by its file stem, ignoring `.vst3` extension.
+    /// Exact case-insensitive match first, then normalized comparison
+    /// (strip " #N", lowercase, drop non-alphanumerics).
+    pub fn find_vst3(&self, name: &str) -> Option<&PathBuf> {
+        if name.is_empty() { return None; }
+
+        // Exact file-stem match (case-insensitive).
+        if let Some(p) = self.vst3.iter().find(|p| {
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            stem.eq_ignore_ascii_case(name)
+        }) {
+            return Some(p);
+        }
+
+        // Normalized comparison.
+        let want = normalize_plugin_key(name);
+        if want.len() < 2 { return None; }
+        self.vst3.iter().find(|p| {
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            normalize_plugin_key(stem) == want
+        })
+    }
+
+    pub fn total(&self) -> usize {
+        self.vst3.len() + self.lv2.len() + self.clap.len() + self.vst2.len()
+    }
+}
+
+fn normalize_plugin_key(s: &str) -> String {
+    let base = if let Some(idx) = s.rfind(" #") {
+        let tail = &s[idx + 2..];
+        if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) {
+            &s[..idx]
+        } else {
+            s
+        }
+    } else {
+        s
+    };
+    base.chars()
+    .filter(|c| c.is_ascii_alphanumeric())
+    .map(|c| c.to_ascii_lowercase())
+    .collect()
+}
+
 pub fn run(argv: &[String]) -> Result<()> {
     let verbose = argv.iter().any(|a| a == "--paths" || a == "-v");
 
-    let paths = search_paths();
     if verbose {
         eprintln!("search paths:");
-        for p in &paths {
+        for p in &search_paths() {
             eprintln!("  {}", p.display());
         }
     }
 
-    let (mut vst3, mut lv2, mut clap, mut vst2) =
-    (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let idx = PluginIndex::scan();
 
-    for root in &paths {
-        scan(root, &mut vst3, &mut lv2, &mut clap, &mut vst2);
-    }
+    print_group("VST3", &idx.vst3);
+    print_group("LV2",  &idx.lv2);
+    print_group("CLAP", &idx.clap);
+    print_group("VST2", &idx.vst2);
 
-    for v in [&mut vst3, &mut lv2, &mut clap, &mut vst2] {
-        v.sort();
-        v.dedup();
-    }
-
-    print_group("VST3", &vst3);
-    print_group("LV2",  &lv2);
-    print_group("CLAP", &clap);
-    print_group("VST2", &vst2);
-
-    let total = vst3.len() + lv2.len() + clap.len() + vst2.len();
-    println!("\n{total} plugin(s) found");
+    println!("\n{} plugin(s) found", idx.total());
     Ok(())
 }
 
@@ -51,11 +111,9 @@ fn print_group(label: &str, items: &[PathBuf]) {
 fn search_paths() -> Vec<PathBuf> {
     let mut v = Vec::new();
 
-    // Repo-local, from cwd (cargo run) and relative to the binary.
     v.push(PathBuf::from("plugins"));
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            // target/release/trackscript-player → ../../plugins
             v.push(dir.join("plugins"));
             v.push(dir.join("../../plugins"));
         }
@@ -102,16 +160,10 @@ fn scan(root: &Path,
                 .to_ascii_lowercase();
 
                 match (ext.as_str(), is_dir) {
-                    // VST3 bundles are directories on Linux; standalone files
-                    // exist too.  Don't recurse into the bundle.
                     ("vst3", true)  => { vst3.push(p); continue; }
                     ("vst3", false) => { vst3.push(p); continue; }
-
                     ("lv2", true)   => { lv2.push(p); continue; }
-
                     ("clap", false) => { clap.push(p); continue; }
-
-                    // VST2 plugins are .so files, but only inside a vst/ dir.
                     ("so", false) => {
                         if dir.components().any(|c| c.as_os_str() == "vst") {
                             vst2.push(p);

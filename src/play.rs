@@ -16,6 +16,7 @@ use crate::display;
 use crate::player::{self, Engine, Loader, Msg, Transport};
 use crate::sources::SourceKind;
 use crate::tui;
+use crate::vst_host_ffi::VstHost;
 
 struct Args {
     song: PathBuf,
@@ -79,10 +80,6 @@ fn parse_args(argv: &[String]) -> Result<Args> {
 }
 
 /// A temporary directory that deletes itself on drop.
-///
-/// Used to hold the converted trackscript + samples when playing a source
-/// that isn't already trackscript.  Nothing is written to disk for a plain
-/// `.trackscript` input.
 struct TempBundle {
     dir: PathBuf,
 }
@@ -99,7 +96,6 @@ impl TempBundle {
         Ok(TempBundle { dir })
     }
 
-    /// Write a Converted bundle and return the path to the .trackscript.
     fn write(&self, c: &convert::Converted, stem: &str) -> Result<PathBuf> {
         let ts_path = self.dir.join(format!("{}.trackscript", stem));
         std::fs::write(&ts_path, &c.trackscript)?;
@@ -131,8 +127,6 @@ impl Drop for TempBundle {
     }
 }
 
-/// Ensure we have a trackscript on disk.  Returns the path to play, plus
-/// an optional TempBundle that must be kept alive for the duration.
 fn resolve_source(src: &Path, args: &Args) -> Result<(PathBuf, Option<TempBundle>)> {
     match SourceKind::from_path(src)? {
         SourceKind::Trackscript => Ok((src.to_path_buf(), None)),
@@ -143,7 +137,6 @@ fn resolve_source(src: &Path, args: &Args) -> Result<(PathBuf, Option<TempBundle
             }
             opts.skip_native = args.skip_native;
             let conv = convert::convert_file(src, &opts)?;
-            // Show what the converter noted (skipped channels, warnings).
             let mut in_footer = false;
             for line in conv.trackscript.lines() {
                 if line.starts_with("// ------") {
@@ -160,21 +153,65 @@ fn resolve_source(src: &Path, args: &Args) -> Result<(PathBuf, Option<TempBundle
     }
 }
 
+/// Install every resolved VST host onto the engine.  Called once before
+/// the audio callback takes ownership of the engine.
+fn install_vst_hosts(engine: &mut Engine, project: &player::Project) {
+    for (name, vinst) in &project.vst_instruments {
+        let Some(path_str) = vinst.plugin_path.to_str() else {
+            eprintln!("  (skipping VST with non-UTF8 path: {})", name);
+            continue;
+        };
+        match VstHost::load(path_str, &vinst.state_bytes, project.sample_rate) {
+            Ok(host) => {
+                let tag = if vinst.fallback { "fallback" } else { "exact" };
+                println!(
+                    "  loaded VST [{}] {} ({})",
+                         vinst.iid,
+                         vinst.plugin_path
+                         .file_stem()
+                         .and_then(|s| s.to_str())
+                         .unwrap_or("?"),
+                         tag
+                );
+                engine.install_host(vinst.iid, host);
+            }
+            Err(e) => {
+                eprintln!("  failed to load VST {} ({:#})", name, e);
+            }
+        }
+    }
+    println!("  installed {} VST host(s)", engine.host_count());
+}
+
 fn worker(mut loader: Loader, tx: Sender<Msg>, tp: Arc<Transport>, lookahead: i64) {
     let mut epoch = 0u64;
     while !tp.stop.load(Ordering::Relaxed) {
         let req = tp.seek_to.swap(i64::MIN, Ordering::AcqRel);
         if req != i64::MIN {
             epoch += 1;
-            let voices = loader.seek(req, req + lookahead);
-            if tx.send(Msg::Seek { epoch, pos: req, voices }).is_err() {
+            let batch = loader.seek(req, req + lookahead);
+            let msg = Msg::Seek {
+                epoch,
+                pos: req,
+                samples: batch.samples,
+                vsts: batch.vsts,
+            };
+            if tx.send(msg).is_err() {
                 break;
             }
         } else {
             let horizon = tp.position.load(Ordering::Relaxed) + lookahead;
-            let voices = loader.load_due(horizon);
-            if !voices.is_empty() && tx.send(Msg::Batch { epoch, voices }).is_err() {
-                break;
+            let batch = loader.load_due(horizon);
+            let empty = batch.samples.is_empty() && batch.vsts.is_empty();
+            if !empty {
+                let msg = Msg::Batch {
+                    epoch,
+                    samples: batch.samples,
+                    vsts: batch.vsts,
+                };
+                if tx.send(msg).is_err() {
+                    break;
+                }
             }
             tp.loaded_lines.store(loader.cursor as i64, Ordering::Relaxed);
         }
@@ -183,8 +220,7 @@ fn worker(mut loader: Loader, tx: Sender<Msg>, tp: Arc<Transport>, lookahead: i6
 }
 
 fn verify_cache(args: &Args) -> Result<()> {
-    let (song, rate) = (&args.song, args.rate);
-    let _ = song;
+    let rate = args.rate;
     let (path, _guard) = resolve_source(&args.song, args)?;
     let (p1, c1) = player::load_project(&path, rate, true)?;
     let (a_l, a_r, c1) = player::render_offline(&p1, c1, 0);
@@ -218,7 +254,6 @@ pub fn run(argv: &[String]) -> Result<()> {
         return verify_cache(&args);
     }
 
-    // Offline render: no device.
     if let Some(out) = &args.render {
         let (path, _guard) = resolve_source(&args.song, &args)?;
         let (project, cache) = player::load_project(&path, args.rate, !args.no_cache)?;
@@ -258,7 +293,6 @@ pub fn run(argv: &[String]) -> Result<()> {
              channels
     );
 
-    // Convert if needed; keep the guard alive until the end of the fn.
     let (project_path, _guard) = resolve_source(&args.song, &args)?;
 
     let (project, cache) = player::load_project(&project_path, sample_rate, !args.no_cache)?;
@@ -285,7 +319,12 @@ pub fn run(argv: &[String]) -> Result<()> {
         std::thread::spawn(move || worker(loader, tx, tp, lookahead));
     }
 
+    // Engine is built on the main thread, hosts installed here, then moved
+    // into the audio callback.  Hosts load before playback begins, so no
+    // audio glitch from plugin init.
     let mut engine = Engine::new(&project);
+    install_vst_hosts(&mut engine, &project);
+
     let tp = Arc::clone(&transport);
     let mut left = vec![0f32; 4096];
     let mut right = vec![0f32; 4096];

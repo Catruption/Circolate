@@ -49,9 +49,10 @@ public:
 
 struct Shim {
     VST3::Hosting::Module::Ptr module;
-    IPtr<IComponent>      component;
-    IPtr<IEditController> controller;
-    IPtr<IAudioProcessor> processor;
+    IPtr<IHostApplication>   host_app;
+    IPtr<IComponent>         component;
+    IPtr<IEditController>    controller;
+    IPtr<IAudioProcessor>    processor;
 
     int sampleRate = 44100;
     int blockSize  = 512;
@@ -104,6 +105,10 @@ extern "C" {
             s->sampleRate = sr;
             s->blockSize  = block;
 
+            // Host application context — required by some plugins (notably
+            // CLAP-to-VST3 wrappers) that dereference it during initialize().
+            s->host_app = new HostApplication();
+
             s->component = factory.createInstance<IComponent>(ci.ID());
             if (!s->component.get()) {
                 delete s;
@@ -118,13 +123,22 @@ extern "C" {
             return nullptr;
                 }
 
-                s->component->initialize(nullptr);
+                s->component->initialize(s->host_app);
                 if (s->controller.get()) {
-                    s->controller->initialize(nullptr);
+                    s->controller->initialize(s->host_app);
                 }
+
+                // Bus negotiation.  Instruments take no input, one stereo output.
+                // Some plugins require this before setupProcessing or they crash
+                // trying to reconcile an undefined bus layout.
+                SpeakerArrangement out_arr = SpeakerArr::kStereo;
+                s->processor->setBusArrangements(nullptr, 0, &out_arr, 1);
 
                 if (s->component->getBusCount(kAudio, kOutput) > 0) {
                     s->component->activateBus(kAudio, kOutput, 0, true);
+                }
+                if (s->component->getBusCount(kAudio, kInput) > 0) {
+                    s->component->activateBus(kAudio, kInput, 0, false);
                 }
 
                 ProcessSetup setup{};
@@ -169,7 +183,7 @@ extern "C" {
     int vst_shim_set_state(void* h, const uint8_t* data, size_t len) {
         auto s = static_cast<Shim*>(h);
         if (!s || !s->component.get()) return 0;
-        if (len == 0 || data == nullptr) return 1;   // no state to load; defaults are fine
+        if (len == 0 || data == nullptr) return 1;
 
         auto buf = const_cast<uint8_t*>(data);
         MemoryStream stream(buf, static_cast<TSize>(len));
@@ -182,12 +196,12 @@ extern "C" {
         return 0;
     }
 
-    void vst_shim_note_on(void* h, int note, int vel) {
+    void vst_shim_note_on(void* h, int note, int vel, int sample_offset) {
         auto s = static_cast<Shim*>(h);
         if (!s) return;
         Event e{};
         e.type            = Event::kNoteOnEvent;
-        e.sampleOffset    = 0;
+        e.sampleOffset    = sample_offset;
         e.noteOn.channel  = 0;
         e.noteOn.pitch    = static_cast<int16>(note);
         e.noteOn.velocity = vel / 127.0f;
@@ -197,12 +211,12 @@ extern "C" {
         s->pending.push_back(e);
     }
 
-    void vst_shim_note_off(void* h, int note) {
+    void vst_shim_note_off(void* h, int note, int sample_offset) {
         auto s = static_cast<Shim*>(h);
         if (!s) return;
         Event e{};
         e.type             = Event::kNoteOffEvent;
-        e.sampleOffset     = 0;
+        e.sampleOffset     = sample_offset;
         e.noteOff.channel  = 0;
         e.noteOff.pitch    = static_cast<int16>(note);
         e.noteOff.velocity = 0.0f;
