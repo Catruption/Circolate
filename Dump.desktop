@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Dump Source
+Comment=Print a source file's parsed structure
+Exec=/run/media/cashmere/Creationism/Circolate/run.sh dump %F
+Icon=/run/media/cashmere/Creationism/Circolate/icons/Dump.png
+Terminal=false
+Categories=Utility;
+StartupNotify=true

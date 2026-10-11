@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Export Trackscript
+Comment=Convert an FLP or IT file to Trackscript
+Exec=/run/media/cashmere/Creationism/Circolate/run.sh export %F
+Icon=/run/media/cashmere/Creationism/Circolate/icons/Export.png
+Terminal=false
+Categories=AudioVideo;Audio;
+StartupNotify=true

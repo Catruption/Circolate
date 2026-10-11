@@ -1,0 +1,14 @@
+/*
+!/.gitignore
+!/Cargo.toml
+!/Cargo.lock
+!/build.rs
+!/README.md
+!/run.sh
+!/src/
+!/scripts/
+!/icons/
+!/*.desktop
+!/flp_dump.py
+!/flp_arrangements.py
+!/night.json

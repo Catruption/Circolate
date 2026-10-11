@@ -1,0 +1,853 @@
+//! Project loading: samples.json + SF2 loading, part templates, `Project`,
+//! and the streaming `Loader`.
+
+use anyhow::{bail, Context, Result};
+use serde::Deserialize;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::path::Path;
+use std::sync::Arc;
+
+use crate::sf2::Sf2File;
+use crate::sources::trackscript::{parse_file, TrackscriptEvent, TrackscriptPart, C5_HZ};
+use crate::timing::{AutomationLane, TempoMap, Waypoint};
+
+use super::engine::{gains, Scheduled};
+
+const TAIL_SECONDS: f64 = 0.05;
+
+// ── samples.json ───────────────────────────────────────────────────────
+
+#[derive(Deserialize, Debug)]
+struct SampleEntry {
+    id: u32,
+    file: Option<String>,
+    #[serde(default)]
+    loops: Loops,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct Loops {
+    main: Option<Loop>,
+}
+
+#[derive(Deserialize, Debug)]
+struct Loop {
+    #[serde(default)]
+    start: u32,
+    #[serde(default)]
+    end: u32,
+}
+
+#[derive(Deserialize, Debug)]
+struct SampleLibrary {
+    #[serde(default)]
+    samples: Vec<SampleEntry>,
+}
+
+// ── runtime data ───────────────────────────────────────────────────────
+
+pub(crate) struct Sample {
+    pub(crate) left: Vec<f32>,
+    pub(crate) right: Vec<f32>,
+    pub(crate) stereo: bool,
+    pub(crate) rate: f64,
+    pub(crate) loop_pts: Option<(i64, i64)>,
+}
+
+impl Sample {
+    pub(crate) fn len(&self) -> usize {
+        self.left.len()
+    }
+}
+
+// ── SF2 instrument ─────────────────────────────────────────────────────
+
+struct Sf2ZoneEntry {
+    key_lo: u8,
+    key_hi: u8,
+    vel_lo: u8,
+    vel_hi: u8,
+    sample_id: u32,
+    root_key: u8,
+    tune_cents: i16,
+}
+
+struct Sf2Instrument {
+    zones: Vec<Sf2ZoneEntry>,
+}
+
+impl Sf2Instrument {
+    /// Returns (sample_id, pitch_hz) for the given key + velocity.
+    /// Later zones take precedence (SF2 layering rule).  If no zone
+    /// contains the key, the nearest zone by edge distance takes over,
+    /// so notes below the bank's coverage still play pitched instead of
+    /// dropping silently.  Velocity mismatches are ignored as a last
+    /// resort for the same reason.
+    fn resolve(&self, key: u8, vel: u8) -> Option<(u32, f64)> {
+        let key_dist = |z: &Sf2ZoneEntry| -> i32 {
+            if key < z.key_lo {
+                (z.key_lo - key) as i32
+            } else if key > z.key_hi {
+                (key - z.key_hi) as i32
+            } else {
+                0
+            }
+        };
+
+        // Pass 1: exact match on key and velocity, latest zone wins.
+        let mut best: Option<(&Sf2ZoneEntry, i32)> = None;
+        for z in self.zones.iter().rev() {
+            if vel < z.vel_lo || vel > z.vel_hi {
+                continue;
+            }
+            let d = key_dist(z);
+            if d == 0 {
+                best = Some((z, 0));
+                break;
+            }
+            if best.map_or(true, |(_, bd)| d < bd) {
+                best = Some((z, d));
+            }
+        }
+        // Pass 2: if velocity filtered everything out, ignore velocity.
+        if best.is_none() {
+            for z in self.zones.iter().rev() {
+                let d = key_dist(z);
+                if best.map_or(true, |(_, bd)| d < bd) {
+                    best = Some((z, d));
+                }
+            }
+        }
+        let (z, _) = best?;
+        let semitones =
+        (key as i32 - z.root_key as i32) as f64 + z.tune_cents as f64 / 100.0;
+        let pitch_hz = C5_HZ * 2f64.powf(semitones / 12.0);
+        Some((z.sample_id, pitch_hz))
+    }
+}
+
+fn load_sf2_instrument(
+    sf2_path: &Path,
+    base_id: u32,
+    samples: &mut HashMap<u32, Arc<Sample>>,
+) -> Result<Sf2Instrument> {
+    let sf2 = Sf2File::load(sf2_path)?;
+    let mut zones: Vec<Sf2ZoneEntry> = Vec::with_capacity(sf2.zones.len());
+
+    for (zi, z) in sf2.zones.iter().enumerate() {
+        let sm = &sf2.samples[z.sample_idx];
+        let start = (sm.start as i64 + z.start_offset as i64).clamp(0, sm.end as i64);
+        let end = (sm.end as i64 + z.end_offset as i64).clamp(start, sf2.pcm.len() as i64);
+        let ls = (sm.loop_start as i64 + z.loop_start_offset as i64).clamp(start, end);
+        let le = (sm.loop_end as i64 + z.loop_end_offset as i64).clamp(ls, end);
+
+        let mono: Vec<f32> = sf2.pcm[start as usize..end as usize]
+        .iter()
+        .map(|&s| s as f32 / 32768.0)
+        .collect();
+
+        let loop_pts = if sm.loop_mode != 0 && le > ls {
+            Some(((ls - start) as i64, (le - start) as i64))
+        } else {
+            None
+        };
+
+        let arc = Arc::new(Sample {
+            left: mono,
+            right: Vec::new(),
+                           stereo: false,
+                           rate: sm.rate as f64,
+                           loop_pts,
+        });
+        let sid = base_id + zi as u32;
+        samples.insert(sid, arc);
+
+        let root_key = z.root_override.unwrap_or(sm.root_key);
+        zones.push(Sf2ZoneEntry {
+            key_lo: z.key_lo,
+            key_hi: z.key_hi,
+            vel_lo: z.vel_lo,
+            vel_hi: z.vel_hi,
+            sample_id: sid,
+            root_key,
+            tune_cents: z.tune_cents,
+        });
+    }
+
+    Ok(Sf2Instrument { zones })
+}
+
+// ── templates ──────────────────────────────────────────────────────────
+
+struct TVoice {
+    rel_row: f64,
+    dur_rows: f64,
+    pitch_hz: f64,
+    vol: f64,
+    pan: f64,
+    sample_id: u32,
+    offset: u32,
+    pitch_wp: Vec<Waypoint>,
+    vol_wp: Vec<Waypoint>,
+    pan_wp: Vec<Waypoint>,
+}
+
+struct PartTemplate {
+    voices: Vec<TVoice>,
+}
+
+fn build_template(
+    part: &TrackscriptPart,
+    path_to_id: &HashMap<String, u32>,
+    samples: &HashMap<u32, Arc<Sample>>,
+    sf2_instruments: &HashMap<String, Arc<Sf2Instrument>>,
+) -> PartTemplate {
+    let default_sid = path_to_id.get(&part.sample_path).copied();
+    let subs = part.subs_per_beat as f64;
+    let mut voices: Vec<TVoice> = Vec::new();
+    let mut last: Option<usize> = None;
+
+    for ev in &part.events {
+        if !ev.is_waypoint() {
+            let lookup_path = ev
+            .sample_override
+            .as_deref()
+            .unwrap_or(&part.sample_path);
+
+            let mut sid = default_sid;
+            if let Some(p) = &ev.sample_override {
+                sid = path_to_id.get(p).copied().or(default_sid);
+            }
+
+            let dur_beats = ev.dur_beats.filter(|d| *d != 0.0).unwrap_or(1.0);
+
+            // Path 1: direct WAV sample.
+            if let Some(sid) = sid {
+                if samples.contains_key(&sid) {
+                    voices.push(TVoice {
+                        rel_row: ev.row,
+                        dur_rows: dur_beats * subs,
+                        pitch_hz: ev.pitch_hz.unwrap_or(C5_HZ),
+                                vol: ev.vol.unwrap_or(100.0),
+                                pan: ev.pan.unwrap_or(0.0),
+                                sample_id: sid,
+                                offset: ev.offset.unwrap_or(part.sample_offset),
+                                pitch_wp: Vec::new(),
+                                vol_wp: Vec::new(),
+                                pan_wp: Vec::new(),
+                    });
+                    last = Some(voices.len() - 1);
+                    continue;
+                }
+            }
+            if std::env::var_os("SF2_TRACE").is_some() && sf2_instruments.contains_key(lookup_path) {
+                eprintln!(
+                    "sf2trace: part={} lookup={} key={:?} vol={:?}",
+                    part.name, lookup_path, ev.pitch_midi, ev.vol
+                );
+            }
+            if std::env::var_os("SF2_TRACE").is_some() && !sf2_instruments.is_empty() {
+                if !sf2_instruments.contains_key(lookup_path) {
+                    eprintln!(
+                        "sf2trace: MISS part={} lookup={:?} keys={:?}",
+                        part.name,
+                        lookup_path,
+                        sf2_instruments.keys().take(3).collect::<Vec<_>>()
+                    );
+                }
+            }
+            // Path 2: SF2 instrument sidecar.
+            if let Some(inst) = sf2_instruments.get(lookup_path) {
+                let key = ev.pitch_midi.unwrap_or(60).clamp(0, 127) as u8;
+                let vel_pct = ev.vol.unwrap_or(100.0).clamp(0.0, 100.0);
+                let vel = (vel_pct * 127.0 / 100.0).round().clamp(0.0, 127.0) as u8;
+                if let Some((sid, pitch_hz)) = inst.resolve(key, vel) {
+                    if samples.contains_key(&sid) {
+                        voices.push(TVoice {
+                            rel_row: ev.row,
+                            dur_rows: dur_beats * subs,
+                            pitch_hz,
+                            vol: ev.vol.unwrap_or(100.0),
+                                    pan: ev.pan.unwrap_or(0.0),
+                                    sample_id: sid,
+                                    offset: 0,
+                                    pitch_wp: Vec::new(),
+                                    vol_wp: Vec::new(),
+                                    pan_wp: Vec::new(),
+                        });
+                        last = Some(voices.len() - 1);
+                        continue;
+                    }
+                }
+            }
+
+            // Nothing matched.
+            continue;
+        } else {
+            let Some(idx) = last else { continue };
+            let dur_rows = ev.dur_beats.unwrap_or(0.0) * subs;
+            let v = &mut voices[idx];
+            if let Some(hz) = ev.pitch_hz {
+                v.pitch_wp.push((ev.row, dur_rows, hz));
+            }
+            if let Some(x) = ev.vol {
+                v.vol_wp.push((ev.row, dur_rows, x));
+            }
+            if let Some(x) = ev.pan {
+                v.pan_wp.push((ev.row, dur_rows, x));
+            }
+        }
+    }
+    PartTemplate { voices }
+}
+
+#[inline]
+fn fnv(h: &mut u64, v: u64) {
+    *h ^= v;
+    *h = h.wrapping_mul(0x100000001b3);
+}
+
+fn fingerprint(s: &Sample) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    fnv(&mut h, s.rate.to_bits());
+    fnv(&mut h, s.stereo as u64);
+    match s.loop_pts {
+        Some((a, b)) => {
+            fnv(&mut h, a as u64);
+            fnv(&mut h, b as u64);
+        }
+        None => fnv(&mut h, u64::MAX),
+    }
+    fnv(&mut h, s.left.len() as u64);
+    for x in &s.left {
+        fnv(&mut h, x.to_bits() as u64);
+    }
+    for x in &s.right {
+        fnv(&mut h, x.to_bits() as u64);
+    }
+    h
+}
+
+fn hash_part(
+    part: &TrackscriptPart,
+    path_to_id: &HashMap<String, u32>,
+    fps: &HashMap<u32, u64>,
+) -> u64 {
+    let mut h = DefaultHasher::new();
+    let sample_key = |path: &str| -> (u32, u64) {
+        match path_to_id.get(path) {
+            Some(id) => (*id, fps.get(id).copied().unwrap_or(0)),
+            None => (0, 0),
+        }
+    };
+    part.sample_path.hash(&mut h);
+    sample_key(&part.sample_path).hash(&mut h);
+    part.sample_offset.hash(&mut h);
+    part.subs_per_beat.hash(&mut h);
+    part.beats_per_measure.hash(&mut h);
+    let ob = |x: Option<f64>| x.map(f64::to_bits);
+    for ev in &part.events {
+        ev.op.hash(&mut h);
+        ev.row.to_bits().hash(&mut h);
+        ob(ev.pitch_hz).hash(&mut h);
+        ob(ev.vol).hash(&mut h);
+        ob(ev.pan).hash(&mut h);
+        ob(ev.dur_beats).hash(&mut h);
+        ev.offset.hash(&mut h);
+        ev.sample_override.hash(&mut h);
+        if let Some(p) = &ev.sample_override {
+            sample_key(p).hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+pub(crate) struct Cache {
+    enabled: bool,
+    map: HashMap<u64, Arc<PartTemplate>>,
+    hits: u64,
+    misses: u64,
+}
+
+impl Cache {
+    fn new(enabled: bool) -> Self {
+        Cache {
+            enabled,
+            map: HashMap::new(),
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn template(
+        &mut self,
+        hash: u64,
+        part: &TrackscriptPart,
+        path_to_id: &HashMap<String, u32>,
+        samples: &HashMap<u32, Arc<Sample>>,
+        sf2_instruments: &HashMap<String, Arc<Sf2Instrument>>,
+    ) -> Arc<PartTemplate> {
+        if self.enabled {
+            if let Some(t) = self.map.get(&hash) {
+                self.hits += 1;
+                return Arc::clone(t);
+            }
+        }
+        self.misses += 1;
+        let t = Arc::new(build_template(part, path_to_id, samples, sf2_instruments));
+        if self.enabled {
+            self.map.insert(hash, Arc::clone(&t));
+        }
+        t
+    }
+
+    pub(crate) fn describe(&self) -> String {
+        if self.enabled {
+            format!("part cache: {} hits, {} builds", self.hits, self.misses)
+        } else {
+            format!("part cache: off ({} builds)", self.misses)
+        }
+    }
+}
+
+// ── project ────────────────────────────────────────────────────────────
+
+struct LineInfo {
+    parts: Vec<String>,
+    min_start: i64,
+    max_end: i64,
+}
+
+pub(crate) struct Project {
+    parts: HashMap<String, TrackscriptPart>,
+    part_hash: HashMap<String, u64>,
+    samples: HashMap<u32, Arc<Sample>>,
+    path_to_id: HashMap<String, u32>,
+    sf2_instruments: HashMap<String, Arc<Sf2Instrument>>,
+    lines: Vec<LineInfo>,
+    order: Vec<usize>,
+    tempo: TempoMap,
+    rows_per_measure: f64,
+    render_end_sec: f64,
+    pub(crate) total_samples: i64,
+    pub(crate) song_volume: f64,
+    pub(crate) linear_pan: bool,
+    pub(crate) sample_rate: u32,
+    pub(crate) title: String,
+    pub(crate) initial_bpm: f64,
+    pub(crate) time_signature: (u32, u32),
+    pub(crate) voice_count: usize,
+}
+
+impl Project {
+    pub(crate) fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// Total playable seconds (already accounts for the tail).
+    pub(crate) fn total_secs(&self) -> f64 {
+        self.total_samples as f64 / self.sample_rate as f64
+    }
+
+    /// Part names on BlockList line `i`, or `&[]` if out of range.
+    pub(crate) fn line_parts(&self, i: usize) -> &[String] {
+        self.lines.get(i).map(|l| l.parts.as_slice()).unwrap_or(&[])
+    }
+
+    /// Index of the BlockList line whose first voice starts at or before
+    /// `pos` (in samples) and whose end is after `pos`, if any.
+    pub(crate) fn current_line(&self, pos: i64) -> Option<usize> {
+        let mut lo = 0usize;
+        let mut hi = self.order.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.lines[self.order[mid]].min_start <= pos {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo == 0 {
+            return None;
+        }
+        let li = self.order[lo - 1];
+        if self.lines[li].max_end > pos {
+            Some(li)
+        } else {
+            None
+        }
+    }
+
+    /// One measure's worth of rows, per config.
+    pub(crate) fn rows_per_measure(&self) -> f64 {
+        self.rows_per_measure
+    }
+
+    /// Sample index where BlockList line `li` begins.
+    pub(crate) fn line_start_sample(&self, li: usize) -> i64 {
+        self.lines.get(li).map(|l| l.min_start).unwrap_or(0)
+    }
+
+    /// Sample index where BlockList line `li` ends.
+    pub(crate) fn line_end_sample(&self, li: usize) -> i64 {
+        self.lines.get(li).map(|l| l.max_end).unwrap_or(0)
+    }
+
+    /// Raw events of a named part (composite or direct).
+    pub(crate) fn part_events(&self, name: &str) -> &[TrackscriptEvent] {
+        self.parts
+        .get(name)
+        .map(|p| p.events.as_slice())
+        .unwrap_or(&[])
+    }
+
+    /// subs_per_beat of a named part, defaulting to 4 if unknown.
+    pub(crate) fn part_subs_per_beat(&self, name: &str) -> u32 {
+        self.parts.get(name).map(|p| p.subs_per_beat).unwrap_or(4)
+    }
+
+    /// Sample duration of the measure that starts at BlockList line `li`.
+    pub(crate) fn line_measure_samples(&self, li: usize) -> i64 {
+        let start_row = li as f64 * self.rows_per_measure;
+        let end_row = start_row + self.rows_per_measure;
+        let sr = self.sample_rate as f64;
+        ((self.tempo.time_at_row(end_row) - self.tempo.time_at_row(start_row)) * sr) as i64
+    }
+}
+
+fn load_wav(path: &Path) -> Result<(Vec<Vec<f32>>, f64)> {
+    let mut reader =
+    hound::WavReader::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let spec = reader.spec();
+    let ch = spec.channels.max(1) as usize;
+    let interleaved: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Int => {
+            let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
+            reader
+            .samples::<i32>()
+            .map(|s| s.map(|v| v as f32 / max))
+            .collect::<Result<_, _>>()?
+        }
+        hound::SampleFormat::Float => reader.samples::<f32>().collect::<Result<_, _>>()?,
+    };
+    let keep = ch.min(2);
+    let mut chans = vec![Vec::with_capacity(interleaved.len() / ch); keep];
+    for frame in interleaved.chunks_exact(ch) {
+        for (c, out) in chans.iter_mut().enumerate() {
+            out.push(frame[c]);
+        }
+    }
+    Ok((chans, spec.sample_rate as f64))
+}
+
+pub(crate) fn load_project(
+    ts_path: &Path,
+    sample_rate: u32,
+    use_cache: bool,
+) -> Result<(Arc<Project>, Cache)> {
+    let parsed = parse_file(ts_path)?;
+    let base = ts_path.parent().unwrap_or_else(|| Path::new("."));
+    let cfg = &parsed.config;
+
+    let mut samples: HashMap<u32, Arc<Sample>> = HashMap::new();
+    let mut fps: HashMap<u32, u64> = HashMap::new();
+    let mut path_to_id: HashMap<String, u32> = HashMap::new();
+    let lib_path = base.join("samples.json");
+    if lib_path.exists() {
+        let text = std::fs::read_to_string(&lib_path)?;
+        let lib: SampleLibrary = serde_json::from_str(&text)
+        .with_context(|| format!("parsing {}", lib_path.display()))?;
+        for s in lib.samples {
+            let Some(rel) = s.file else { continue };
+            let path = base.join(&rel);
+            if !path.exists() {
+                continue;
+            }
+            let (mut chans, rate) = load_wav(&path)?;
+            let stereo = chans.len() == 2;
+            let right = if stereo {
+                chans.pop().unwrap()
+            } else {
+                Vec::new()
+            };
+            let left = chans.pop().unwrap_or_default();
+            let loop_pts = s
+            .loops
+            .main
+            .filter(|l| l.end > l.start)
+            .map(|l| (l.start as i64, l.end as i64));
+            let smp = Sample {
+                left,
+                right,
+                stereo,
+                rate,
+                loop_pts,
+            };
+            fps.insert(s.id, fingerprint(&smp));
+            samples.insert(s.id, Arc::new(smp));
+            if let Some(stripped) = rel.strip_prefix("./") {
+                path_to_id.insert(stripped.to_string(), s.id);
+            }
+            path_to_id.insert(rel, s.id);
+        }
+    } else {
+        eprintln!("  (no samples.json in {})", base.display());
+    }
+    println!("  loaded {} samples", samples.len());
+
+    // ── Load SF2 instruments ──────────────────────────────────────────
+    let mut sf2_instruments: HashMap<String, Arc<Sf2Instrument>> = HashMap::new();
+    let mut next_sf2_id: u32 = 10_000;
+    let inst_dir = base.join("instruments");
+    if let Ok(entries) = std::fs::read_dir(&inst_dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("instrument") {
+                continue;
+            }
+            let Ok(inst) = crate::instruments::load(&p) else { continue };
+            if !inst.is_sf2() {
+                continue;
+            }
+            // `File:` is relative to the trackscript root (like samples.json).
+            let sf2_path = if inst.sf2_path.is_absolute() {
+                inst.sf2_path.clone()
+            } else {
+                base.join(&inst.sf2_path)
+            };
+            match load_sf2_instrument(&sf2_path, next_sf2_id, &mut samples) {
+                Ok(obj) => {
+                    next_sf2_id += obj.zones.len() as u32 + 1;
+                    if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                        let rel = format!("instruments/{}.instrument", stem);
+                        sf2_instruments.insert(rel, Arc::new(obj));
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "  (failed to load SF2 {}: {:#})",
+                              sf2_path.display(),
+                              e
+                    );
+                }
+            }
+        }
+    }
+    println!("  loaded {} sf2 instruments", sf2_instruments.len());
+
+    let sr = sample_rate as f64;
+    let rows_per_measure = cfg.time_signature.0 as f64 * cfg.subdivisions.max(1) as f64;
+    let tempo = TempoMap::new(cfg.bpm, &parsed.tempo_events, cfg.subdivisions);
+    let total_rows = parsed.block_list.len() as f64 * rows_per_measure;
+    tempo.prepare(total_rows);
+    let render_end_sec = tempo.time_at_row(total_rows) + TAIL_SECONDS;
+    let total_samples = (render_end_sec * sr) as i64;
+
+    let part_hash: HashMap<String, u64> = parsed
+    .parts
+    .iter()
+    .map(|(n, p)| (n.clone(), hash_part(p, &path_to_id, &fps)))
+    .collect();
+
+    let mut cache = Cache::new(use_cache);
+    let mut lines: Vec<LineInfo> = Vec::with_capacity(parsed.block_list.len());
+    let mut total_voices = 0usize;
+    for (li, line) in parsed.block_list.iter().enumerate() {
+        let placement_row = li as f64 * rows_per_measure;
+        let mut names = Vec::new();
+        let (mut min_row, mut max_end_row) = (f64::INFINITY, f64::NEG_INFINITY);
+        for call in line {
+            let part_names: Vec<String> = parsed
+            .blocks
+            .get(call)
+            .cloned()
+            .unwrap_or_else(|| vec![call.clone()]);
+            for name in part_names {
+                let Some(part) = parsed.parts.get(&name) else { continue };
+                let tpl = cache.template(
+                    part_hash[&name],
+                    part,
+                    &path_to_id,
+                    &samples,
+                    &sf2_instruments,
+                );
+                for tv in &tpl.voices {
+                    let start_row = placement_row + tv.rel_row;
+                    min_row = min_row.min(start_row);
+                    max_end_row = max_end_row.max(start_row + tv.dur_rows);
+                    total_voices += 1;
+                }
+                names.push(name);
+            }
+        }
+        let (min_start, max_end) = if min_row.is_finite() {
+            (
+                (tempo.time_at_row(min_row) * sr) as i64,
+             (tempo.time_at_row(max_end_row).min(render_end_sec) * sr) as i64,
+            )
+        } else {
+            (i64::MAX, i64::MIN)
+        };
+        lines.push(LineInfo {
+            parts: names,
+            min_start,
+            max_end,
+        });
+    }
+    if total_voices == 0 {
+        bail!("no playable voices (check samples.json and sample paths)");
+    }
+
+    let mut order: Vec<usize> = (0..lines.len())
+    .filter(|&i| lines[i].min_start != i64::MAX)
+    .collect();
+    order.sort_by_key(|&i| (lines[i].min_start, i));
+
+    println!(
+        "  parsed {} parts, {} blocks, {} BlockList lines, {} voices",
+        parsed.parts.len(),
+             parsed.blocks.len(),
+             parsed.block_list.len(),
+             total_voices
+    );
+
+    let title = ts_path
+    .file_stem()
+    .and_then(|s| s.to_str())
+    .unwrap_or("(untitled)")
+    .to_string();
+
+    let project = Project {
+        parts: parsed.parts,
+        part_hash,
+        samples,
+        path_to_id,
+        sf2_instruments,
+        lines,
+        order,
+        tempo,
+        rows_per_measure,
+        render_end_sec,
+        total_samples,
+        song_volume: cfg.song_volume / 100.0,
+        linear_pan: cfg.panning_law == "linear",
+        sample_rate,
+        title,
+        initial_bpm: cfg.bpm,
+        time_signature: cfg.time_signature,
+        voice_count: total_voices,
+    };
+    Ok((Arc::new(project), cache))
+}
+
+// ── loader ─────────────────────────────────────────────────────────────
+
+pub(crate) struct Loader {
+    project: Arc<Project>,
+    pub(crate) cache: Cache,
+    pub(crate) cursor: usize,
+}
+
+impl Loader {
+    pub(crate) fn new(project: Arc<Project>, cache: Cache) -> Self {
+        Loader {
+            project,
+            cache,
+            cursor: 0,
+        }
+    }
+
+    pub(crate) fn load_due(&mut self, horizon: i64) -> Vec<Scheduled> {
+        let project = Arc::clone(&self.project);
+        let mut out = Vec::new();
+        while self.cursor < project.order.len() {
+            let li = project.order[self.cursor];
+            if project.lines[li].min_start > horizon {
+                break;
+            }
+            self.cursor += 1;
+            out.extend(prepare_line(&project, &mut self.cache, li, i64::MIN));
+        }
+        out
+    }
+
+    pub(crate) fn seek(&mut self, to: i64, horizon: i64) -> Vec<Scheduled> {
+        let project = Arc::clone(&self.project);
+        self.cursor = 0;
+        let mut out = Vec::new();
+        while self.cursor < project.order.len() {
+            let li = project.order[self.cursor];
+            let line = &project.lines[li];
+            if line.min_start > horizon {
+                break;
+            }
+            self.cursor += 1;
+            if line.max_end <= to {
+                continue;
+            }
+            out.extend(prepare_line(&project, &mut self.cache, li, to));
+        }
+        out
+    }
+}
+
+fn prepare_line(project: &Project, cache: &mut Cache, li: usize, min_end: i64) -> Vec<Scheduled> {
+    let sr = project.sample_rate as f64;
+    let placement_row = li as f64 * project.rows_per_measure;
+    let tempo = &project.tempo;
+    let mut out = Vec::new();
+    let mut seq = 0u32;
+
+    for name in &project.lines[li].parts {
+        let part = &project.parts[name];
+        let tpl = cache.template(
+            project.part_hash[name],
+            part,
+            &project.path_to_id,
+            &project.samples,
+            &project.sf2_instruments,
+        );
+        for tv in &tpl.voices {
+            seq += 1;
+            let start_row = placement_row + tv.rel_row;
+            let end_row = start_row + tv.dur_rows;
+            let start = (tempo.time_at_row(start_row) * sr) as i64;
+            let end = (tempo.time_at_row(end_row).min(project.render_end_sec) * sr) as i64;
+            if end <= start || end <= min_end {
+                continue;
+            }
+            let sample = Arc::clone(&project.samples[&tv.sample_id]);
+            if sample.len() == 0 {
+                continue;
+            }
+            let mk = |wp: &Vec<Waypoint>, initial: f64| -> Option<AutomationLane> {
+                if wp.is_empty() {
+                    return None;
+                }
+                let abs: Vec<Waypoint> = wp
+                .iter()
+                .map(|&(r, d, x)| (placement_row + r, d, x))
+                .collect();
+                Some(AutomationLane::new(initial, start_row, &abs, tempo))
+            };
+            out.push(Scheduled {
+                start,
+                end,
+                line: li as u32,
+                seq,
+                sample,
+                pitch_hz: tv.pitch_hz,
+                offset: tv.offset as f64,
+                vol: tv.vol,
+                pan: tv.pan,
+                pitch_lane: mk(&tv.pitch_wp, tv.pitch_hz),
+                     vol_lane: mk(&tv.vol_wp, tv.vol),
+                     pan_lane: mk(&tv.pan_wp, tv.pan),
+                     const_gain: gains(tv.vol, tv.pan, project.song_volume, project.linear_pan),
+            });
+        }
+    }
+    out
+}
