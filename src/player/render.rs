@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use super::engine::Engine;
 use super::project::{Cache, Loader, Project};
+use crate::effects::EffectChain;
 use crate::vst_host_ffi::VstHost;
 
 const BLOCK: usize = 4096;
@@ -14,6 +15,7 @@ pub(crate) fn render_offline(
     project: &Arc<Project>,
     cache: Cache,
     start: i64,
+    no_master_fx: bool,
 ) -> (Vec<f32>, Vec<f32>, Cache) {
     let lookahead = project.sample_rate as i64;
     let start = start.clamp(0, project.total_samples);
@@ -50,6 +52,21 @@ pub(crate) fn render_offline(
         }
     }
     println!("  installed {} VST host(s)", engine.host_count());
+
+    // Master bus effects.  Silent if master_fx.json is missing or empty.
+    if !no_master_fx {
+        match EffectChain::load_default(project.sample_rate) {
+            Ok(chain) => {
+                if !chain.is_empty() {
+                    println!("  {}", chain.describe());
+                }
+                engine.install_master_fx(chain);
+            }
+            Err(e) => {
+                eprintln!("  master fx: {:#}", e);
+            }
+        }
+    }
 
     let first = loader.seek(start, start + lookahead);
     engine.apply_seek(start, first.samples);

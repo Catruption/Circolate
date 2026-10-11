@@ -6,6 +6,7 @@
 mod convert;
 mod display;
 mod dump;
+mod effects;
 mod export;
 mod fallbacks;
 mod fetch;
@@ -24,9 +25,6 @@ mod vst_smoke;
 use anyhow::{bail, Result};
 
 fn main() -> Result<()> {
-    // Exit quietly on SIGPIPE (e.g. `dump foo | head` closing the reader
-    // early).  Without this, the default Rust runtime turns SIGPIPE into a
-    // panic, which is neither useful nor a real error.
     #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
@@ -34,8 +32,6 @@ fn main() -> Result<()> {
 
     let mut args: Vec<String> = std::env::args().collect();
 
-    // Pull out the pause flag wherever it appears, so it doesn't confuse
-    // the subcommand parsers.
     let pause = args.iter().any(|a| a == "--pause");
     args.retain(|a| a != "--pause");
 
@@ -53,7 +49,6 @@ fn main() -> Result<()> {
             print_help();
             Ok(())
         }
-        // Back-compat: `trackscript-player song.trackscript` still plays.
         Some(other) if std::path::Path::new(other).exists() => play::run(&args[1..]),
         Some(other) => bail!("unknown command: {other}"),
     };

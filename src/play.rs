@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use crate::convert::{self, ConvertOptions};
 use crate::display;
+use crate::effects::EffectChain;
 use crate::player::{self, Engine, Loader, Msg, Transport};
 use crate::sources::SourceKind;
 use crate::tui;
@@ -27,6 +28,7 @@ struct Args {
     verify: bool,
     samples_dir: Option<PathBuf>,
     skip_native: bool,
+    no_master_fx: bool,
 }
 
 fn parse_args(argv: &[String]) -> Result<Args> {
@@ -38,6 +40,7 @@ fn parse_args(argv: &[String]) -> Result<Args> {
     let (mut no_cache, mut verify) = (false, false);
     let mut samples_dir: Option<PathBuf> = None;
     let mut skip_native = false;
+    let mut no_master_fx = false;
     while let Some(a) = it.next() {
         match a.as_str() {
             "--render" => {
@@ -65,6 +68,7 @@ fn parse_args(argv: &[String]) -> Result<Args> {
             "--skip-native" => skip_native = true,
             "--no-cache" => no_cache = true,
             "--verify-cache" => verify = true,
+            "--no-master-fx" => no_master_fx = true,
             _ if song.is_none() => song = Some(PathBuf::from(a)),
             _ => bail!("unexpected argument {a}"),
         }
@@ -73,10 +77,13 @@ fn parse_args(argv: &[String]) -> Result<Args> {
         anyhow!(
             "usage: trackscript-player play <song> \
 [--start SEC] [--samples-dir DIR] [--skip-native] [--no-cache] [--verify-cache] \
-[--render out.wav [--rate HZ]]"
+[--no-master-fx] [--render out.wav [--rate HZ]]"
         )
     })?;
-    Ok(Args { song, render, rate, start, no_cache, verify, samples_dir, skip_native })
+    Ok(Args {
+        song, render, rate, start, no_cache, verify,
+       samples_dir, skip_native, no_master_fx,
+    })
 }
 
 /// A temporary directory that deletes itself on drop.
@@ -153,8 +160,6 @@ fn resolve_source(src: &Path, args: &Args) -> Result<(PathBuf, Option<TempBundle
     }
 }
 
-/// Install every resolved VST host onto the engine.  Called once before
-/// the audio callback takes ownership of the engine.
 fn install_vst_hosts(engine: &mut Engine, project: &player::Project) {
     for (name, vinst) in &project.vst_instruments {
         let Some(path_str) = vinst.plugin_path.to_str() else {
@@ -181,6 +186,21 @@ fn install_vst_hosts(engine: &mut Engine, project: &player::Project) {
         }
     }
     println!("  installed {} VST host(s)", engine.host_count());
+}
+
+fn install_master_fx(engine: &mut Engine, project: &player::Project, disabled: bool) {
+    if disabled {
+        return;
+    }
+    match EffectChain::load_default(project.sample_rate) {
+        Ok(chain) => {
+            if !chain.is_empty() {
+                println!("  {}", chain.describe());
+            }
+            engine.install_master_fx(chain);
+        }
+        Err(e) => eprintln!("  master fx: {:#}", e),
+    }
 }
 
 fn worker(mut loader: Loader, tx: Sender<Msg>, tp: Arc<Transport>, lookahead: i64) {
@@ -223,10 +243,10 @@ fn verify_cache(args: &Args) -> Result<()> {
     let rate = args.rate;
     let (path, _guard) = resolve_source(&args.song, args)?;
     let (p1, c1) = player::load_project(&path, rate, true)?;
-    let (a_l, a_r, c1) = player::render_offline(&p1, c1, 0);
+    let (a_l, a_r, c1) = player::render_offline(&p1, c1, 0, true);
     println!("  with cache:    {}", c1.describe());
     let (p2, c2) = player::load_project(&path, rate, false)?;
-    let (b_l, b_r, c2) = player::render_offline(&p2, c2, 0);
+    let (b_l, b_r, c2) = player::render_offline(&p2, c2, 0, true);
     println!("  without cache: {}", c2.describe());
 
     let diffs = |a: &[f32], b: &[f32]| {
@@ -259,7 +279,7 @@ pub fn run(argv: &[String]) -> Result<()> {
         let (project, cache) = player::load_project(&path, args.rate, !args.no_cache)?;
         let t0 = std::time::Instant::now();
         let start = (args.start * args.rate as f64) as i64;
-        let (l, r, cache) = player::render_offline(&project, cache, start);
+        let (l, r, cache) = player::render_offline(&project, cache, start, args.no_master_fx);
         player::write_wav(out, &l, &r, args.rate)?;
         println!(
             "  wrote {} ({:.2}s of audio in {:.1}s; {})",
@@ -319,11 +339,9 @@ pub fn run(argv: &[String]) -> Result<()> {
         std::thread::spawn(move || worker(loader, tx, tp, lookahead));
     }
 
-    // Engine is built on the main thread, hosts installed here, then moved
-    // into the audio callback.  Hosts load before playback begins, so no
-    // audio glitch from plugin init.
     let mut engine = Engine::new(&project);
     install_vst_hosts(&mut engine, &project);
+    install_master_fx(&mut engine, &project, args.no_master_fx);
 
     let tp = Arc::clone(&transport);
     let mut left = vec![0f32; 4096];

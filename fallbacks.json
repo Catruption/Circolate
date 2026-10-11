@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "mappings": [
+    {
+      "match": { "vst_basename": "ZENOLOGY.vst" },
+      "fallback": {
+        "name": "Surge XT",
+        "kind": "vst3",
+        "acquire": {
+          "url": "https://github.com/surge-synthesizer/surge/releases/download/Release_1.3.4/surge-xt-linux-1.3.4-pluginsonly.tar.gz",
+          "archive": "tar.gz",
+          "extract_to": "plugins/",
+          "provides": "plugins/surge-xt-linux-1.3.4-pluginsonly/Surge XT.vst3"
+        }
+      },
+      "note": "poly pads / leads — rebuild by ear from note data"
+    },
+    {
+      "match": { "vst_basename": "Arcade.vst" },
+      "fallback": {
+        "name": "Surge XT",
+        "kind": "vst3",
+        "acquire": {
+          "url": "https://github.com/surge-synthesizer/surge/releases/download/Release_1.3.4/surge-xt-linux-1.3.4-pluginsonly.tar.gz",
+          "archive": "tar.gz",
+          "extract_to": "plugins/",
+          "provides": "plugins/surge-xt-linux-1.3.4-pluginsonly/Surge XT.vst3"
+        }
+      },
+      "note": "was Hyperion Warm Pulse; Floe crashes in process() so routed to Surge XT"
+    },
+    {
+      "match": { "vst_basename": "Splice INSTRUMENT.vst" },
+      "fallback": {
+        "name": "Decent Sampler",
+        "kind": "vst3",
+        "acquire": {
+          "url": "https://cdn.decentsamples.com/production/builds/ds/1.36.2/Decent_Sampler-1.36.2-Linux-Static-x86_64.tar.gz",
+          "archive": "tar.gz",
+          "extract_to": "plugins/",
+          "provides": "plugins/Decent_Sampler-1.36.2-Linux-Static-x86_64/Decent Sampler.vst3"
+        }
+      },
+      "note": "sample player"
+    }
+  ],
+  "default": {
+    "fallback": { "name": "Surge XT", "kind": "vst3" },
+    "on_missing": "warn"
+  }
+}

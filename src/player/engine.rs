@@ -4,6 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::f64::consts::{FRAC_PI_4, PI};
 use std::sync::{Arc, OnceLock};
 
+use crate::effects::EffectChain;
 use crate::sources::trackscript::C5_HZ;
 use crate::timing::AutomationLane;
 use crate::vst_host_ffi::VstHost;
@@ -215,6 +216,9 @@ pub(crate) struct Engine {
     vst_active: Vec<VstNote>,
     vst_scratch_l: Vec<f32>,
     vst_scratch_r: Vec<f32>,
+
+    // Master bus effects — one chain, run on the fully-summed stereo mix.
+    master_fx: Option<EffectChain>,
 }
 
 impl Engine {
@@ -234,6 +238,7 @@ impl Engine {
             vst_active: Vec::new(),
             vst_scratch_l: vec![0.0; VST_BLOCK as usize],
             vst_scratch_r: vec![0.0; VST_BLOCK as usize],
+            master_fx: None,
         }
     }
 
@@ -245,6 +250,15 @@ impl Engine {
 
     pub(crate) fn host_count(&self) -> usize {
         self.hosts.len()
+    }
+
+    /// Attach a master-bus effect chain.  Runs after all voices are summed.
+    pub(crate) fn install_master_fx(&mut self, chain: EffectChain) {
+        self.master_fx = Some(chain);
+    }
+
+    pub(crate) fn master_fx_count(&self) -> usize {
+        self.master_fx.as_ref().map_or(0, |c| c.len())
     }
 
     pub(crate) fn sample_rate(&self) -> f64 { self.sr }
@@ -419,6 +433,18 @@ impl Engine {
             self.render_vsts(out_l, out_r, block_start);
         }
 
+        // ── master bus effects ─────────────────────────────────────────
+        if let Some(chain) = self.master_fx.as_mut() {
+            if !chain.is_empty() {
+                let mut i = 0;
+                while i < out_l.len() {
+                    let n = (out_l.len() - i).min(VST_BLOCK as usize);
+                    chain.process(&mut out_l[i..i + n], &mut out_r[i..i + n]);
+                    i += n;
+                }
+            }
+        }
+
         self.pos = block_end;
     }
 
@@ -471,8 +497,7 @@ impl Engine {
                     *s = 0.0;
                 }
 
-                // Sum every host into scratch.  Disjoint borrows for the field
-                // split — hosts, scratch_l, scratch_r are three separate fields.
+                // Sum every host into scratch.
                 let hosts = &mut self.hosts;
                 let scratch_l = &mut self.vst_scratch_l;
                 let scratch_r = &mut self.vst_scratch_r;

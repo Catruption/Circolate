@@ -1,4 +1,13 @@
 // vst_shim.cpp — flat C ABI over the Steinberg VST3 SDK.
+//
+// Hosts instruments (no audio input) and effects (stereo input).
+// Detection is automatic: if the plugin declares an input bus, we
+// allocate silent scratch for it and pass it through ProcessData.
+//
+// DPF-based plugins (Dragonfly, x42, most LSP) assert on null host
+// pointers in ProcessData and on out-of-order init calls, so we always
+// provide non-null inputParameterChanges, outputParameterChanges, and
+// processContext, and we initialize() before querying bus counts.
 
 #include <algorithm>
 #include <cstring>
@@ -8,12 +17,14 @@
 
 #include "public.sdk/source/vst/hosting/module.h"
 #include "public.sdk/source/vst/hosting/hostclasses.h"
+#include "public.sdk/source/vst/hosting/parameterchanges.h"
 #include "public.sdk/source/common/memorystream.h"
 #include "pluginterfaces/base/ipluginbase.h"
 #include "pluginterfaces/vst/ivstcomponent.h"
 #include "pluginterfaces/vst/ivsteditcontroller.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
 #include "pluginterfaces/vst/ivstevents.h"
+#include "pluginterfaces/vst/ivstprocesscontext.h"
 #include "pluginterfaces/vst/vstspeaker.h"
 
 using namespace Steinberg;
@@ -49,19 +60,30 @@ public:
 
 struct Shim {
     VST3::Hosting::Module::Ptr module;
-    IPtr<IHostApplication>   host_app;
-    IPtr<IComponent>         component;
-    IPtr<IEditController>    controller;
-    IPtr<IAudioProcessor>    processor;
+    IPtr<IHostApplication>     host_app;
+    IPtr<IComponent>           component;
+    IPtr<IEditController>      controller;
+    IPtr<IAudioProcessor>      processor;
 
     int sampleRate = 44100;
     int blockSize  = 512;
 
+    bool hasInput = false;
+
     std::vector<float> scratchL, scratchR;
-    std::vector<AudioBusBuffers> outBuses;
+    std::vector<float> inScratchL, inScratchR;
     std::vector<float*> outChannelPtrs;
+    std::vector<float*> inChannelPtrs;
+    std::vector<AudioBusBuffers> outBuses;
+    std::vector<AudioBusBuffers> inBuses;
 
     std::vector<Event> pending;
+
+    ParameterChanges inParams;
+    ParameterChanges outParams;
+    ProcessContext   context;
+
+    int64 samplePos = 0;
 };
 
 static bool pick_class(const VST3::Hosting::PluginFactory& factory,
@@ -105,8 +127,6 @@ extern "C" {
             s->sampleRate = sr;
             s->blockSize  = block;
 
-            // Host application context — required by some plugins (notably
-            // CLAP-to-VST3 wrappers) that dereference it during initialize().
             s->host_app = new HostApplication();
 
             s->component = factory.createInstance<IComponent>(ci.ID());
@@ -123,22 +143,35 @@ extern "C" {
             return nullptr;
                 }
 
+                // initialize() must come before any VST3 call that touches the
+                // plugin's internal state.  DPF plugins set up their vst3 pointer
+                // here and assert on anything that runs first.
                 s->component->initialize(s->host_app);
                 if (s->controller.get()) {
                     s->controller->initialize(s->host_app);
                 }
 
-                // Bus negotiation.  Instruments take no input, one stereo output.
-                // Some plugins require this before setupProcessing or they crash
-                // trying to reconcile an undefined bus layout.
-                SpeakerArrangement out_arr = SpeakerArr::kStereo;
-                s->processor->setBusArrangements(nullptr, 0, &out_arr, 1);
+                // Now bus counts are safe to query.
+                int32 inCount  = s->component->getBusCount(kAudio, kInput);
+                int32 outCount = s->component->getBusCount(kAudio, kOutput);
+                s->hasInput    = inCount > 0;
 
-                if (s->component->getBusCount(kAudio, kOutput) > 0) {
+                // setBusArrangements before activateBus — the arrangement
+                // determines channel counts on DPF plugins, and activating a bus
+                // with an undefined layout trips their assert.
+                SpeakerArrangement out_arr = SpeakerArr::kStereo;
+                if (s->hasInput) {
+                    SpeakerArrangement in_arr = SpeakerArr::kStereo;
+                    s->processor->setBusArrangements(&in_arr, 1, &out_arr, 1);
+                } else {
+                    s->processor->setBusArrangements(nullptr, 0, &out_arr, 1);
+                }
+
+                if (outCount > 0) {
                     s->component->activateBus(kAudio, kOutput, 0, true);
                 }
-                if (s->component->getBusCount(kAudio, kInput) > 0) {
-                    s->component->activateBus(kAudio, kInput, 0, false);
+                if (s->hasInput) {
+                    s->component->activateBus(kAudio, kInput, 0, true);
                 }
 
                 ProcessSetup setup{};
@@ -156,13 +189,31 @@ extern "C" {
 
                 s->scratchL.assign(block, 0.0f);
                 s->scratchR.assign(block, 0.0f);
-
                 s->outChannelPtrs.resize(2);
-                AudioBusBuffers bus{};
-                bus.numChannels      = 2;
-                bus.channelBuffers32 = s->outChannelPtrs.data();
-                bus.silenceFlags     = 0;
-                s->outBuses.push_back(bus);
+                AudioBusBuffers outBus{};
+                outBus.numChannels      = 2;
+                outBus.channelBuffers32 = s->outChannelPtrs.data();
+                outBus.silenceFlags     = 0;
+                s->outBuses.push_back(outBus);
+
+                if (s->hasInput) {
+                    s->inScratchL.assign(block, 0.0f);
+                    s->inScratchR.assign(block, 0.0f);
+                    s->inChannelPtrs.resize(2);
+                    AudioBusBuffers inBus{};
+                    inBus.numChannels      = 2;
+                    inBus.channelBuffers32 = s->inChannelPtrs.data();
+                    inBus.silenceFlags     = 0;
+                    s->inBuses.push_back(inBus);
+                }
+
+                s->context = ProcessContext{};
+                s->context.state              = ProcessContext::kPlaying;
+                s->context.sampleRate         = static_cast<double>(sr);
+                s->context.projectTimeSamples = 0;
+                s->context.tempo              = 120.0;
+                s->context.timeSigNumerator   = 4;
+                s->context.timeSigDenominator = 4;
 
                 return s;
         } catch (...) {
@@ -240,16 +291,23 @@ extern "C" {
         SimpleEventList evList;
         evList.events.swap(s->pending);
 
+        s->inParams.clearQueue();
+        s->outParams.clearQueue();
+        s->context.projectTimeSamples = s->samplePos;
+
         ProcessData pd{};
-        pd.processMode        = kRealtime;
-        pd.symbolicSampleSize = kSample32;
-        pd.numSamples         = frames;
-        pd.numInputs          = 0;
-        pd.inputs             = nullptr;
-        pd.numOutputs         = static_cast<int32>(s->outBuses.size());
-        pd.outputs            = s->outBuses.data();
-        pd.inputEvents        = &evList;
-        pd.outputEvents       = nullptr;
+        pd.processMode             = kRealtime;
+        pd.symbolicSampleSize      = kSample32;
+        pd.numSamples              = frames;
+        pd.numInputs               = 0;
+        pd.inputs                  = nullptr;
+        pd.numOutputs              = static_cast<int32>(s->outBuses.size());
+        pd.outputs                 = s->outBuses.data();
+        pd.inputEvents             = &evList;
+        pd.outputEvents            = nullptr;
+        pd.inputParameterChanges   = &s->inParams;
+        pd.outputParameterChanges  = &s->outParams;
+        pd.processContext          = &s->context;
 
         if (s->processor->process(pd) != kResultOk) return 0;
 
@@ -257,6 +315,54 @@ extern "C" {
             outL[i] = s->scratchL[i];
             outR[i] = s->scratchR[i];
         }
+        s->samplePos += frames;
+        return 1;
+    }
+
+    int vst_shim_process_inplace(void* h, float* bufL, float* bufR, int frames) {
+        auto s = static_cast<Shim*>(h);
+        if (!s || !s->processor.get()) return 0;
+        if (frames > s->blockSize) frames = s->blockSize;
+        if (frames <= 0) return 1;
+        if (!s->hasInput) return 1;
+
+        std::memcpy(s->inScratchL.data(), bufL, frames * sizeof(float));
+        std::memcpy(s->inScratchR.data(), bufR, frames * sizeof(float));
+
+        std::fill(s->scratchL.begin(), s->scratchL.begin() + frames, 0.0f);
+        std::fill(s->scratchR.begin(), s->scratchR.begin() + frames, 0.0f);
+
+        s->inChannelPtrs[0]  = s->inScratchL.data();
+        s->inChannelPtrs[1]  = s->inScratchR.data();
+        s->outChannelPtrs[0] = s->scratchL.data();
+        s->outChannelPtrs[1] = s->scratchR.data();
+
+        SimpleEventList evList;
+        evList.events.swap(s->pending);
+
+        s->inParams.clearQueue();
+        s->outParams.clearQueue();
+        s->context.projectTimeSamples = s->samplePos;
+
+        ProcessData pd{};
+        pd.processMode             = kRealtime;
+        pd.symbolicSampleSize      = kSample32;
+        pd.numSamples              = frames;
+        pd.numInputs               = static_cast<int32>(s->inBuses.size());
+        pd.inputs                  = s->inBuses.data();
+        pd.numOutputs              = static_cast<int32>(s->outBuses.size());
+        pd.outputs                 = s->outBuses.data();
+        pd.inputEvents             = &evList;
+        pd.outputEvents            = nullptr;
+        pd.inputParameterChanges   = &s->inParams;
+        pd.outputParameterChanges  = &s->outParams;
+        pd.processContext          = &s->context;
+
+        if (s->processor->process(pd) != kResultOk) return 0;
+
+        std::memcpy(bufL, s->scratchL.data(), frames * sizeof(float));
+        std::memcpy(bufR, s->scratchR.data(), frames * sizeof(float));
+        s->samplePos += frames;
         return 1;
     }
 

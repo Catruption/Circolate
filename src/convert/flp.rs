@@ -72,7 +72,7 @@ fn resolve_plugin(
         return Resolved::Exact { name: display, path: path.clone() };
     }
 
-    // (b) Configured fallback?
+    // (b) Configured fallback for this specific plugin?
     if let Some(table) = fallbacks {
         if let Some((_m, target)) = table.resolve(&plugin.vst_path, &display) {
             let target_path = index.find_vst3(&target.name).cloned();
@@ -84,7 +84,20 @@ fn resolve_plugin(
         }
     }
 
-    // (c) Nothing.
+    // (c) Wildcard default from the fallback table.
+    if let Some(table) = fallbacks {
+        let rule = table.default_rule();
+        if let Some(target) = &rule.fallback {
+            let target_path = index.find_vst3(&target.name).cloned();
+            return Resolved::Fallback {
+                name: target.name.clone(),
+                path: target_path,
+                replaces: display,
+            };
+        }
+    }
+
+    // (d) Nothing.
     Resolved::Unresolved { name: display }
 }
 
@@ -177,9 +190,7 @@ pub(super) fn convert(
     let fallback_table = match FallbackTable::load_default() {
         Ok(t) => Some(t),
         Err(e) => {
-            if debug_on() {
-                eprintln!("flp: no fallbacks.json ({e})");
-            }
+            eprintln!("flp: fallback table unavailable ({e:#}); native channels use exact match only");
             None
         }
     };

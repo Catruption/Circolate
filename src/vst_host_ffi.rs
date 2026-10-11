@@ -1,4 +1,9 @@
 //! Thin wrapper around a small C++ shim (vst_shim.cpp) that hosts VST3s.
+//!
+//! Instruments and effects share the same wrapper.  Callers decide which
+//! entry point to use: `process()` for synths (writes output, ignores
+//! input), `process_inplace()` for effects (reads and writes the same
+//! buffer).
 
 use anyhow::Result;
 use std::ffi::CString;
@@ -19,6 +24,9 @@ extern "C" {
                                              fn vst_shim_process(handle: *mut c_void,
                                                                  out_l: *mut c_float, out_r: *mut c_float,
                                                                  frames: c_int) -> c_int;
+                                                                 fn vst_shim_process_inplace(handle: *mut c_void,
+                                                                                             buf_l: *mut c_float, buf_r: *mut c_float,
+                                                                                             frames: c_int) -> c_int;
 }
 
 pub struct VstHost {
@@ -42,7 +50,6 @@ impl VstHost {
         Ok(VstHost { handle })
     }
 
-    /// Note on at a specific sample offset within the current block.
     pub fn note_on_at(&mut self, note: u8, vel: u8, sample_offset: i32) {
         unsafe {
             vst_shim_note_on(self.handle, note as c_int, vel as c_int, sample_offset);
@@ -55,8 +62,6 @@ impl VstHost {
         }
     }
 
-    /// Convenience: note on at the start of the next block.  Used by
-    /// `vst-smoke` and any caller that doesn't schedule per-sample.
     pub fn note_on(&mut self, note: u8, vel: u8) {
         self.note_on_at(note, vel, 0);
     }
@@ -65,10 +70,19 @@ impl VstHost {
         self.note_off_at(note, 0);
     }
 
+    /// Instrument path: synth writes here, input is ignored.
     pub fn process(&mut self, l: &mut [f32], r: &mut [f32]) {
         unsafe {
             vst_shim_process(self.handle, l.as_mut_ptr(), r.as_mut_ptr(),
                              l.len() as c_int);
+        }
+    }
+
+    /// Effect path: reads and writes the same buffer.
+    pub fn process_inplace(&mut self, l: &mut [f32], r: &mut [f32]) {
+        unsafe {
+            vst_shim_process_inplace(self.handle, l.as_mut_ptr(), r.as_mut_ptr(),
+                                     l.len() as c_int);
         }
     }
 }
@@ -80,7 +94,6 @@ impl Drop for VstHost {
 }
 
 // SAFETY: the raw handle is only dereferenced through `&mut self`.  The
-// engine owns each `VstHost` and only touches it from one thread at a
-// time — either the audio callback (live) or the render loop (offline) —
-// so moving ownership across threads is fine.
+// engine owns each `VstHost` and only touches it from the audio callback
+// (live) or the render loop (offline), never both at once.
 unsafe impl Send for VstHost {}

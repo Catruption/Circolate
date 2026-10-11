@@ -1,6 +1,11 @@
 //! `trackscript-player export` — convert a source file to trackscript.
+//!
+//! Same pipeline as `play` uses: `convert_file` produces a `Converted`,
+//! and we write the bundle (trackscript + samples + aux + samples.json)
+//! to the output directory ourselves.  No separate exporter path to
+//! drift out of sync.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::path::PathBuf;
 
 use crate::convert::{self, ConvertOptions, PitchMode};
@@ -50,7 +55,55 @@ pub fn run(argv: &[String]) -> Result<()> {
     })?;
     let out = out_dir.unwrap_or_else(|| convert::default_out_dir(&src));
 
-    let ts = convert::export(&src, &out, &opts)?;
-    println!("wrote {}", ts.display());
+    std::fs::create_dir_all(&out)
+    .with_context(|| format!("creating {}", out.display()))?;
+
+    let conv = convert::convert_file(&src, &opts)?;
+    let stem = convert::output_stem(&src);
+
+    // The trackscript itself.
+    let ts_path = out.join(format!("{}.trackscript", stem));
+    std::fs::write(&ts_path, &conv.trackscript)
+    .with_context(|| format!("writing {}", ts_path.display()))?;
+
+    // Decoded sample WAVs (samples/…).
+    for s in &conv.samples {
+        let p = out.join(&s.rel_path);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&p, &s.wav)
+        .with_context(|| format!("writing {}", p.display()))?;
+    }
+
+    // Aux files — instruments/*.instrument, instruments/*.state,
+    // samples/*.sf2.
+    for a in &conv.aux {
+        let p = out.join(&a.rel_path);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&p, &a.bytes)
+        .with_context(|| format!("writing {}", p.display()))?;
+    }
+
+    // Sample library index.
+    if !conv.samples_json.is_empty() {
+        std::fs::write(out.join("samples.json"), &conv.samples_json)
+        .with_context(|| format!("writing {}", out.join("samples.json").display()))?;
+    }
+
+    // Print the same footer the play path prints, so the user sees the
+    // warnings and skipped-channel summary without having to cat the file.
+    let mut in_footer = false;
+    for line in conv.trackscript.lines() {
+        if line.starts_with("// ------") {
+            in_footer = true;
+        } else if in_footer && line.starts_with("//") {
+            println!("  {}", line);
+        }
+    }
+
+    println!("wrote {}", ts_path.display());
     Ok(())
 }

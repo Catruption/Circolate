@@ -2,6 +2,7 @@
 //! WAV inspection, decoding and sample-file lookup.
 
 use anyhow::{Context, Result};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 pub(super) fn wav_secs(wav: &[u8]) -> Option<f64> {
@@ -54,7 +55,11 @@ pub(super) fn wav_sample_rate(wav: &[u8]) -> Option<u32> {
     None
 }
 
-fn wav_is_16bit_pcm(wav: &[u8]) -> bool {
+/// True if hound can read this WAV without conversion.  Accepts PCM
+/// (tag 1), IEEE float (tag 3), and WAVE_FORMAT_EXTENSIBLE (tag 0xFFFE)
+/// at 8/16/24/32 bits.  Files that pass this check are returned to the
+/// caller untouched; everything else goes through symphonia.
+fn wav_is_hound_readable(wav: &[u8]) -> bool {
     if wav.len() < 12 || &wav[0..4] != b"RIFF" || &wav[8..12] != b"WAVE" {
         return false;
     }
@@ -66,7 +71,9 @@ fn wav_is_16bit_pcm(wav: &[u8]) -> bool {
         if id == b"fmt " && body + 16 <= wav.len() {
             let fmt_tag = u16::from_le_bytes([wav[body], wav[body + 1]]);
             let bits = u16::from_le_bytes([wav[body + 14], wav[body + 15]]);
-            return fmt_tag == 1 && (bits == 8 || bits == 16);
+            let is_pcm_like = fmt_tag == 1 || fmt_tag == 3 || fmt_tag == 0xFFFE;
+            let is_bits = matches!(bits, 8 | 16 | 24 | 32);
+            return is_pcm_like && is_bits;
         }
         p = body + size + (size & 1);
     }
@@ -83,7 +90,7 @@ pub(super) fn decode_audio_to_wav(path: &Path) -> Result<Vec<u8>> {
 
     let raw = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
 
-    if wav_is_16bit_pcm(&raw) {
+    if wav_is_hound_readable(&raw) {
         return Ok(raw);
     }
 
@@ -180,6 +187,14 @@ pub(super) fn decode_audio_to_wav(path: &Path) -> Result<Vec<u8>> {
     Ok(file)
 }
 
+/// Locate a sample on disk.  The FLP stores absolute Windows paths that
+/// won't exist here, so we try, in order:
+///
+///   1. explicit `--samples-dir`
+///   2. the FLP's own directory
+///   3. common subfolders next to the FLP (Audio, Samples, ...)
+///   4. bounded recursive search under the FLP directory
+///   5. the absolute path, if it happens to exist
 pub(super) fn find_sample(
     sample_path: &str,
     samples_dir: Option<&Path>,
@@ -198,14 +213,56 @@ pub(super) fn find_sample(
             return Some(c);
         }
     }
+
     if let Some(dir) = flp_dir {
         let c = dir.join(basename);
         if c.is_file() {
             return Some(c);
         }
+
+        for sub in ["Audio", "Samples", "audio", "samples", "WAV", "wav"] {
+            let c = dir.join(sub).join(basename);
+            if c.is_file() {
+                return Some(c);
+            }
+        }
+
+        if let Some(found) = search_basename(dir, basename, 3) {
+            return Some(found);
+        }
     }
+
     if p.is_file() {
         return Some(p.to_path_buf());
+    }
+    None
+}
+
+/// Breadth-limited DFS: find a file by basename.  `depth` counts levels
+/// below `dir`; a value of 3 covers `FLP_dir/Audio/Drums/foo.wav` but
+/// stops well short of pathological trees.
+fn search_basename(dir: &Path, basename: &OsStr, depth: usize) -> Option<PathBuf> {
+    if depth == 0 {
+        return None;
+    }
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut subdirs: Vec<PathBuf> = Vec::new();
+    for e in entries.flatten() {
+        let path = e.path();
+        match std::fs::symlink_metadata(&path) {
+            Ok(md) if md.file_type().is_dir() => subdirs.push(path),
+            Ok(md) if md.file_type().is_file() => {
+                if path.file_name() == Some(basename) {
+                    return Some(path);
+                }
+            }
+            _ => {}
+        }
+    }
+    for d in subdirs {
+        if let Some(found) = search_basename(&d, basename, depth - 1) {
+            return Some(found);
+        }
     }
     None
 }
