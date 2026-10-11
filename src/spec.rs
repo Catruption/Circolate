@@ -49,14 +49,25 @@ pub const EV_SHIM:       &str = "@";
 
 // ── emitters ───────────────────────────────────────────────────────────
 
+/// `|N/D[` — a section header that also opens the bracket.
 pub fn section_header(beats: u32, subs: u32) -> String {
     format!("{}{}/{}[", PART_HEADER_SIGIL, beats, subs)
 }
 
+/// `|N/D` — the section's coordinate frame, without the opening bracket.
 pub fn section_frame(beats: u32, subs: u32) -> String {
     format!("{}{}/{}", PART_HEADER_SIGIL, beats, subs)
 }
 
+/// Full part definition:
+///
+///     ƒNAME(<|N/D, ƒsource, %vol, ¶pan, ~dur>)[
+///         events
+///     ];
+///
+/// `events` may contain newlines; each line is indented four spaces to
+/// line up under the opening bracket.  Callers that want one event per
+/// line should join with `",\n"` rather than `", "`.
 pub fn part_definition(name: &str, args: &str, beats: u32, subs: u32, events: &str) -> String {
     let mut out = String::new();
     out.push_str(FIELD_SOURCE);
@@ -70,14 +81,21 @@ pub fn part_definition(name: &str, args: &str, beats: u32, subs: u32, events: &s
     out.push_str(">)[");
     out.push('\n');
     if !events.is_empty() {
-        out.push_str("    ");
-        out.push_str(events);
-        out.push('\n');
+        for line in events.lines() {
+            if line.is_empty() {
+                out.push('\n');
+            } else {
+                out.push_str("    ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
     }
     out.push_str("];");
     out
 }
 
+/// `ƒNAME(args);` — a call in BlockList or a composite definition.
 pub fn call(name: &str, args: &str) -> String {
     let mut out = String::new();
     out.push_str(FIELD_SOURCE);
@@ -88,6 +106,7 @@ pub fn call(name: &str, args: &str) -> String {
     out
 }
 
+/// `ƒ'path'` or `ƒ'path'(offset)` — the source argument for a definition.
 pub fn source_arg(path: &str, offset: Option<u32>) -> String {
     match offset {
         Some(n) if n != 0 => format!("{}'{}'({})", FIELD_SOURCE, path, n),
@@ -95,9 +114,7 @@ pub fn source_arg(path: &str, offset: Option<u32>) -> String {
     }
 }
 
-/// `@<§pos, #bpm, ƒTempo>;` — a tempo shim event.  The caller supplies
-/// the position string and formatted BPM because it knows the section's
-/// subdivision count and rounding.
+/// `@<§pos, #bpm, ƒTempo>;` — a tempo shim event.
 pub fn tempo_shim(pos: &str, bpm_text: &str) -> String {
     format!("@<{},#{}, {}Tempo>;", pos, bpm_text, FIELD_SOURCE)
 }
@@ -135,11 +152,11 @@ pub const FIELD_SYMBOLS: &[Symbol] = &[
 
 pub const EVENT_PREFIXES: &[Symbol] = &[
     sym(EV_NOTE, "note", "A note-on.", "1.10", Done),
-    sym(EV_WAYPOINT, "waypoint", "Changes properties of the preceding note at a later position instead of starting a new note.", "1.10", Done),
+    sym(EV_WAYPOINT, "waypoint", "Changes properties of the preceding note at a later position instead of starting a new note. Waypoints cross section boundaries; a section header between them is a layout marker, not a break.", "1.10", Done),
     sym(EV_UNDOC_EQ, "(undocumented)", "Recognised by the parser; its meaning is not defined in trackscript.rs.", "1.10", Done),
     sym(EV_UNDOC_TRI, "(undocumented)", "Recognised by the parser; its meaning is not defined in trackscript.rs.", "1.10", Done),
     sym(EV_UNDOC_NOTE, "(undocumented)", "Recognised by the parser; its meaning is not defined in trackscript.rs.", "1.10", Done),
-    sym(EV_SHIM, "shim", "Applies mix automation to a named target. The last field of the `@<...>` list must be a reserved target name. See Shim targets below.", "1.11", Plan),
+    sym(EV_SHIM, "shim", "Applies mix automation to a named target. The last field of the `@<...>` list must be a reserved target name.", "1.11", Done),
 ];
 
 pub fn active_event_prefix_glyphs() -> Vec<&'static str> {
@@ -170,14 +187,14 @@ Context {
     doc: "Defines a part. The argument list is a note-shaped default: \
 `|N/D` sets the section frame, `ƒ'path'` names the sample, \
 `%`/`¶`/`~` supply defaults notes may override.",
-status: Plan,
+status: Done,
 },
 Context {
     name: "composite",
     syntax: "ƒName(ƒA, ƒB, ...);",
     doc: "Defines a block as a list of calls. No body; the arguments are the body. \
 Distinguished from a part by the args not starting with `<`.",
-status: Plan,
+status: Done,
 },
 Context {
     name: "call",
@@ -264,6 +281,14 @@ A field omitted from a definition falls back to the engine default: 100% volume,
 end; equal plays once; longer repeats the definition until the time is \
 filled, truncating the final iteration.  Omitted means play once.";
 
+pub const SHIM_SEMANTICS: &str =
+"A shim is a global call.  It carries a starting value and an operator \
+expression, and applies that curve to a named target for the rest of \
+the song (until another shim for the same target takes over).  \
+Multiple shims for the same target do not multiply: the later one \
+overrides.  The target's property determines which field carries the \
+value: `%` for percent-shaped targets, `¶` for pan, `#` for pitch.";
+
 pub const OPERATORS: &[Symbol] = &[
     sym("+", "increase", "Add `amount` each interval.", "1.11", Plan),
     sym("-", "decrease", "Subtract `amount` each interval.", "1.11", Plan),
@@ -283,7 +308,7 @@ pub struct ConfigKey {
 
 pub const CONFIG_KEYS: &[ConfigKey] = &[
     ConfigKey { key: "TrackscriptVersion", ty: "number", default: "-", doc: "Format version the file was written for.", parsed: false },
-ConfigKey { key: "BeatsPerMinute", ty: "number", default: "120", doc: "Starting tempo. Time-varying tempo is the planned `ƒTempo` shim.", parsed: true },
+ConfigKey { key: "BeatsPerMinute", ty: "number", default: "120", doc: "Starting tempo. Time-varying tempo is the `ƒTempo` shim.", parsed: true },
 ConfigKey { key: "TimeSignature", ty: "a/b", default: "4/4", doc: "Time signature.", parsed: true },
 ConfigKey { key: "Subdivisions", ty: "integer", default: "4", doc: "Rows per beat.", parsed: true },
 ConfigKey { key: "SongVolume", ty: "percent", default: "100%", doc: "Static master volume.", parsed: true },
@@ -313,24 +338,11 @@ Section {
 },
 ];
 
-// ── shims ──────────────────────────────────────────────────────────────
-
-pub const SHIM_SEMANTICS: &str =
-"A shim is a global call.  It carries a starting value and an operator \
-expression, and applies that curve to a named target for the rest of \
-the song (until another shim for the same target takes over).  \
-Multiple shims for the same target do not multiply: the later one \
-overrides.  The target's property determines which field carries the \
-value: `%` for percent-shaped targets, `¶` for pan, `#` for pitch.";
-
 pub struct Builtin {
     pub name: &'static str,
     pub scope: &'static str,
-    /// The field glyph that carries this target's value expression.
     pub property: &'static str,
-    /// Starting value when no shim has been emitted yet.
     pub default: &'static str,
-    /// Human-readable unit.
     pub unit: &'static str,
     pub doc: &'static str,
     pub status: Status,
@@ -338,40 +350,24 @@ pub struct Builtin {
 
 pub const BUILTINS: &[Builtin] = &[
     Builtin {
-        name: "GlobalVolume",
-        scope: "song",
-        property: FIELD_VOLUME,
-        default: "100%",
-            unit: "percent",
-            doc: "Song-wide volume multiplier over time.",
-            status: Plan,
+        name: "Tempo", scope: "song", property: FIELD_PITCH,
+        default: "120", unit: "bpm",
+            doc: "Song tempo.", status: Done,
     },
 Builtin {
-    name: "GlobalPan",
-    scope: "song",
-    property: FIELD_PAN,
-        default: "0",
-            unit: "pan",
-            doc: "Song-wide stereo pan.",
-            status: Plan,
+    name: "GlobalVolume", scope: "song", property: FIELD_VOLUME,
+        default: "100%", unit: "percent",
+            doc: "Song-wide volume multiplier over time.", status: Plan,
 },
 Builtin {
-    name: "GlobalTuning",
-    scope: "song",
-    property: FIELD_PITCH,
-        default: "0",
-            unit: "cents",
-            doc: "Song-wide fine tuning.",
-            status: Plan,
+    name: "GlobalPan", scope: "song", property: FIELD_PAN,
+        default: "0", unit: "pan",
+            doc: "Song-wide stereo pan.", status: Plan,
 },
 Builtin {
-    name: "Tempo",
-    scope: "song",
-    property: FIELD_PITCH,
-        default: "120",
-            unit: "bpm",
-            doc: "Song tempo. Replaces the 1.10 `Tempo { ... }` section.",
-            status: Plan,
+    name: "GlobalTuning", scope: "song", property: FIELD_PITCH,
+        default: "0", unit: "cents",
+            doc: "Song-wide fine tuning.", status: Plan,
 },
 ];
 
@@ -387,7 +383,6 @@ pub fn avoid_reserved(base: &str) -> String {
     }
 }
 
-/// Look up a target's default by name.
 pub fn shim_default(name: &str) -> Option<&'static str> {
     BUILTINS.iter().find(|b| b.name == name).map(|b| b.default)
 }
@@ -405,6 +400,7 @@ Section opener becomes `|`, freeing `@` for shim events. \
 The definition's argument list is a note-shaped default wrapped in `<...>`. \
 Call `~dur` truncates or repeats the called definition. \
 Shim events (`@<...>`) apply mix automation to reserved global targets. \
+Sections accumulate row offsets, so a waypoint chain crosses them. \
 Inline operators (`+ - * ±`, `^`, `:count`). \
 The 1.10 `Tempo { ... }` section becomes the `ƒTempo` shim.",
     },
@@ -421,18 +417,19 @@ pub struct Example {
 }
 
 pub const EXAMPLES: &[Example] = &[
-    Example { title: "A note", status: Plan, src: "<§1/1,#D5,~4,%50>" },
-Example { title: "A note with a waypoint", status: Plan, src: "<§1/1,#D5,~4,%50>&<§1/2,%43,~0.33>" },
-Example { title: "Pan and a per-note sample", status: Plan, src: "<§1/1,#C6,~2,¶-1,ƒ'samples/other.wav'>" },
+    Example { title: "A note", status: Done, src: "<§1/1,#D5,~4,%50>" },
+Example { title: "A note with a waypoint", status: Done, src: "<§1/1,#D5,~4,%50>&<§1/2,%43,~0.33>" },
+Example { title: "Pan and a per-note sample", status: Done, src: "<§1/1,#C6,~2,¶-1,ƒ'samples/other.wav'>" },
 Example { title: "Operator: volume rises 4 times", status: Plan, src: "<§1/1,#D5,~4,%15+0.1^0/1:4>" },
 Example { title: "Operator: pitch oscillates", status: Plan, src: "<§1/1,#C5,~4,#C5±0.25^0/2:4>" },
 Example { title: "Shim: end fade-out", status: Plan, src: "@<§1/1,%100-0.78125^0/2:8, ƒGlobalVolume>" },
-Example { title: "Definition with defaults", status: Plan, src: "ƒHARP(<|4/4, ƒ'samples/harp.wav', %80, ¶0.5>)[\n    <§1/1,#D5>\n    <§1/2,#E5,%100>\n];" },
-Example { title: "Composite call", status: Plan, src: "ƒLAYER(ƒKICK, ƒHARP);" },
+Example { title: "Shim: tempo", status: Done, src: "@<§1/1,#110, ƒTempo>" },
+Example { title: "Definition with defaults", status: Done, src: "ƒHARP(<|4/4, ƒ'samples/harp.wav', %80, ¶0.5>)[\n    <§1/1,#D5>\n    <§1/2,#E5,%100>\n];" },
+Example { title: "Composite call", status: Done, src: "ƒLAYER(ƒKICK, ƒHARP);" },
 Example { title: "Call with overrides", status: Plan, src: "ƒHARP(<%60, §1/3>);" },
 Example { title: "Call with offset and length", status: Plan, src: "ƒDRUMS(<§1/3, ~2>);" },
 Example { title: "Call that repeats a two-beat part four times", status: Plan, src: "ƒHIT(<~8>);   // definition is |2/4, so ~8 plays it four times" },
-Example { title: "Bare call", status: Plan, src: "ƒKICK();" },
+Example { title: "Bare call", status: Done, src: "ƒKICK();" },
 ];
 
 pub fn wrap_example(src: &str) -> String {
@@ -582,11 +579,6 @@ mod tests {
     }
 
     #[test]
-    fn tempo_shim_shape() {
-        assert_eq!(tempo_shim("§1/1", "120"), "@<§1/1,#120, ƒTempo>;");
-    }
-
-    #[test]
     fn glyphs_are_unique_per_table() {
         for table in [FIELD_SYMBOLS, EVENT_PREFIXES, OPERATORS] {
             let mut seen = HashSet::new();
@@ -639,7 +631,7 @@ mod tests {
     #[test]
     fn shim_semantics_documented() {
         let md = render_markdown();
-        assert!(md.contains("Global calls"));
+        assert!(md.contains("global call"));
         assert!(md.contains("GlobalVolume"));
         assert!(md.contains("overrides"));
     }
@@ -649,12 +641,24 @@ mod tests {
         let s = part_definition("HARP", "ƒ'samples/harp.wav'", 4, 4, "<§1/1,#D5>");
         assert!(s.starts_with("ƒHARP(<|4/4, ƒ'samples/harp.wav'>)["));
         assert!(s.ends_with("];"));
+        assert!(s.contains("    <§1/1,#D5>"));
+    }
+
+    #[test]
+    fn part_definition_indents_multiline_events() {
+        let s = part_definition("X", "ƒ'samples/x.wav'", 4, 4, "<a>,\n<b>");
+        assert!(s.contains("    <a>,\n    <b>"));
     }
 
     #[test]
     fn call_shape_always_parenthesized() {
         assert_eq!(call("KICK", ""), "ƒKICK();");
         assert_eq!(call("HARP", "%60"), "ƒHARP(%60);");
+    }
+
+    #[test]
+    fn tempo_shim_shape() {
+        assert_eq!(tempo_shim("§1/1", "120"), "@<§1/1,#120, ƒTempo>;");
     }
 
     #[test]

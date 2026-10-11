@@ -2,14 +2,19 @@
 //!
 //! 1.11 syntax:
 //!
-//!   ƒNAME(args) |N/D[ events ];       part definition
+//!   ƒNAME(<|N/D, args>)[ events ];    part definition
 //!   ƒNAME(ƒA, ƒB);                    composite block
-//!   ƒNAME;  ƒNAME(args);              call in BlockList
+//!   ƒNAME();  ƒNAME(<args>);          call in BlockList
 //!   @<§pos, %expr, ƒTarget>;          shim event in BlockList
 //!
-//! Args use the same field list as notes. Fields a definition accepts
+//! Args use the same field list as notes.  Fields a definition accepts
 //! become its defaults for that field; a note that omits a field
 //! inherits the default.
+//!
+//! Sections (`|N/D[...]`) are layout markers within a part.  A waypoint
+//! chain crosses section boundaries; the header tells the TUI where to
+//! draw a measure line, and tells the parser where a new coordinate
+//! frame starts.
 
 use anyhow::{anyhow, Result};
 use regex::Regex;
@@ -62,8 +67,6 @@ pub struct TrackscriptPart {
     pub len_beats: Option<f64>,
     pub sample_offset: u32,
     pub events: Vec<TrackscriptEvent>,
-    /// Defaults from the definition's argument list. A note that omits
-    /// a field inherits the default for that field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_vol: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -72,7 +75,7 @@ pub struct TrackscriptPart {
     pub default_dur: Option<f64>,
 }
 
-/// A shim event on a BlockList line. Applies to that line's measure,
+/// A shim event on a BlockList line.  Applies to that line's measure,
 /// starting at `row` (local to the measure).
 #[derive(Debug, Clone, Serialize)]
 pub struct ShimEvent {
@@ -342,7 +345,7 @@ fn tempo_event_rx() -> &'static Regex {
     })
 }
 
-// ── config / tempo (unchanged shape) ───────────────────────────────────
+// ── config / tempo ─────────────────────────────────────────────────────
 
 fn parse_config(body: &str) -> Config {
     let mut cfg = Config::default();
@@ -565,11 +568,14 @@ fn parse_block_list(body: &str, subs: u32) -> (Vec<Vec<String>>, Vec<ShimEvent>)
 
 // ── part events ────────────────────────────────────────────────────────
 
+/// Parse a section body into events.  `absolute_offset_rows` is the row
+/// at which this section begins within the part, accumulated across all
+/// preceding sections at their own resolution.
 fn parse_part_events(
     body: &str,
     subs: u32,
-    beats_per_measure: u32,
-    measure_offset: f64,
+    _beats_per_measure: u32,
+    absolute_offset_rows: f64,
 ) -> Vec<TrackscriptEvent> {
     let event_rx = event_rx();
     let src_rx = source_rx();
@@ -637,7 +643,7 @@ fn parse_part_events(
         }
 
         let (Some(b), Some(s)) = (beat, sub) else { continue };
-        ev.row = measure_offset * beats_per_measure as f64 * subs as f64
+        ev.row = absolute_offset_rows
         + (b - 1.0) * subs as f64
         + s;
         events.push(ev);
@@ -689,7 +695,6 @@ fn parse_block_array(body: &str) -> (BlockMap, PartMap) {
 
         // Expect (
         if pos >= bytes.len() || bytes[pos] != b'(' {
-            // Not a definition; skip the line.
             while pos < bytes.len() && bytes[pos] != b'\n' {
                 pos += 1;
             }
@@ -773,7 +778,11 @@ fn parse_block_array(body: &str) -> (BlockMap, PartMap) {
             ));
             pos = close + 1;
         } else if pos < bytes.len() && bytes[pos] == PART_HEADER_SIGIL.as_bytes()[0] {
-            // Multi-section body: each `|N/D[events]` overrides the arg frame.
+            // Multi-section body.  Each `|N/D[events]` has its own frame.
+            // Sections accumulate row offsets so a waypoint chain crossing
+            // a boundary lands on the correct absolute row within the part.
+            let mut section_start_row: f64 = 0.0;
+
             while pos < bytes.len() && bytes[pos] == PART_HEADER_SIGIL.as_bytes()[0] {
                 let hdr_start = pos + PART_HEADER_SIGIL.len();
                 let Some(bracket_rel) = body[hdr_start..].find('[') else { break };
@@ -794,7 +803,16 @@ fn parse_block_array(body: &str) -> (BlockMap, PartMap) {
 
                 let bracket_close = match_pair(body, bracket_open, b'[', b']');
                 let events_str = &body[bracket_open + 1..bracket_close];
-                all_events.extend(parse_part_events(events_str, ns, nb, 0.0));
+                all_events.extend(parse_part_events(
+                    events_str,
+                    ns,
+                    nb,
+                    section_start_row,
+                ));
+
+                // One section = one measure.  Advance by its own length
+                // at its own resolution so mixed-meter parts accumulate.
+                section_start_row += nb as f64 * ns as f64;
 
                 pos = bracket_close + 1;
                 while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {

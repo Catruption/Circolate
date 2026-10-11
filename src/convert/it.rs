@@ -2174,8 +2174,9 @@ fn split_rendered_events(rendered: &str) -> Vec<String> {
 
 /// Render a list of event groups as a single comma-joined line.
 /// The header and terminator come from `spec::part_definition`.
+/// One event group per line.  `spec::part_definition` adds the indent.
 fn render_event_groups(groups: &[String]) -> String {
-    groups.join(", ")
+    groups.join(",\n")
 }
 
 /// Merge parts that share a sample_index AND appear on exactly the same

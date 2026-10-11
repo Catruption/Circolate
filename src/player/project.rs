@@ -540,6 +540,13 @@ impl Project {
         self.lines.len()
     }
 
+    /// The sample backing a part, if the part references one.
+    pub(crate) fn sample_for_part(&self, part_name: &str) -> Option<Arc<Sample>> {
+        let part = self.parts.get(part_name)?;
+        let id = self.path_to_id.get(&part.sample_path)?;
+        self.samples.get(id).cloned()
+    }
+
     pub(crate) fn total_secs(&self) -> f64 {
         self.total_samples as f64 / self.sample_rate as f64
     }

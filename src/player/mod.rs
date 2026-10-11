@@ -12,6 +12,7 @@ mod render;
 mod transport;
 
 pub(crate) use engine::{Engine, Msg};
-pub(crate) use project::{load_project, Loader, Project};
+pub(crate) use project::{load_project, Loader, Project, Sample};
 pub(crate) use render::{render_offline, write_wav};
 pub(crate) use transport::Transport;
+

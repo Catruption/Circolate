@@ -7,7 +7,6 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::convert::{fmt, identifier, note_name, pos_str};
 use crate::sources::flp::Channel;
-use crate::spec::PART_HEADER_SIGIL;
 
 use super::place::Placed;
 use super::{MAX_FULL_BEATS, PLAY_FULL_SAMPLE};
@@ -118,14 +117,7 @@ fn render_part(
         }
     }
 
-    let mut out = format!("{}4/{}[\n", PART_HEADER_SIGIL, subs);
-    if !pieces.is_empty() {
-        out.push_str("    ");
-        out.push_str(&pieces.join(", "));
-        out.push('\n');
-    }
-    out.push(']');
-    out
+        pieces.join(",\n")
 }
 
 #[allow(clippy::too_many_arguments)]
