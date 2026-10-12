@@ -48,6 +48,9 @@ pub struct TrackscriptEvent {
     pub dur_beats: Option<f64>,
     pub sample_override: Option<String>,
     pub offset: Option<u32>,
+    /// Native tempo of the sample, from a `|bpm` field.  The player
+    /// stretches the sample by song tempo / `src_bpm`.
+    pub src_bpm: Option<f64>,
     pub raw: String,
 }
 
@@ -66,6 +69,8 @@ pub struct TrackscriptPart {
     pub subs_per_beat: u32,
     pub len_beats: Option<f64>,
     pub sample_offset: u32,
+    /// Default native tempo of the part's sample (`|bpm` in the part args).
+    pub src_bpm: Option<f64>,
     pub events: Vec<TrackscriptEvent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_vol: Option<f64>,
@@ -597,6 +602,7 @@ fn parse_part_events(
             dur_beats: None,
             sample_override: None,
             offset: None,
+            src_bpm: None,
             raw: format!("<{}>", inner),
         };
 
@@ -612,6 +618,12 @@ fn parse_part_events(
                         beat = Some(ai);
                         sub = Some(bi - 1.0);
                     }
+                }
+            } else if let Some(rest) = f.strip_prefix(PART_HEADER_SIGIL) {
+                // `|135` is the sample's native BPM.  `|4/4` is a frame
+                // and means nothing on a note.
+                if !rest.contains('/') {
+                    ev.src_bpm = parse_f(rest).filter(|b| *b > 0.0);
                 }
             } else if let Some(rest) = f.strip_prefix(FIELD_PITCH) {
                 ev.pitch_midi = parse_pitch_midi(rest);
@@ -729,6 +741,7 @@ fn parse_block_array(body: &str) -> (BlockMap, PartMap) {
 
         let mut sample_path = String::new();
         let mut sample_offset: u32 = 0;
+        let mut src_bpm: Option<f64> = None;
         let mut default_vol: Option<f64> = None;
         let mut default_pan: Option<f64> = None;
         let mut default_dur: Option<f64> = None;
@@ -744,6 +757,9 @@ fn parse_block_array(body: &str) -> (BlockMap, PartMap) {
                         subs_per_beat = sv;
                         frame_from_args = true;
                     }
+                } else {
+                    // `|135`: the sample's native BPM.
+                    src_bpm = parse_f(rest).filter(|b| *b > 0.0);
                 }
             } else if f.starts_with(FIELD_SOURCE) {
                 if let Some(c) = src_rx.captures(&f) {
@@ -834,6 +850,7 @@ fn parse_block_array(body: &str) -> (BlockMap, PartMap) {
                          subs_per_beat,
                          len_beats: None,
                          sample_offset,
+                         src_bpm,
                          events: all_events,
                          default_vol,
                          default_pan,

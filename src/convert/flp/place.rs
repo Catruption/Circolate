@@ -23,6 +23,10 @@ pub(super) struct Placed {
     /// For audio clips: where inside the source file playback should
     /// start, in milliseconds.  `None` for pattern notes.
     pub(super) clip_offset_ms: Option<f32>,
+    /// For audio clips: where inside the source file the clip's window
+    /// ends, in milliseconds.  `None` for pattern notes; negative means
+    /// the clip is untrimmed (the window runs to the end of the file).
+    pub(super) clip_end_ms: Option<f32>,
 }
 
 pub(super) fn place_notes(prj: &Project) -> (HashMap<u16, Vec<Placed>>, bool, usize) {
@@ -143,6 +147,7 @@ pub(super) fn place_notes(prj: &Project) -> (HashMap<u16, Vec<Placed>>, bool, us
                 abs: item.position.saturating_add(n.position - win_start),
                                                       note,
                                                       clip_offset_ms: None,
+                clip_end_ms: None,
             });
         }
         if debug_on() {
@@ -180,6 +185,7 @@ pub(super) fn place_notes(prj: &Project) -> (HashMap<u16, Vec<Placed>>, bool, us
                     abs: n.position,
                     note: n.clone(),
                                                           clip_offset_ms: None,
+                clip_end_ms: None,
                 });
             }
         }
@@ -227,6 +233,7 @@ pub(super) fn place_notes(prj: &Project) -> (HashMap<u16, Vec<Placed>>, bool, us
             },
             // The file stores -1.0 for "no trim"; clamp it to 0.
             clip_offset_ms: Some(item.start_offset_ms.max(0.0)),
+            clip_end_ms: Some(item.end_offset_ms),
         });
     }
 

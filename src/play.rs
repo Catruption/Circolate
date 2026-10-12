@@ -322,13 +322,13 @@ pub fn run(argv: &[String]) -> Result<()> {
     let start = ((args.start * sample_rate as f64) as i64).clamp(0, total);
 
     let transport = Arc::new(Transport {
-        paused: AtomicBool::new(false),
-                             seek_to: AtomicI64::new(start),
-                             position: AtomicI64::new(start),
-                             done: AtomicBool::new(false),
-                             stop: AtomicBool::new(false),
-                             active_voices: AtomicI64::new(0),
-                             loaded_lines: AtomicI64::new(0),
+        speed: AtomicI64::new(0),
+        seek_to: AtomicI64::new(start),
+        position: AtomicI64::new(start),
+        done: AtomicBool::new(false),
+        stop: AtomicBool::new(false),
+        active_voices: AtomicI64::new(0),
+        loaded_lines: AtomicI64::new(0),
     });
 
     let (tx, rx): (Sender<Msg>, Receiver<Msg>) = channel();
@@ -349,7 +349,7 @@ pub fn run(argv: &[String]) -> Result<()> {
 
     let stream = device.build_output_stream(
         &stream_config,
-        move |data: &mut [f32], _| {
+                move |data: &mut [f32], _| {
             while let Ok(m) = rx.try_recv() {
                 engine.handle(m);
             }
@@ -359,9 +359,11 @@ pub fn run(argv: &[String]) -> Result<()> {
             }
             tp.position.store(engine.pos, Ordering::Relaxed);
 
-            if tp.paused.load(Ordering::Relaxed) || engine.finished() {
+            let speed = tp.speed.load(Ordering::Relaxed);
+            let reached_end = speed > 0 && engine.finished();
+            if speed == 0 || reached_end {
                 data.fill(0.0);
-                if engine.finished() {
+                if reached_end {
                     tp.done.store(true, Ordering::Release);
                 }
                 return;
@@ -373,7 +375,12 @@ pub fn run(argv: &[String]) -> Result<()> {
                 right.resize(frames, 0.0);
             }
             let (l, r) = (&mut left[..frames], &mut right[..frames]);
-            engine.render(l, r);
+            engine.render(l, r, speed);
+
+            // Auto-stop when reverse hits the top of the song.
+            if engine.pos <= 0 && speed < 0 {
+                tp.speed.store(0, Ordering::Release);
+            }
             tp.active_voices.store(engine.active_count() as i64, Ordering::Relaxed);
             for i in 0..frames {
                 let o = i * channels;

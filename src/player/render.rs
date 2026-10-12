@@ -81,7 +81,7 @@ pub(crate) fn render_offline(
         let batch = loader.load_due(engine.pos + lookahead);
         engine.ingest(batch.samples);
         engine.ingest_vst(batch.vsts);
-        engine.render(&mut l[i..i + n], &mut r[i..i + n]);
+                engine.render(&mut l[i..i + n], &mut r[i..i + n], 1);
         i += n;
     }
     (l, r, loader.cache)

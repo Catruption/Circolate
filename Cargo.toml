@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 cpal = "0.15"

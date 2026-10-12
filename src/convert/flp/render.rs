@@ -60,6 +60,39 @@ fn pan_norm(p: u8) -> f64 {
     ((p as f64 - 64.0) / 64.0).clamp(-1.0, 1.0)
 }
 
+/// The sample's native tempo for an audio clip that FL has time-stretched,
+/// or `None` if the clip plays at its natural speed.
+///
+/// FL stores the part of the file a clip shows (`start..end`, in ms) and
+/// the clip's own length on the playlist.  If the window is not as long as
+/// the clip, the audio was stretched: `speed = window / clip` is how many
+/// source seconds play per output second.  The sample's own tempo is then
+/// `project bpm / speed`; Trackscript writes that as `|bpm` and the player
+/// stretches to the song tempo.
+fn source_bpm(p: &Placed, ppq: u32, style: &NoteStyle) -> Option<f64> {
+    let start_ms = p.clip_offset_ms? as f64;
+    let ticks = p.note.length;
+    if ticks == 0 || ppq == 0 || style.bpm <= 0.0 {
+        return None;
+    }
+    let clip_ms = ticks as f64 / ppq as f64 * 60_000.0 / style.bpm;
+
+    // `end < 0` means "untrimmed": the window runs to the end of the file.
+    let end_ms = match p.clip_end_ms {
+        Some(e) if e >= 0.0 => e as f64,
+        _ => style.full_secs? * 1000.0,
+    };
+
+    let speed = (end_ms - start_ms) / clip_ms;
+    // One tick of rounding in the clip length is not a stretch.
+    let tolerance = (1.0 / ticks as f64).max(0.005);
+    if speed > 0.0 && (speed - 1.0).abs() > tolerance {
+        Some(style.bpm / speed)
+    } else {
+        None
+    }
+}
+
 fn render_part(
     notes: &[&Placed],
     measure_start: u32,
@@ -84,55 +117,69 @@ fn render_part(
             let n = &p.note;
             let key = n.key as i32 + style.transpose;
             let mut dur_beats = (n.length as f64 / ppq as f64).max(0.05);
+
+            // NOTE: this branch only runs when PLAY_FULL_SAMPLE is false
+            // (the `false` in the pattern), and never for audio clips
+            // (`clip_offset_ms` must be None).  Left as it was.
             if let (false, Some(secs), None) =
                 (PLAY_FULL_SAMPLE, style.full_secs, p.clip_offset_ms)
-                {
-                    let ratio = 2f64.powf((key as f64 - 60.0) / 12.0);
-                    let full = (secs / ratio * style.bpm / 60.0).min(MAX_FULL_BEATS);
-                    dur_beats = dur_beats.max(full);
-                }
-                let mut fields = vec![
-                    pos_str(row, subs),
-                    format!("#{}", note_name(key)),
-                        format!("~{}", fmt(dur_beats, 2)),
-                ];
-                let vol = (vel_to_pct(n.velocity) * style.vol_scale).clamp(0.0, 100.0);
-                if (vol - 100.0).abs() > 0.5 {
-                    fields.push(format!("%{}", fmt(vol, 1)));
-                }
-                let pan = (pan_norm(n.pan) + style.pan_offset).clamp(-1.0, 1.0);
-                if pan.abs() > 0.01 {
-                    fields.push(format!("¶{}", fmt(pan, 2)));
-                }
-                if let Some(ms) = p.clip_offset_ms {
-                    if ms > 0.0 && style.sample_rate > 0 && !source_path.is_empty() {
-                        let samples =
+            {
+                let ratio = 2f64.powf((key as f64 - 60.0) / 12.0);
+                let full = (secs / ratio * style.bpm / 60.0).min(MAX_FULL_BEATS);
+                dur_beats = dur_beats.max(full);
+            }
+
+            let mut fields = vec![
+                pos_str(row, subs),
+                format!("#{}", note_name(key)),
+                format!("~{}", fmt(dur_beats, 2)),
+            ];
+
+            let vol = (vel_to_pct(n.velocity) * style.vol_scale).clamp(0.0, 100.0);
+            if (vol - 100.0).abs() > 0.5 {
+                fields.push(format!("%{}", fmt(vol, 1)));
+            }
+
+            let pan = (pan_norm(n.pan) + style.pan_offset).clamp(-1.0, 1.0);
+            if pan.abs() > 0.01 {
+                fields.push(format!("¶{}", fmt(pan, 2)));
+            }
+
+            if let Some(ms) = p.clip_offset_ms {
+                if ms > 0.0 && style.sample_rate > 0 && !source_path.is_empty() {
+                    let samples =
                         (ms as f64 * style.sample_rate as f64 / 1000.0).round() as u32;
-                        if samples > 0 {
-                            fields.push(format!("ƒ'{}'({})", source_path, samples));
-                        }
+                    if samples > 0 {
+                        fields.push(format!("ƒ'{}'({})", source_path, samples));
                     }
                 }
-                pieces.push(format!("<{}>", fields.join(",")));
+            }
+
+            // Time-stretched audio clip: declare the sample's own tempo.
+            if let Some(bpm) = source_bpm(p, ppq, &style) {
+                fields.push(format!("|{}", fmt(bpm, 2)));
+            }
+
+            pieces.push(format!("<{}>", fields.join(",")));
         }
     }
 
-        pieces.join(",\n")
+    pieces.join(",\n")
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_part(
     seen: &mut HashMap<(u16, String), usize>,
-                        parts: &mut Vec<Part>,
-                        part_name_used: &mut HashMap<String, u32>,
-                        chan: &Channel,
-                        notes: &[&Placed],
-                        m_start: u32,
-                        subs: u32,
-                        ppq: u32,
-                        kind: &'static str,
-                        style: NoteStyle,
-                        source_path: &str,
+    parts: &mut Vec<Part>,
+    part_name_used: &mut HashMap<String, u32>,
+    chan: &Channel,
+    notes: &[&Placed],
+    m_start: u32,
+    subs: u32,
+    ppq: u32,
+    kind: &'static str,
+    style: NoteStyle,
+    source_path: &str,
 ) -> usize {
     let rendered = render_part(notes, m_start, subs, ppq, style, source_path);
     let key = (chan.iid, rendered.clone());

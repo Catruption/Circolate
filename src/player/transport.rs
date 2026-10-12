@@ -2,8 +2,11 @@
 
 use std::sync::atomic::{AtomicBool, AtomicI64};
 
+/// Playback speed, in multiples of the base rate.  0 is stopped,
+/// positive is forward, negative is reverse.  The UI sets this; the
+/// audio callback reads it.
 pub(crate) struct Transport {
-    pub(crate) paused: AtomicBool,
+    pub(crate) speed: AtomicI64,
     pub(crate) seek_to: AtomicI64,
     pub(crate) position: AtomicI64,
     pub(crate) done: AtomicBool,

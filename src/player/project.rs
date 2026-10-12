@@ -15,6 +15,8 @@ use crate::timing::{AutomationLane, TempoMap, Waypoint};
 
 use super::engine::{gains, Scheduled, VstNote};
 
+mod stretch;
+
 const TAIL_SECONDS: f64 = 0.05;
 
 use crate::sources::trackscript::ShimEvent;
@@ -246,6 +248,8 @@ struct TVoice {
     pan: f64,
     sample_id: u32,
     offset: u32,
+    /// Native tempo of the sample (`|bpm`); stretched to the song tempo.
+    src_bpm: Option<f64>,
     pitch_wp: Vec<Waypoint>,
     vol_wp: Vec<Waypoint>,
     pan_wp: Vec<Waypoint>,
@@ -305,6 +309,7 @@ fn build_template(
                                 pan: ev.pan.unwrap_or(0.0),
                                 sample_id: sid,
                                 offset: ev.offset.unwrap_or(part.sample_offset),
+                                src_bpm: ev.src_bpm.or(part.src_bpm),
                                 pitch_wp: Vec::new(),
                                 vol_wp: Vec::new(),
                                 pan_wp: Vec::new(),
@@ -360,6 +365,7 @@ fn build_template(
                                     pan: ev.pan.unwrap_or(0.0),
                                     sample_id: sid,
                                     offset: 0,
+                                    src_bpm: None,
                                     pitch_wp: Vec::new(),
                                     vol_wp: Vec::new(),
                                     pan_wp: Vec::new(),
@@ -431,6 +437,7 @@ fn hash_part(
     part.sample_path.hash(&mut h);
     sample_key(&part.sample_path).hash(&mut h);
     part.sample_offset.hash(&mut h);
+    part.src_bpm.map(f64::to_bits).hash(&mut h);
     part.subs_per_beat.hash(&mut h);
     part.beats_per_measure.hash(&mut h);
     let ob = |x: Option<f64>| x.map(f64::to_bits);
@@ -442,6 +449,7 @@ fn hash_part(
         ob(ev.pan).hash(&mut h);
         ob(ev.dur_beats).hash(&mut h);
         ev.offset.hash(&mut h);
+        ob(ev.src_bpm).hash(&mut h);
         ev.sample_override.hash(&mut h);
         if let Some(p) = &ev.sample_override {
             sample_key(p).hash(&mut h);
@@ -453,6 +461,8 @@ fn hash_part(
 pub(crate) struct Cache {
     enabled: bool,
     map: HashMap<u64, Arc<PartTemplate>>,
+    /// Time-stretched copies of samples, keyed by (sample id, factor bits).
+    stretched: HashMap<(u32, u64), Arc<Sample>>,
     hits: u64,
     misses: u64,
 }
@@ -462,6 +472,7 @@ impl Cache {
         Cache {
             enabled,
             map: HashMap::new(),
+            stretched: HashMap::new(),
             hits: 0,
             misses: 0,
         }
@@ -496,6 +507,32 @@ impl Cache {
         t
     }
 
+    /// A copy of `sample` made `factor` times as long without changing its
+    /// pitch.  Built once per (sample, factor) and reused.
+    fn stretched(&mut self, sid: u32, sample: &Arc<Sample>, factor: f64) -> Arc<Sample> {
+        let key = (sid, factor.to_bits());
+        if let Some(s) = self.stretched.get(&key) {
+            return Arc::clone(s);
+        }
+        let mut chans: Vec<&[f32]> = vec![&sample.left];
+        if sample.stereo {
+            chans.push(&sample.right);
+        }
+        let mut out = stretch::stretch(&chans, factor, sample.rate).into_iter();
+        let left = out.next().unwrap_or_default();
+        let right = out.next().unwrap_or_else(|| left.clone());
+        let scale = |p: i64| (p as f64 * factor).round() as i64;
+        let s = Arc::new(Sample {
+            left,
+            right,
+            stereo: sample.stereo,
+            rate: sample.rate,
+            loop_pts: sample.loop_pts.map(|(a, b)| (scale(a), scale(b))),
+        });
+        self.stretched.insert(key, Arc::clone(&s));
+        s
+    }
+
     pub(crate) fn describe(&self) -> String {
         if self.enabled {
             format!("part cache: {} hits, {} builds", self.hits, self.misses)
@@ -514,6 +551,8 @@ struct LineInfo {
 }
 
 pub(crate) struct Project {
+    pub(crate) source_dir: PathBuf,
+    cover_path: Option<PathBuf>,
     parts: HashMap<String, TrackscriptPart>,
     part_hash: HashMap<String, u64>,
     samples: HashMap<u32, Arc<Sample>>,
@@ -545,6 +584,27 @@ impl Project {
         let part = self.parts.get(part_name)?;
         let id = self.path_to_id.get(&part.sample_path)?;
         self.samples.get(id).cloned()
+    }
+
+    /// The VST channel id backing a part, if the part references one.
+    /// Used by the TUI to find the part's live scope ring in the global
+    /// buffer (scope slots are indexed by VST channel iid).
+    pub(crate) fn iid_for_part(&self, part_name: &str) -> Option<u16> {
+        let part = self.parts.get(part_name)?;
+        let inst = self.vst_instruments.get(&part.sample_path)?;
+        Some(inst.iid)
+    }
+
+        /// Path to `cover.jpg` next to the trackscript, if present.
+    pub(crate) fn cover_path(&self) -> Option<&Path> {
+        self.cover_path.as_deref()
+    }
+
+    /// The sample or instrument path a part declares.  Two parts with
+    /// the same path are said to "share a declarer" and should be shown
+    /// in the same tracker column, stacked.
+    pub(crate) fn part_path(&self, name: &str) -> Option<&str> {
+        self.parts.get(name).map(|p| p.sample_path.as_str())
     }
 
     pub(crate) fn total_secs(&self) -> f64 {
@@ -641,6 +701,12 @@ pub(crate) fn load_project(
     let parsed = parse_file(ts_path)?;
     let base = ts_path.parent().unwrap_or_else(|| Path::new("."));
     let cfg = &parsed.config;
+
+    let source_dir = base.to_path_buf();
+    let cover_path = {
+        let p = source_dir.join("cover.jpg");
+        if p.exists() { Some(p) } else { None }
+    };
 
     let mut samples: HashMap<u32, Arc<Sample>> = HashMap::new();
     let mut fps: HashMap<u32, u64> = HashMap::new();
@@ -829,14 +895,17 @@ pub(crate) fn load_project(
                 names.push(name);
             }
         }
-        let (min_start, max_end) = if min_row.is_finite() {
-            (
-                (tempo.time_at_row(min_row) * sr) as i64,
-             (tempo.time_at_row(max_end_row).min(render_end_sec) * sr) as i64,
-            )
-        } else {
-            (i64::MAX, i64::MIN)
-        };
+        // Every line — including empty ones (`;` in the BlockList) — gets
+        // its own measure's time range in the timeline.  Without this,
+        // `current_line` cannot advance through an empty line, and a long
+        // note whose source line has scrolled past keeps the tracker view
+        // frozen on that earlier line for the whole note duration.
+        let line_end_row = placement_row + rows_per_measure;
+        let (min_start, max_end) = (
+            (tempo.time_at_row(placement_row) * sr) as i64,
+                                    (tempo.time_at_row(max_end_row.max(line_end_row))
+                                    .min(render_end_sec) * sr) as i64,
+        );
         lines.push(LineInfo {
             parts: names,
             min_start,
@@ -847,9 +916,8 @@ pub(crate) fn load_project(
         bail!("no playable voices (check samples.json and sample paths)");
     }
 
-    let mut order: Vec<usize> = (0..lines.len())
-    .filter(|&i| lines[i].min_start != i64::MAX)
-    .collect();
+    // Every line participates in the timeline order, including empty ones.
+    let mut order: Vec<usize> = (0..lines.len()).collect();
     order.sort_by_key(|&i| (lines[i].min_start, i));
 
     println!(
@@ -886,6 +954,8 @@ pub(crate) fn load_project(
         initial_bpm: cfg.bpm,
         time_signature: cfg.time_signature,
         voice_count: total_voices,
+        source_dir,       // ← add these two
+        cover_path,       // ← lines
     };
     Ok((Arc::new(project), cache))
 }
@@ -986,9 +1056,24 @@ fn prepare_line(
             if end <= start || end <= min_end {
                 continue;
             }
-            let sample = Arc::clone(&project.samples[&tv.sample_id]);
+            let mut sample = Arc::clone(&project.samples[&tv.sample_id]);
             if sample.len() == 0 {
                 continue;
+            }
+            // `|bpm`: stretch the sample from its own tempo to the song
+            // tempo where the note starts.
+            let mut offset = tv.offset as f64;
+            if let Some(src_bpm) = tv.src_bpm {
+                let beat_secs = tempo.time_at_row(start_row + part.subs_per_beat as f64)
+                - tempo.time_at_row(start_row);
+                if beat_secs > 0.0 {
+                    let song_bpm = 60.0 / beat_secs;
+                    let factor = src_bpm / song_bpm;
+                    if (factor - 1.0).abs() > 0.001 && factor > 0.05 && factor < 20.0 {
+                        sample = cache.stretched(tv.sample_id, &sample, factor);
+                        offset *= factor;
+                    }
+                }
             }
             let mk = |wp: &Vec<Waypoint>, initial: f64| -> Option<AutomationLane> {
                 if wp.is_empty() {
@@ -1007,7 +1092,7 @@ fn prepare_line(
                 seq,
                 sample,
                 pitch_hz: tv.pitch_hz,
-                offset: tv.offset as f64,
+                offset,
                 vol: tv.vol,
                 pan: tv.pan,
                 pitch_lane: mk(&tv.pitch_wp, tv.pitch_hz),

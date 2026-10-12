@@ -1,6 +1,6 @@
 #!/bin/sh
 # Shared launcher for the .desktop files.  $1 is the verb (play/export/dump/test),
-# $2 (optional) is the file to operate on.
+# then optional flags (e.g. --raw), then an optional file to operate on.
 #
 # Resolves its own location so the repo can live anywhere, and rewrites the
 # sibling .desktop files' Exec=/Icon= lines to match.
@@ -28,7 +28,7 @@ if ! [ -t 0 ]; then
 fi
 
 if [ $# -eq 0 ]; then
-    echo "usage: $0 <play|export|dump|test> [file]" >&2
+    echo "usage: $0 <play|export|dump|test> [flags] [file]" >&2
     exit 1
 fi
 
@@ -42,6 +42,15 @@ case "$verb" in
         exit 1
         ;;
 esac
+
+# Leading flags (e.g. --raw, --no-states) are passed through to the binary.
+flags=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -*) flags="$flags $1"; shift ;;
+        *) break ;;
+    esac
+done
 
 file="${1:-}"
 filter="*.trackscript *.flp *.it|Trackscript sources"
@@ -60,19 +69,24 @@ fi
 
 case "$verb" in
     play)
-        exec "$bin" play "$file"
+        exec "$bin" play $flags "$file"
         ;;
     export)
         # Ask for an output directory next to the source file.
         out=$(kdialog --getexistingdirectory "$(dirname "$file")" \
                 --title "Where to write?")
         [ -z "$out" ] && exit 0
-        exec "$bin" export "$file" -o "$out"
+        exec "$bin" export $flags "$file" -o "$out"
         ;;
     dump)
-        "$bin" dump "$file" | less
+        # Page it only when stdout is a terminal, so `> file` still works.
+        if [ -t 1 ]; then
+            "$bin" dump $flags "$file" | less
+        else
+            "$bin" dump $flags "$file"
+        fi
         ;;
     test)
-        "$bin" test "$file"
+        "$bin" test $flags "$file"
         ;;
 esac

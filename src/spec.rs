@@ -429,6 +429,7 @@ Example { title: "Composite call", status: Done, src: "ƒLAYER(ƒKICK, ƒHARP);"
 Example { title: "Call with overrides", status: Plan, src: "ƒHARP(<%60, §1/3>);" },
 Example { title: "Call with offset and length", status: Plan, src: "ƒDRUMS(<§1/3, ~2>);" },
 Example { title: "Call that repeats a two-beat part four times", status: Plan, src: "ƒHIT(<~8>);   // definition is |2/4, so ~8 plays it four times" },
+Example { title: "Sample tempo: stretch a 135 bpm loop to the song tempo", status: Plan, src: "<§1/1,#C5,~2,|135>" },
 Example { title: "Bare call", status: Done, src: "ƒKICK();" },
 ];
 

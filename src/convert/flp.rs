@@ -21,7 +21,6 @@ use crate::sources::flp_audio;
 
 use place::{end_tick_of, notes_in_measure, place_notes};
 use render::{emit_part, EmbeddedSample, NoteStyle, Part};
-use sf2::find_matching_sf2;
 use wav::{decode_audio_to_wav, find_sample, wav_sample_rate, wav_secs};
 
 const DEFAULT_FLPPQ: u32 = 96;
@@ -32,6 +31,11 @@ const MAX_NOTE_TICKS: u32 = 500_000;
 const MIN_EMBEDDED_BYTES: usize = 512;
 const FL_C5_MIDI: i32 = 60;
 const FL_C5_KEY: u16 = 60;
+
+/// Built-in generators with no vst_path and a state smaller than this are
+/// checked for a SoundFont path.  Anything bigger (DirectWave, Serum, ...)
+/// can't be the SoundFont player.
+const SF2_STATE_MAX: usize = 4096;
 
 pub(super) fn debug_on() -> bool {
     std::env::var_os("FLP_DEBUG").is_some()
@@ -218,6 +222,9 @@ pub(super) fn convert(
 
     let mut sidecar_path: HashMap<u16, String> = HashMap::new();
     let mut aux_files: Vec<AuxFile> = Vec::new();
+    // SF2 files already copied into samples/, keyed by source path, so
+    // channels that share a file share one copy.
+    let mut sf2_copied: HashMap<PathBuf, String> = HashMap::new();
 
     let mut usable_samples: Vec<(&Channel, PathBuf)> = Vec::new();
     let mut usable_embedded: Vec<(&Channel, EmbeddedSample)> = Vec::new();
@@ -298,7 +305,114 @@ pub(super) fn convert(
                     continue;
                 }
 
-                // 1. Embedded audio in plugin state?
+                // 1. SoundFont player?  Its state carries the SF2 path (and
+                //    preset), so read it from there.  This runs before the
+                //    embedded-audio scan so nothing else claims the channel.
+                if let Some(plugin) = chan.plugin.as_ref() {
+                    if plugin.vst_path.is_empty() && plugin.state.len() < SF2_STATE_MAX {
+                        if let Some(sf) = sf2::parse_sf2_state(&plugin.state) {
+                            let want = sf
+                            .path
+                            .rsplit(|c| c == '\\' || c == '/')
+                            .next()
+                            .unwrap_or("?")
+                            .to_string();
+                            let dirs: Vec<&Path> = [opts.samples_dir.as_deref(), Some(flp_dir)]
+                            .into_iter()
+                            .flatten()
+                            .collect();
+
+                            let Some(src) = sf2::find_sf2(Some(&sf), &chan.name, &dirs) else {
+                                skipped.push((chan, format!("SF2 not found: {}", want)));
+                                continue;
+                            };
+                            if debug_on() {
+                                eprintln!(
+                                    "flp: chan {} sf2 {} preset {:?}",
+                                    chan.iid,
+                                    src.display(),
+                                          sf.preset
+                                );
+                            }
+
+                            // Copy the SF2 once, share it across channels.
+                            let rel: Option<String> = match sf2_copied.get(&src) {
+                                Some(r) => Some(r.clone()),
+                                None => match std::fs::read(&src) {
+                                    Ok(bytes) => {
+                                        let stem = src
+                                        .file_stem()
+                                        .and_then(|s| s.to_str())
+                                        .unwrap_or("sf2");
+                                        let mut rel = format!("samples/{}.sf2", safe_name(stem));
+                                        if sf2_copied.values().any(|v| *v == rel) {
+                                            // Same stem from a different folder.
+                                            rel = format!(
+                                                "samples/{:02}_{}.sf2",
+                                                chan.iid,
+                                                safe_name(stem)
+                                            );
+                                        }
+                                        aux_files.push(AuxFile {
+                                            rel_path: rel.clone(),
+                                                       bytes,
+                                        });
+                                        sf2_copied.insert(src.clone(), rel.clone());
+                                        Some(rel)
+                                    }
+                                    Err(e) => {
+                                        warnings.push(format!(
+                                            "[{:2}] SF2 {} read failed: {:#}",
+                                            chan.iid,
+                                            src.display(),
+                                                              e
+                                        ));
+                                        None
+                                    }
+                                },
+                            };
+                            let Some(rel) = rel else {
+                                skipped.push((chan, format!("SF2 unreadable: {}", want)));
+                                continue;
+                            };
+
+                            let base_raw = if chan.name.is_empty() {
+                                format!("Ch{:02}", chan.iid)
+                            } else {
+                                chan.name.clone()
+                            };
+                            let base = identifier(&base_raw);
+                            let preset_line = sf
+                            .preset
+                            .map(|p| format!("    Preset: {};\n", p))
+                            .unwrap_or_default();
+                            let inst_text = format!(
+                                "Instrument {base}\n{{\n    Kind: sf2;\n    File: '{rel}';\n{preset_line}    SourceChannel: {};\n}}\n",
+                                chan.iid
+                            );
+                            let inst_rel = format!("instruments/{}.instrument", base);
+                            aux_files.push(AuxFile {
+                                rel_path: inst_rel.clone(),
+                                           bytes: inst_text.into_bytes(),
+                            });
+                            sidecar_path.insert(chan.iid, inst_rel);
+                            warnings.push(format!(
+                                "[{:2}] {}: SF2 {}{}",
+                                chan.iid,
+                                chan.name,
+                                src.display(),
+                                                  match sf.preset {
+                                                      Some(p) => format!(", preset {}", p),
+                                                  None => String::new(),
+                                                  }
+                            ));
+                            usable_sf2.push(chan);
+                            continue;
+                        }
+                    }
+                }
+
+                // 2. Embedded audio in plugin state?
                 if let Some(plugin) = chan.plugin.as_ref() {
                     let found = flp_audio::extract_all(&plugin.state);
                     let files_found = found.len();
@@ -343,7 +457,9 @@ pub(super) fn convert(
                         break;
                     }
                     if let Some(e) = chosen {
-                        if e.files_found > 2 {
+                        // Two files (e.g. low/high zones) is already more than
+                        // one sample can represent.
+                        if e.files_found >= 2 {
                             warnings.push(format!(
                                 "[{:2}] {} audio files in plugin state; only the first is used \
 (multi-sample instruments will sound wrong)",
@@ -353,67 +469,6 @@ pub(super) fn convert(
                         usable_embedded.push((chan, e));
                         continue;
                     }
-                }
-
-                // 2. External SF2 matching the channel name?
-                let mut sf2_used = false;
-                if !chan.name.is_empty() {
-                    let dirs: [Option<&Path>; 2] =
-                    [opts.samples_dir.as_deref(), Some(flp_dir)];
-                    'sf2: for dir in dirs.into_iter().flatten() {
-                        if let Some(sf2_src) = find_matching_sf2(&chan.name, dir) {
-                            if debug_on() {
-                                eprintln!(
-                                    "flp: chan {} sf2 {} (sidecar)",
-                                          chan.iid,
-                                          sf2_src.display()
-                                );
-                            }
-                            let base_raw = if chan.name.is_empty() {
-                                format!("Ch{:02}", chan.iid)
-                            } else {
-                                chan.name.clone()
-                            };
-                            let base = identifier(&base_raw);
-                            let sf2_name = format!("{:02}_sf2_{}.sf2", chan.iid, base);
-                            let sf2_rel = format!("samples/{}", sf2_name);
-
-                            let bytes = match std::fs::read(&sf2_src) {
-                                Ok(b) => b,
-                                Err(e) => {
-                                    warnings.push(format!(
-                                        "[{:2}] SF2 {} read failed: {:#}",
-                                        chan.iid,
-                                        sf2_src.display(),
-                                                          e
-                                    ));
-                                    break 'sf2;
-                                }
-                            };
-                            aux_files.push(AuxFile {
-                                rel_path: sf2_rel.clone(),
-                                           bytes,
-                            });
-
-                            let inst_rel = format!("instruments/{}.instrument", base);
-                            let inst_text = format!(
-                                "Instrument {}\n{{\n    Kind: sf2;\n    File: '{}';\n    SourceChannel: {};\n}}\n",
-                                base, sf2_rel, chan.iid
-                            );
-                            aux_files.push(AuxFile {
-                                rel_path: inst_rel.clone(),
-                                           bytes: inst_text.into_bytes(),
-                            });
-
-                            sidecar_path.insert(chan.iid, inst_rel);
-                            sf2_used = true;
-                            break 'sf2;
-                        }
-                    }
-                }
-                if sf2_used {
-                    usable_sf2.push(chan);
-                    continue;
                 }
 
                 // 3. VST — resolve to installed plugin, fallback, or warn.
@@ -493,8 +548,10 @@ pub(super) fn convert(
         for chan in &usable_natives {
             end_tick = end_tick.max(end_tick_of(&placed, chan.iid));
         }
-        let n_measures =
-        std::cmp::max(1, (end_tick + ticks_per_measure - 1) / ticks_per_measure);
+        for chan in &usable_sf2 {
+            end_tick = end_tick.max(end_tick_of(&placed, chan.iid));
+        }
+        let n_measures = std::cmp::max(1, (end_tick + ticks_per_measure - 1) / ticks_per_measure);
 
         let mut sample_files: HashMap<u16, String> = HashMap::new();
         let mut sample_meta: Vec<SampleJsonEntry> = Vec::new();
@@ -558,7 +615,7 @@ pub(super) fn convert(
                     chan.name.clone()
                 },
                 file: rel,
-                c5_speed: 8363,
+                c5_speed: sample_rate,   // ← was 8363
             });
             decoded.push((*chan, src.clone()));
         }
@@ -597,6 +654,20 @@ pub(super) fn convert(
                 file: rel,
                 c5_speed: 8363,
             });
+        }
+
+        // Channel volume and pan for instrument-backed channels (VST and SF2).
+        // Without this they fall back to NoteStyle::neutral and ignore the
+        // channel's own level and pan.
+        for chan in usable_natives.iter().chain(usable_sf2.iter()) {
+            styles.insert(
+                chan.iid,
+                NoteStyle {
+                    vol_scale: chan.volume_scale(),
+                          pan_offset: chan.pan_norm(),
+                          ..NoteStyle::neutral(tempo)
+                },
+            );
         }
 
         // VST sidecars for every usable native channel.

@@ -1,20 +1,24 @@
 //! Ratatui front-end for live playback.
 //!
-//! Tracker view with synesthetic coloring and a waveform overlay:
+//! Tracker view with synesthetic coloring and a waveform overlay, plus a
+//! two-button transport at the bottom modelled on the DSi sound player:
+//! pressing left or right plays in that direction and the button turns
+//! into a stop; holding the key accelerates.  There is no pause button —
+//! the only states are stopped, forward, and reverse, with a speed
+//! multiplier on top.
+//!
 //!   - pitch class maps to hue on a 12-step wheel
 //!   - volume maps to saturation
 //!   - playing notes invert; others dim
-//!   - a grey waveform of each part's source sample is drawn *behind*
-//!     the note text
-//!   - sample parts render real PCM; synth parts render a synthesized
-//!     sine at the note's pitch
-//!   - a per-column yellow playhead follows the actual source read
-//!     position of the note currently playing in that column, so it
-//!     snaps when a note retriggers or its offset changes, and moves
-//!     at the source's pitch-scaled read rate
-//!
-//! The waveform uses braille (2×4 dots per cell) so a 30-char column is
-//! 60 pixels wide and a 20-line row is 80 pixels tall.
+//!   - a grey waveform is drawn behind the note text
+//!   - sample parts render the source PCM as a static background,
+//!     with a playhead tracking the pitch-scaled source read position
+//!   - VST parts render a live scrolling scope of the plugin's actual
+//!     output, fed by a global ring buffer indexed by channel iid
+//!   - a `cover.jpg` next to the trackscript fills the whole terminal
+//!     as a mosaic (one dimmed color per cell), painted as a background
+//!     pass after every widget, so any cell without an explicit
+//!     background picks it up
 
 use anyhow::Result;
 use crossterm::{
@@ -24,17 +28,20 @@ use crossterm::{
         disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
     },
 };
+use image::GenericImageView;
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, Paragraph},
+    widgets::{Block, Borders, Paragraph},
     Frame, Terminal,
 };
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Stdout};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::player::{Project, Sample, Transport};
@@ -49,20 +56,164 @@ const MAX_SLICE: usize = 512;
 /// Column width in terminal cells.  30 gives 60 braille pixels, wide
 /// enough to see low-frequency detail without crowding the note text.
 const COL_W: usize = 30;
-/// Latency compensation for the visual playhead.  The position is read
-/// at the top of a frame, but the frame is not visible until the draw
-/// finishes and the terminal refreshes, and there is extra audio
-/// output buffering on top of that.  This offset is added to the
-/// position used by the tracker view so the playhead lines up with
-/// what is actually being heard.  Tune by ear: raise if the playhead
-/// trails, lower if it leads.  0 disables compensation.
+/// Recent samples retained per part for the live scope.  At 48 kHz this
+/// is ~85 ms — comfortably more than one frame.
+const SCOPE_LEN: usize = 4096;
+/// Scope slots are indexed by VST channel iid, a u16.  In practice the
+/// FLP-derived projects we handle use 0..=127.
+const SCOPE_MAX_PARTS: usize = 256;
+/// Latency compensation for the visual playhead.  Raise if the playhead
+/// trails what you hear, lower if it leads.  0 disables compensation.
 const PLAYHEAD_LOOKAHEAD_SECS: f64 = 0.05;
+/// Brightness multiplier applied to the cover image.  0.5 = "half
+/// transparency" — the image is visible but text on top stays readable.
+const COVER_DIM: f32 = 0.5;
+/// Speed multipliers the direction keys step through on hold.
+const SPEED_STEPS: &[i64] = &[1, 4, 16];
+/// Two presses of the same direction key within this window count as a
+/// hold.  Most terminals don't send `KeyEventKind::Repeat` (that's a
+/// Kitty keyboard protocol feature), so we detect holds by timing.
+const HOLD_WINDOW_MS: u128 = 250;
+
+// ── cover art ──────────────────────────────────────────────────────────
+
+/// A cover image resampled to one dimmed RGB color per terminal cell.
+/// Sampled at the full terminal size, painted as a background pass over
+/// every cell that doesn't carry its own explicit background style.
+struct Cover {
+    cells: Vec<Color>,
+    cols: usize,
+    rows: usize,
+}
+
+impl Cover {
+    fn load(path: &Path, cols: usize, rows: usize, dim: f32) -> Option<Self> {
+        if cols == 0 || rows == 0 {
+            return None;
+        }
+        let img = image::open(path).ok()?;
+        let (w, h) = img.dimensions();
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let rgb = img.to_rgb8();
+
+        // Terminal cells are roughly twice as tall as they are wide, so
+        // the cell grid's pixel aspect is cols : rows*2.  Cover-fit: crop
+        // the image to that aspect, then sample one pixel per cell.
+        let grid_aspect = cols as f32 / (rows as f32 * 2.0);
+        let img_aspect = w as f32 / h as f32;
+        let (src_x, src_y, src_w, src_h) = if img_aspect > grid_aspect {
+            let new_w = (h as f32 * grid_aspect).round().max(1.0) as u32;
+            ((w - new_w) / 2, 0, new_w, h)
+        } else {
+            let new_h = (w as f32 / grid_aspect).round().max(1.0) as u32;
+            (0, (h - new_h) / 2, w, new_h)
+        };
+
+        let mut cells = Vec::with_capacity(cols * rows);
+        for cy in 0..rows {
+            for cx in 0..cols {
+                let sx = src_x + ((cx as f32 + 0.5) / cols as f32 * src_w as f32) as u32;
+                let sy = src_y + ((cy as f32 + 0.5) / rows as f32 * src_h as f32) as u32;
+                let sx = sx.min(rgb.width().saturating_sub(1));
+                let sy = sy.min(rgb.height().saturating_sub(1));
+                let p = rgb.get_pixel(sx, sy);
+                let r = (p[0] as f32 * dim).round().clamp(0.0, 255.0) as u8;
+                let g = (p[1] as f32 * dim).round().clamp(0.0, 255.0) as u8;
+                let b = (p[2] as f32 * dim).round().clamp(0.0, 255.0) as u8;
+                cells.push(Color::Rgb(r, g, b));
+            }
+        }
+        Some(Cover { cells, cols, rows })
+    }
+
+    fn get(&self, row: usize, col: usize) -> Option<Color> {
+        if row >= self.rows || col >= self.cols {
+            return None;
+        }
+        Some(self.cells[row * self.cols + col])
+    }
+}
+
+// ── global scope ring buffer ───────────────────────────────────────────
+
+struct Scope {
+    inner: Vec<Mutex<VecDeque<f32>>>,
+}
+
+static SCOPE: OnceLock<Scope> = OnceLock::new();
+
+fn scope() -> &'static Scope {
+    SCOPE.get_or_init(|| {
+        let mut inner = Vec::with_capacity(SCOPE_MAX_PARTS);
+        for _ in 0..SCOPE_MAX_PARTS {
+            inner.push(Mutex::new(VecDeque::with_capacity(SCOPE_LEN)));
+        }
+        Scope { inner }
+    })
+}
+
+/// Call from the audio callback, once per part, after the synth produces
+/// the part's sample for this frame.  Never blocks.
+pub fn scope_push(part: usize, sample: f32) {
+    let s = scope();
+    let Some(slot) = s.inner.get(part) else { return };
+    if let Ok(mut q) = slot.try_lock() {
+        if q.len() >= SCOPE_LEN {
+            q.pop_front();
+        }
+        q.push_back(sample);
+    }
+}
+
+/// Called from the render thread.  Copies the current window into `out`
+/// (cleared first).  Doesn't drain, so a paused synth leaves its last
+/// window frozen on screen.
+fn scope_snapshot(part: usize, out: &mut Vec<f32>) {
+    out.clear();
+    let s = scope();
+    let Some(slot) = s.inner.get(part) else { return };
+    if let Ok(q) = slot.lock() {
+        out.extend(q.iter().copied());
+    }
+}
+
+// ── render state ───────────────────────────────────────────────────────
+
+struct RenderState {
+    last_synth_env: Vec<Vec<(f32, f32)>>,
+    snapshot: Vec<f32>,
+    column_order: Vec<String>,
+    cover: Option<Cover>,
+    cover_source: Option<PathBuf>,
+    cover_dims: (usize, usize),
+    /// Last direction key (Left/Right) and when it was pressed.  Used to
+    /// tell a fresh tap (toggle play/stop) from a hold (accelerate),
+    /// since most terminals don't emit `KeyEventKind::Repeat`.
+    last_dir_press: Option<(KeyCode, std::time::Instant)>,
+}
+
+impl RenderState {
+    fn new() -> Self {
+        Self {
+            last_synth_env: Vec::new(),
+            snapshot: Vec::with_capacity(SCOPE_LEN),
+            column_order: Vec::new(),
+            cover: None,
+            cover_source: None,
+            cover_dims: (0, 0),
+            last_dir_press: None,
+        }
+    }
+}
 
 // ── entry point ────────────────────────────────────────────────────────
 
 pub fn run(transport: Arc<Transport>, project: Arc<Project>, sample_rate: u32) -> Result<()> {
     let mut term = setup()?;
-    let result = event_loop(&mut term, &transport, &project, sample_rate);
+    let mut state = RenderState::new();
+    let result = event_loop(&mut term, &transport, &project, sample_rate, &mut state);
     let _ = restore(&mut term);
     transport.stop.store(true, Ordering::Relaxed);
     result
@@ -87,47 +238,86 @@ fn event_loop(
     tp: &Arc<Transport>,
     project: &Arc<Project>,
     sample_rate: u32,
+    state: &mut RenderState,
 ) -> Result<()> {
     let sr = sample_rate as f64;
-    let total_secs = project.total_secs();
-    let seek_step = (SEEK_STEP_SECS * sr) as i64;
+    let _seek_step = (SEEK_STEP_SECS * sr) as i64;
     let tick = Duration::from_millis(TICK_MS);
 
     loop {
-        term.draw(|f| draw(f, tp, project, sample_rate, total_secs))?;
+        term.draw(|f| draw(f, tp, project, sample_rate, state))?;
 
         if event::poll(tick)? {
             if let Event::Key(k) = event::read()? {
-                if k.kind == KeyEventKind::Press {
-                    match (k.code, k.modifiers) {
-                        (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => break,
-                        (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
-                        (KeyCode::Char(' '), _) => {
-                            let p = tp.paused.load(Ordering::Relaxed);
-                            tp.paused.store(!p, Ordering::Relaxed);
+                // Quit and rewind fire on press or repeat, not on release.
+                if k.kind != KeyEventKind::Release {
+                    match k.code {
+                        KeyCode::Char('q') | KeyCode::Esc => break,
+                        KeyCode::Char('c')
+                            if k.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            break;
                         }
-                        (KeyCode::Left, _) => {
-                            let pos = tp.position.load(Ordering::Relaxed);
-                            tp.seek_to.store((pos - seek_step).max(0), Ordering::Release);
-                        }
-                        (KeyCode::Right, _) => {
-                            let pos = tp.position.load(Ordering::Relaxed);
-                            tp.seek_to.store(
-                                (pos + seek_step).min(project.total_samples),
-                                             Ordering::Release,
-                            );
-                        }
-                        (KeyCode::Home, _) => {
+                        KeyCode::Home => {
                             tp.seek_to.store(0, Ordering::Release);
+                            tp.speed.store(0, Ordering::Release);
                         }
                         _ => {}
+                    }
+                }
+
+                // Direction keys.  A fresh tap toggles play/stop in that
+                // direction; a rapid repeat (key held) accelerates.  We
+                // can't rely on `KeyEventKind::Repeat` — it only fires
+                // under the Kitty keyboard protocol, which most terminals
+                // don't enable.  Instead, treat any press within the
+                // hold window of the previous press of the same key as
+                // a hold.
+                if k.kind == KeyEventKind::Press
+                    && matches!(k.code, KeyCode::Left | KeyCode::Right)
+                {
+                    let now = std::time::Instant::now();
+                    let is_hold = matches!(
+                        state.last_dir_press,
+                        Some((last, t))
+                            if last == k.code
+                                && now.duration_since(t).as_millis() < HOLD_WINDOW_MS
+                    );
+                    state.last_dir_press = Some((k.code, now));
+
+                    let cur = tp.speed.load(Ordering::Relaxed);
+                    let want_sign: i64 = if k.code == KeyCode::Left { -1 } else { 1 };
+
+                    if is_hold {
+                        // Same direction as we're already going?  Bump
+                        // the magnitude.  Opposite direction?  Restart
+                        // at 1x in the new direction.
+                        let mag = if cur.signum() == want_sign {
+                            cur.unsigned_abs() as i64
+                        } else {
+                            0
+                        };
+                        let next = SPEED_STEPS
+                            .iter()
+                            .copied()
+                            .find(|s| *s > mag)
+                            .unwrap_or(*SPEED_STEPS.last().unwrap());
+                        tp.speed.store(want_sign * next, Ordering::Release);
+                    } else {
+                        // Fresh tap: toggle if we're already going this
+                        // direction, otherwise start at 1x that way.
+                        let already = cur.signum() == want_sign;
+                        tp.speed.store(
+                            if already { 0 } else { want_sign },
+                            Ordering::Release,
+                        );
                     }
                 }
             }
         }
 
         if tp.done.load(Ordering::Acquire) {
-            term.draw(|f| draw(f, tp, project, sample_rate, total_secs))?;
+            term.draw(|f| draw(f, tp, project, sample_rate, state))?;
             std::thread::sleep(Duration::from_millis(500));
             break;
         }
@@ -140,9 +330,20 @@ fn draw(
     tp: &Transport,
     project: &Project,
     sample_rate: u32,
-    total_secs: f64,
+    state: &mut RenderState,
 ) {
     let area = f.area();
+
+    // ── Cover image ──────────────────────────────────────────────────
+    let cover_dims = (area.width as usize, area.height as usize);
+    if state.cover_source.as_deref() != project.cover_path() || state.cover_dims != cover_dims {
+        state.cover = project
+        .cover_path()
+        .and_then(|path| Cover::load(path, cover_dims.0, cover_dims.1, COVER_DIM));
+        state.cover_source = project.cover_path().map(Path::to_path_buf);
+        state.cover_dims = cover_dims;
+    }
+
     let chunks = Layout::default()
     .direction(Direction::Vertical)
     .constraints([
@@ -152,20 +353,57 @@ fn draw(
     ])
     .split(area);
 
-    draw_header(f, chunks[0], project);
-    draw_body(f, chunks[1], tp, project);
-    draw_transport(f, chunks[2], tp, sample_rate, total_secs);
+    draw_header(f, chunks[0], project, tp, sample_rate);
+    draw_body(f, chunks[1], tp, project, state);
+    draw_transport(f, chunks[2], tp);
+
+    // ── Mosaic background pass ──────────────────────────────────────
+    //
+    // Fill in cover color for any cell without an explicit background.
+    // In ratatui `Cell::bg` is a `Color` (default `Color::Reset`), not
+    // an Option, so we test against `Color::Reset` directly.
+    if let Some(cover) = &state.cover {
+        let buf = f.buffer_mut();
+        let w = buf.area.width;
+        let h = buf.area.height;
+        for y in 0..h {
+            for x in 0..w {
+                let Some(cc) = cover.get(y as usize, x as usize) else { continue };
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    if cell.bg == Color::Reset {
+                        cell.bg = cc;
+                    }
+                }
+            }
+        }
+    }
 }
 
-fn draw_header(f: &mut Frame<'_>, area: Rect, p: &Project) {
+fn draw_header(
+    f: &mut Frame<'_>,
+    area: Rect,
+    p: &Project,
+    tp: &Transport,
+    sr: u32,
+) {
     let (num, den) = p.time_signature;
+    let pos = tp.position.load(Ordering::Relaxed).max(0) as f64;
+    let secs = pos / sr as f64;
+    let total = p.total_secs();
+    let speed = tp.speed.load(Ordering::Relaxed);
+    let speed_tag = match speed {
+        0 => "■".to_string(),
+        s if s > 0 => format!("▶{}x", s),
+        s => format!("◀{}x", -s),
+    };
     let line = Line::from(vec![
         Span::styled(" ♪ ", Style::default().fg(Color::Cyan)),
                           Span::styled(p.title.clone(), Style::default().add_modifier(Modifier::BOLD)),
                           Span::raw(format!(
-                              "    {} BPM    {}/{}    {} voices    {} lines",
+                              "    {} BPM    {}/{}    {} voices    {} lines    {}  {:>5.1}s / {:.1}s",
                               p.initial_bpm.round() as i64,
-                                            num, den, p.voice_count, p.line_count()
+                                            num, den, p.voice_count, p.line_count(),
+                                            speed_tag, secs, total
                           )),
     ]);
     f.render_widget(
@@ -174,12 +412,18 @@ fn draw_header(f: &mut Frame<'_>, area: Rect, p: &Project) {
     );
 }
 
-fn draw_body(f: &mut Frame<'_>, area: Rect, tp: &Transport, p: &Project) {
+fn draw_body(
+    f: &mut Frame<'_>,
+    area: Rect,
+    tp: &Transport,
+    p: &Project,
+    state: &mut RenderState,
+) {
     let chunks = Layout::default()
     .direction(Direction::Horizontal)
     .constraints([Constraint::Percentage(78), Constraint::Percentage(22)])
     .split(area);
-    draw_tracker(f, chunks[0], tp, p);
+    draw_tracker(f, chunks[0], tp, p, state);
     draw_live_panel(f, chunks[1], tp, p);
 }
 
@@ -269,6 +513,7 @@ struct NoteRow {
 
 struct DisplayNote {
     note: NoteRow,
+    subs: u32,
     display_start: f64,
     display_end: f64,
     value_offset: f64,
@@ -436,9 +681,6 @@ fn slice_minmax(
     if !lo.is_finite() || !hi.is_finite() { (0.0, 0.0) } else { (lo, hi) }
 }
 
-/// Envelope of an entire source sample, one (min, max) pair per pixel
-/// row.  Used for the static column background.  The playhead is drawn
-/// separately, based on the actual source read position of the note.
 fn whole_sample_envelope(sample: &Sample, pixel_rows: usize) -> Vec<(f32, f32)> {
     let n = sample.left.len();
     if n == 0 || pixel_rows == 0 {
@@ -449,16 +691,37 @@ fn whole_sample_envelope(sample: &Sample, pixel_rows: usize) -> Vec<(f32, f32)> 
     for py in 0..pixel_rows {
         let s0 = (py as f64 / pixel_rows as f64) * nf;
         let s1 = ((py + 1) as f64 / pixel_rows as f64) * nf;
-        // No loop wrapping here: the background is a static view of the
-        // whole sample, not the looping playback region.
         out.push(slice_minmax(sample, s0, s1, None));
     }
     out
 }
 
-/// Synthesized envelope for a synth part: a sine whose pitch-driven
-/// period scales with the note's pitch, amplitude from the note's volume.
-fn synth_envelope(
+fn synth_envelope_live(snapshot: &[f32], pixel_rows: usize) -> Vec<(f32, f32)> {
+    if pixel_rows == 0 || snapshot.is_empty() {
+        return Vec::new();
+    }
+    let n = snapshot.len();
+    let mut out = Vec::with_capacity(pixel_rows);
+    for py in 0..pixel_rows {
+        let s0 = (py as f64 / pixel_rows as f64) * n as f64;
+        let s1 = ((py + 1) as f64 / pixel_rows as f64) * n as f64;
+        let a = (s0.floor() as usize).min(n.saturating_sub(1));
+        let b = (s1.ceil() as usize).max(a + 1).min(n);
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for &s in &snapshot[a..b] {
+            if s < lo { lo = s; }
+            if s > hi { hi = s; }
+        }
+        if !lo.is_finite() {
+            out.push((0.0, 0.0));
+        } else {
+            out.push((lo, hi));
+        }
+    }
+    out
+}
+
+fn synth_envelope_static(
     p: &Project,
     part_name: &str,
     pixel_rows: usize,
@@ -474,7 +737,6 @@ fn synth_envelope(
         let t = py as f64 / pixel_rows as f64;
         let row = t * rpmeasure;
 
-        // The note currently under this pixel row.
         let active = notes.iter().rev().find(|n| n.start_row <= row && row < n.end_row);
         let Some(note) = active else {
             out.push((0.0, 0.0));
@@ -484,8 +746,6 @@ fn synth_envelope(
         let pitch = value_at(&note.pitch_points, row).unwrap_or(C5_HZ);
         let vol = (value_at(&note.vol_points, row).unwrap_or(100.0) / 100.0) as f32;
 
-        // Two cycles across the visible window at C5, scaling with pitch.
-        // Higher pitch = more cycles across the same vertical span.
         let cycles_total = (pitch / C5_HZ) * 2.0;
         phase += cycles_total / pixel_rows as f64;
         let s = (phase * std::f64::consts::TAU).sin() as f32 * vol;
@@ -496,14 +756,16 @@ fn synth_envelope(
 
 // ── tracker with wave overlay ──────────────────────────────────────────
 
-fn draw_tracker(f: &mut Frame<'_>, area: Rect, tp: &Transport, p: &Project) {
-    // Position for the tracker view: real position plus a small
-    // lookahead to compensate for render + terminal + audio-buffer
-    // latency.  The transport gauge below still uses the raw position.
+fn draw_tracker(
+    f: &mut Frame<'_>,
+    area: Rect,
+    tp: &Transport,
+    p: &Project,
+    state: &mut RenderState,
+) {
     let sr_comp = p.sample_rate as f64;
     let lookahead = (PLAYHEAD_LOOKAHEAD_SECS * sr_comp) as i64;
-    let pos = (tp.position.load(Ordering::Relaxed) + lookahead)
-    .min(p.total_samples);
+    let pos = (tp.position.load(Ordering::Relaxed) + lookahead).min(p.total_samples);
     let current = p.current_line(pos);
 
     let title = match current {
@@ -516,11 +778,61 @@ fn draw_tracker(f: &mut Frame<'_>, area: Rect, tp: &Transport, p: &Project) {
         f.render_widget(Paragraph::new("(silence)").block(outer), area);
         return;
     };
-    let parts = p.line_parts(li);
-    if parts.is_empty() {
+
+    let rpmeasure = p.rows_per_measure();
+    let lookback = LOOKBACK_LINES.min(li);
+    let current_line_parts = p.line_parts(li);
+
+    let mut by_path: HashMap<String, Vec<(String, f64)>> = HashMap::new();
+    let mut discovery: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    for name in current_line_parts {
+        let Some(path) = p.part_path(name) else { continue };
+        let key = path.to_string();
+        if seen.insert(key.clone()) {
+            discovery.push(key.clone());
+        }
+        by_path.entry(key).or_default().push((name.clone(), 0.0));
+    }
+
+    for k in 1..=lookback {
+        let prev_li = li - k;
+        let offset_rows = k as f64 * rpmeasure;
+        for name in p.line_parts(prev_li) {
+            let Some(path) = p.part_path(name) else { continue };
+            let subs = p.part_subs_per_beat(name);
+            let still_on = split_notes(p.part_events(name), subs)
+                .iter()
+                .any(|n| n.end_row > offset_rows);
+            if !still_on { continue; }
+            let key = path.to_string();
+            if seen.insert(key.clone()) {
+                discovery.push(key.clone());
+            }
+            by_path.entry(key).or_default().push((name.clone(), offset_rows));
+        }
+    }
+
+    if discovery.is_empty() {
         f.render_widget(Paragraph::new("(silence)").block(outer), area);
         return;
     }
+
+    let present: HashSet<&String> = discovery.iter().collect();
+    let mut merged: Vec<String> = state
+    .column_order
+    .iter()
+    .filter(|path| present.contains(path))
+    .cloned()
+    .collect();
+    for path in &discovery {
+        if !merged.iter().any(|m| m == path) {
+            merged.push(path.clone());
+        }
+    }
+    state.column_order = merged.clone();
+    let path_order = merged;
 
     let inner = outer.inner(area);
     let inner_w = inner.width as usize;
@@ -530,151 +842,158 @@ fn draw_tracker(f: &mut Frame<'_>, area: Rect, tp: &Transport, p: &Project) {
         return;
     }
 
-    let visible_cols = (inner_w / (COL_W + 1)).min(parts.len());
-    let char_rows = inner_h.saturating_sub(1); // one line for the header
+    let visible_cols = (inner_w / (COL_W + 1)).min(path_order.len());
+    let char_rows = inner_h.saturating_sub(1);
     let pixel_rows = char_rows * 4;
 
-    // Measure duration in seconds.
     let sr = p.sample_rate as f64;
     let measure_samples = p.line_measure_samples(li).max(1);
     let measure_secs = measure_samples as f64 / sr;
 
-    // Current playhead position within the measure (0..1).
     let line_start = p.line_start_sample(li);
     let elapsed = (pos - line_start).max(0);
     let playhead_frac = (elapsed as f64 / measure_samples as f64).clamp(0.0, 1.0);
-    let rpmeasure = p.rows_per_measure();
     let current_row = playhead_frac * rpmeasure;
     let rows_per_sec = rpmeasure / measure_secs.max(1e-9);
 
-    // Build columns of DisplayNote for the visible parts.
     let mut columns: Vec<Vec<DisplayNote>> = Vec::with_capacity(visible_cols);
-    for (i, name) in parts.iter().take(visible_cols).enumerate() {
-        let subs = p.part_subs_per_beat(name);
+    for col in 0..visible_cols {
+        let path = &path_order[col];
+        let sources = &by_path[path];
         let mut notes: Vec<DisplayNote> = Vec::new();
-        let lookback = LOOKBACK_LINES.min(li);
-        for k in 1..=lookback {
-            let prev_li = li - k;
-            let prev_parts = p.line_parts(prev_li);
-            let Some(prev_name) = prev_parts.get(i) else { continue };
-            let prev_subs = p.part_subs_per_beat(prev_name);
-            let offset_rows = k as f64 * rpmeasure;
 
-            for note in split_notes(p.part_events(prev_name), prev_subs) {
-                let active = note.end_row > offset_rows;
+        for (name, offset_rows) in sources {
+            let subs = p.part_subs_per_beat(name);
+            let is_current = *offset_rows == 0.0;
+            for note in split_notes(p.part_events(name), subs) {
+                let active = note.end_row > *offset_rows;
                 let has_vol_waypoints = note.vol_points.len() > 1;
                 let dur_beats = note.dur_beats.unwrap_or(1.0);
                 let is_sustained = dur_beats >= 2.0;
                 let end_vol = value_at(&note.vol_points, note.end_row).unwrap_or(0.0);
                 let still_fading = has_vol_waypoints && is_sustained && end_vol > 0.01;
                 if !active && !still_fading { continue; }
-                let display_end = if active {
-                    (note.end_row - offset_rows).min(rpmeasure)
-                } else { 0.0 };
+                let (display_start, display_end) = if is_current {
+                    (note.start_row, note.end_row)
+                } else if active {
+                    (0.0, (note.end_row - *offset_rows).min(rpmeasure))
+                } else {
+                    (0.0, 0.0)
+                };
                 notes.push(DisplayNote {
                     note,
-                    display_start: 0.0,
+                    subs,
+                    display_start,
                     display_end,
-                    value_offset: offset_rows,
+                    value_offset: *offset_rows,
                 });
             }
         }
-        for note in split_notes(p.part_events(name), subs) {
-            let display_start = note.start_row;
-            let display_end = note.end_row;
-            notes.push(DisplayNote {
-                note,
-                display_start,
-                display_end,
-                value_offset: 0.0,
-            });
-        }
+
         notes.sort_by(|a, b| {
-            a.display_start.partial_cmp(&b.display_start).unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.value_offset.partial_cmp(&b.value_offset).unwrap_or(std::cmp::Ordering::Equal))
+            let ka = a.note.start_row - a.value_offset;
+            let kb = b.note.start_row - b.value_offset;
+            ka.partial_cmp(&kb).unwrap_or(std::cmp::Ordering::Equal)
         });
         columns.push(notes);
     }
 
-    // Wave envelopes, one per visible column.  Sample parts show the
-    // whole source sample as a static background; synth parts show a
-    // synthesized sine over the measure.
+    if state.last_synth_env.len() < visible_cols {
+        state.last_synth_env.resize_with(visible_cols, Vec::new);
+    }
     let mut envelopes: Vec<Vec<(f32, f32)>> = Vec::with_capacity(visible_cols);
-    for name in parts.iter().take(visible_cols) {
+    for col in 0..visible_cols {
+        let path = &path_order[col];
+        let Some((name, _)) = by_path[path].first() else {
+            envelopes.push(vec![(0.0, 0.0); pixel_rows]);
+            continue;
+        };
         if let Some(sample) = p.sample_for_part(name) {
             envelopes.push(whole_sample_envelope(&sample, pixel_rows));
         } else {
-            envelopes.push(synth_envelope(p, name, pixel_rows));
+            let env = p.iid_for_part(name).and_then(|iid| {
+                scope_snapshot(iid as usize, &mut state.snapshot);
+                if state.snapshot.is_empty() {
+                    None
+                } else {
+                    let e = synth_envelope_live(&state.snapshot, pixel_rows);
+                    if e.is_empty() { None } else { Some(e) }
+                }
+            });
+            match env {
+                Some(env) => {
+                    state.last_synth_env[col] = env.clone();
+                    envelopes.push(env);
+                }
+                None => {
+                    let cached = &state.last_synth_env[col];
+                    if cached.len() == pixel_rows {
+                        envelopes.push(cached.clone());
+                    } else {
+                        envelopes.push(synth_envelope_static(p, name, pixel_rows));
+                    }
+                }
+            }
         }
     }
 
-    // Per-column playhead pixel row.
-    //
-    // For sample parts this is derived from the actual source read
-    // position of the note currently active in that column: offset +
-    // elapsed_secs * sample_rate * pitch_ratio, wrapped through the
-    // sample's loop if it has one.  That means it snaps when the note
-    // retriggers (or its offset changes) and moves at the pitch-scaled
-    // read rate, so a high note visibly scrolls the playhead faster.
-    //
-    // For synth parts (no source sample) we fall back to a plain
-    // measure-linear sweep.
     let mut playhead_pys: Vec<Option<usize>> = Vec::with_capacity(visible_cols);
     for col in 0..visible_cols {
-        let part_name = &parts[col];
-        if let Some(sample) = p.sample_for_part(part_name) {
-            let n = sample.left.len();
-            if n == 0 {
-                playhead_pys.push(None);
-                continue;
-            }
-            let nf = n as f64;
-            let loop_pts = sample.loop_pts;
-            let sample_rate_f = sample.rate;
-
-            // Most recently started note that's still sounding at
-            // current_row.  Notes are sorted ascending by display_start,
-            // so reverse-iteration finds the newest one first.
-            let active = columns[col].iter().rev().find(|dn| {
-                let local_row = dn.value_offset + current_row;
-                dn.note.start_row <= local_row && local_row < dn.note.end_row
-            });
-
-            let py = active.and_then(|dn| {
-                let local_row = dn.value_offset + current_row;
-                let elapsed_rows = (local_row - dn.note.start_row).max(0.0);
-                let elapsed_secs = elapsed_rows / rows_per_sec;
-                let pitch = value_at(&dn.note.pitch_points, local_row).unwrap_or(C5_HZ);
-                let ratio = (pitch / C5_HZ).max(1e-6);
-                let src_now = dn.note.offset as f64 + elapsed_secs * sample_rate_f * ratio;
-                let wrapped = wrapped_pos(src_now, loop_pts);
-                let t = (wrapped / nf).clamp(0.0, 1.0);
-                let row = ((t * pixel_rows as f64).floor() as usize)
-                .min(pixel_rows.saturating_sub(1));
-                Some(row)
-            });
-            playhead_pys.push(py);
-        } else {
-            let row = ((playhead_frac * pixel_rows as f64).floor() as usize)
-            .min(pixel_rows.saturating_sub(1));
-            playhead_pys.push(Some(row));
+        let path = &path_order[col];
+        let Some((name, _)) = by_path[path].first() else {
+            playhead_pys.push(None);
+            continue;
+        };
+        let Some(sample) = p.sample_for_part(name) else {
+            playhead_pys.push(None);
+            continue;
+        };
+        let n = sample.left.len();
+        if n == 0 {
+            playhead_pys.push(None);
+            continue;
         }
+        let nf = n as f64;
+        let loop_pts = sample.loop_pts;
+        let sample_rate_f = sample.rate;
+
+        let active = columns[col].iter().rev().find(|dn| {
+            let local_row = dn.value_offset + current_row;
+            dn.note.start_row <= local_row && local_row < dn.note.end_row
+        });
+
+        let py = active.and_then(|dn| {
+            let local_row = dn.value_offset + current_row;
+            let elapsed_rows = (local_row - dn.note.start_row).max(0.0);
+            let elapsed_secs = elapsed_rows / rows_per_sec;
+            let pitch = value_at(&dn.note.pitch_points, local_row).unwrap_or(C5_HZ);
+            let ratio = (pitch / C5_HZ).max(1e-6);
+            let src_now = dn.note.offset as f64 + elapsed_secs * sample_rate_f * ratio;
+            let wrapped = wrapped_pos(src_now, loop_pts);
+            let t = (wrapped / nf).clamp(0.0, 1.0);
+            let row = ((t * pixel_rows as f64).floor() as usize)
+                .min(pixel_rows.saturating_sub(1));
+            Some(row)
+        });
+        playhead_pys.push(py);
     }
 
-    // Neutral grey wave.  Text cells keep their own style, so the wave
-    // does not tint note highlights underneath it.
-    let wave_fg = Color::Rgb(128, 128, 128);
+    let wave_fg = Color::Rgb(200, 200, 200);
 
-    // Header line: part names.
     let mut header: Vec<Span> = Vec::new();
-    for name in parts.iter().take(visible_cols) {
-        let mut label = name.clone();
-        if label.len() >= COL_W {
-            label.truncate(COL_W - 1);
-            label.push('…');
+    for col in 0..visible_cols {
+        let path = &path_order[col];
+        let label = by_path[path]
+            .first()
+            .map(|(n, _)| n.clone())
+            .unwrap_or_else(|| "(?)".to_string());
+        let mut l = label;
+        if l.len() >= COL_W {
+            l.truncate(COL_W - 1);
+            l.push('…');
         }
         header.push(Span::styled(
-            format!("{:<width$}", label, width = COL_W),
+            format!("{:<width$}", l, width = COL_W),
                 Style::default().add_modifier(Modifier::BOLD),
         ));
         header.push(Span::raw(" "));
@@ -685,20 +1004,14 @@ fn draw_tracker(f: &mut Frame<'_>, area: Rect, tp: &Transport, p: &Project) {
     for r in 0..char_rows {
         let mut spans: Vec<Span> = Vec::new();
         for col in 0..visible_cols {
-            let name = &parts[col];
-            let subs = p.part_subs_per_beat(name);
-
-            // Playhead char row for this column (if any).
             let playhead_char: Option<usize> = playhead_pys[col].map(|py| py / 4);
 
-            // Wave bits for each cell in this part column.
             for cx in 0..COL_W {
                 let mut bits: u8 = 0;
                 for ly in 0..4 {
                     let py = r * 4 + ly;
                     if py >= pixel_rows { continue; }
                     let (lo, hi) = envelopes[col].get(py).copied().unwrap_or((0.0, 0.0));
-                    // Amplitude [-1, 1] -> pixel [0, COL_W*2-1].
                     let half = (COL_W * 2) as f32 / 2.0;
                     let center = half;
                     let px_lo = (center + lo * half).round() as isize;
@@ -711,12 +1024,9 @@ fn draw_tracker(f: &mut Frame<'_>, area: Rect, tp: &Transport, p: &Project) {
                     if (px_lo..=px_hi).contains(&cell_x1) { bits |= dot_bit(1, ly); }
                 }
 
-                // Find text occupying this exact cell.  Notes are drawn
-                // as a single span across the whole part column, so we
-                // check if the note's text covers this cell index.
                 let cell_text: Option<(String, Style)> = columns[col].get(r).map(|dn| {
                     let note_local_row = dn.value_offset + current_row;
-                    let text = fmt_note(&dn.note, note_local_row, subs);
+                    let text = fmt_note(&dn.note, note_local_row, dn.subs);
                     let playing = dn.display_end > 0.0
                     && dn.display_start <= current_row
                     && current_row < dn.display_end;
@@ -734,21 +1044,19 @@ fn draw_tracker(f: &mut Frame<'_>, area: Rect, tp: &Transport, p: &Project) {
                     (text, note_style(pitch, vol, state))
                 });
 
-                // Determine if the note text covers this cx.
-                let text_char: Option<char> = cell_text.as_ref().and_then(|(t, _)| {
-                    t.chars().nth(cx)
-                });
+                let text_char: Option<char> = cell_text
+                .as_ref()
+                .and_then(|(t, _)| t.chars().nth(cx));
 
                 let under_playhead = playhead_char == Some(r);
 
                 if let Some(ch) = text_char {
-                    // Text cell: keep the note's own style so its
-                    // highlight colors are not polluted by the wave or
-                    // the playhead.
-                    let style = cell_text.as_ref().unwrap().1;
+                    let mut style = cell_text.as_ref().unwrap().1;
+                    if under_playhead {
+                        style = style.bg(Color::Yellow).fg(Color::Black);
+                    }
                     spans.push(Span::styled(ch.to_string(), style));
                 } else if bits != 0 {
-                    // Wave-only cell.
                     let ch = braille_char(bits);
                     let style = if under_playhead {
                         Style::default().fg(Color::Yellow)
@@ -780,10 +1088,17 @@ fn draw_live_panel(f: &mut Frame<'_>, area: Rect, tp: &Transport, p: &Project) {
     let active = tp.active_voices.load(Ordering::Relaxed);
     let loaded = tp.loaded_lines.load(Ordering::Relaxed);
     let done = tp.done.load(Ordering::Relaxed);
-    let paused = tp.paused.load(Ordering::Relaxed);
+    let speed = tp.speed.load(Ordering::Relaxed);
 
-    let state_str = if done { "finished" } else if paused { "paused" } else { "playing" };
-    let state_col = if done { Color::DarkGray } else if paused { Color::Yellow } else { Color::Green };
+    let (state_str, state_col) = if done {
+        ("finished", Color::DarkGray)
+    } else if speed == 0 {
+        ("stopped", Color::DarkGray)
+    } else if speed > 0 {
+        ("forward", Color::Green)
+    } else {
+        ("reverse", Color::Cyan)
+    };
     let now_line = p.current_line(pos).map(|i| format!("{}", i + 1)).unwrap_or_else(|| "—".into());
 
     let legend: Vec<Span> = (0..12).flat_map(|class| {
@@ -803,8 +1118,8 @@ fn draw_live_panel(f: &mut Frame<'_>, area: Rect, tp: &Transport, p: &Project) {
         Line::from(Span::styled("C  C# D  D# E  F  F# G  G# A  A# B", Style::default().fg(Color::DarkGray))),
         Line::from(legend),
         Line::from(""),
-        Line::from(Span::styled("space  pause", Style::default().fg(Color::DarkGray))),
-        Line::from(Span::styled("← →    seek ±5s", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled("← →    reverse / forward", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled("hold   accelerate", Style::default().fg(Color::DarkGray))),
         Line::from(Span::styled("home   rewind", Style::default().fg(Color::DarkGray))),
         Line::from(Span::styled("q      quit", Style::default().fg(Color::DarkGray))),
     ];
@@ -814,16 +1129,60 @@ fn draw_live_panel(f: &mut Frame<'_>, area: Rect, tp: &Transport, p: &Project) {
     );
 }
 
-fn draw_transport(f: &mut Frame<'_>, area: Rect, tp: &Transport, sr: u32, total_secs: f64) {
-    let pos = tp.position.load(Ordering::Relaxed).max(0) as f64;
-    let secs = pos / sr as f64;
-    let ratio = if total_secs > 0.0 { (secs / total_secs).clamp(0.0, 1.0) } else { 0.0 };
-    let paused = tp.paused.load(Ordering::Relaxed);
-    let label = format!("{}  {:>6.1}s / {:.1}s", if paused { "❚❚" } else { "▶" }, secs, total_secs);
-    let gauge = Gauge::default()
-    .block(Block::default().borders(Borders::ALL))
-    .gauge_style(Style::default().fg(if paused { Color::Yellow } else { Color::Green }))
-    .ratio(ratio)
-    .label(label);
-    f.render_widget(gauge, area);
+// ── transport (DSi-style two buttons) ──────────────────────────────────
+
+fn draw_transport(f: &mut Frame<'_>, area: Rect, tp: &Transport) {
+    let speed = tp.speed.load(Ordering::Relaxed);
+    let chunks = Layout::default()
+    .direction(Direction::Horizontal)
+    .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+    .split(area);
+
+    // Left: reverse / stop.
+    let rev_active = speed < 0;
+    let rev_label = if rev_active {
+        format!("■   stop    {}x", -speed)
+    } else {
+        "◀   rewind".to_string()
+    };
+    let rev_style = if rev_active {
+        Style::default()
+        .fg(Color::Black)
+        .bg(Color::Cyan)
+        .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    let rev_block = Block::default()
+    .borders(Borders::ALL)
+    .title(" left ");
+    let rev = Paragraph::new(rev_label)
+    .alignment(Alignment::Center)
+    .block(rev_block)
+    .style(rev_style);
+    f.render_widget(rev, chunks[0]);
+
+    // Right: forward / stop.
+    let fwd_active = speed > 0;
+    let fwd_label = if fwd_active {
+        format!("■   stop    {}x", speed)
+    } else {
+        "▶   play".to_string()
+    };
+    let fwd_style = if fwd_active {
+        Style::default()
+        .fg(Color::Black)
+        .bg(Color::Green)
+        .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    let fwd_block = Block::default()
+    .borders(Borders::ALL)
+    .title(" right ");
+    let fwd = Paragraph::new(fwd_label)
+    .alignment(Alignment::Center)
+    .block(fwd_block)
+    .style(fwd_style);
+    f.render_widget(fwd, chunks[1]);
 }

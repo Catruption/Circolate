@@ -1,6 +1,6 @@
 //! Voice scheduling, mixer, and DSP primitives.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::f64::consts::{FRAC_PI_4, PI};
 use std::sync::{Arc, OnceLock};
 
@@ -199,6 +199,10 @@ pub(crate) enum Msg {
 /// audible quantization.
 const VST_BLOCK: i64 = 512;
 
+/// Seconds of VST output retained for reverse playback.  Ten seconds of
+/// 48 kHz stereo is about 3.8 MB.
+const VST_HISTORY_SECS: f64 = 10.0;
+
 pub(crate) struct Engine {
     sr: f64,
     song_volume: f64,
@@ -211,11 +215,25 @@ pub(crate) struct Engine {
     active: Vec<Active>,
 
     // VST hosting — one instance per channel, keyed by channel iid.
-    hosts: HashMap<u16, VstHost>,
+    // BTreeMap (not HashMap) so iteration is sorted by iid and therefore
+    // deterministic across calls.
+    hosts: BTreeMap<u16, VstHost>,
+    /// Per-host scratch, preallocated so the audio thread never allocates.
+    host_scratch: BTreeMap<u16, (Vec<f32>, Vec<f32>)>,
     vst_pending: VecDeque<VstNote>,
     vst_active: Vec<VstNote>,
     vst_scratch_l: Vec<f32>,
     vst_scratch_r: Vec<f32>,
+
+    /// Rolling stereo history of the summed VST output, indexed by
+    /// absolute song sample position modulo the ring length.  Used to
+    /// play plugin audio backward, since we can't run a plugin in
+    /// reverse.
+    vst_hist_l: Vec<f32>,
+    vst_hist_r: Vec<f32>,
+    /// The highest song position whose VST output has been recorded.
+    /// `i64::MIN` means nothing has been recorded yet.
+    vst_hist_head: i64,
 
     // Master bus effects — one chain, run on the fully-summed stereo mix.
     master_fx: Option<EffectChain>,
@@ -223,6 +241,7 @@ pub(crate) struct Engine {
 
 impl Engine {
     pub(crate) fn new(p: &Project) -> Self {
+        let hist_len = (VST_HISTORY_SECS * p.sample_rate as f64).max(1.0) as usize;
         Engine {
             sr: p.sample_rate as f64,
             song_volume: p.song_volume,
@@ -233,11 +252,15 @@ impl Engine {
             epoch: 0,
             pending: VecDeque::new(),
             active: Vec::new(),
-            hosts: HashMap::new(),
+            hosts: BTreeMap::new(),
+            host_scratch: BTreeMap::new(),
             vst_pending: VecDeque::new(),
             vst_active: Vec::new(),
             vst_scratch_l: vec![0.0; VST_BLOCK as usize],
             vst_scratch_r: vec![0.0; VST_BLOCK as usize],
+            vst_hist_l: vec![0.0; hist_len],
+            vst_hist_r: vec![0.0; hist_len],
+            vst_hist_head: i64::MIN,
             master_fx: None,
         }
     }
@@ -246,6 +269,13 @@ impl Engine {
     /// after resolving the channel's `.instrument` sidecar.
     pub(crate) fn install_host(&mut self, iid: u16, host: VstHost) {
         self.hosts.insert(iid, host);
+        self.host_scratch.insert(
+            iid,
+            (
+                vec![0.0f32; VST_BLOCK as usize],
+                vec![0.0f32; VST_BLOCK as usize],
+            ),
+        );
     }
 
     pub(crate) fn host_count(&self) -> usize {
@@ -366,27 +396,58 @@ impl Engine {
         self.active.len()
     }
 
-    pub(crate) fn render(&mut self, out_l: &mut [f32], out_r: &mut [f32]) {
+    pub(crate) fn render(&mut self, out_l: &mut [f32], out_r: &mut [f32], speed: i64) {
         out_l.fill(0.0);
         out_r.fill(0.0);
-        let block_start = self.pos;
-        let block_end = block_start + out_l.len() as i64;
-        let sr = self.sr;
 
-        // ── sample voices ──────────────────────────────────────────────
-        while self.pending.front().map_or(false, |v| v.start < block_end) {
-            let v = self.pending.pop_front().unwrap();
-            let raw_pos = v.offset;
-            self.active.push(Active { v, raw_pos });
+        if speed == 0 {
+            return;
         }
 
+        let block_len = out_l.len() as i64;
+        let block_start = self.pos;
+        let block_end = block_start + block_len * speed;
+        let sr = self.sr;
+        let dir: i64 = if speed > 0 { 1 } else { -1 };
+        let dir_f = dir as f64;
+
+        // ── Voice activation ─────────────────────────────────────────
+        //
+        // Forward: pop pending voices whose start we've crossed as we
+        // move up through time.
+        // Reverse: pop pending voices whose *end* we've crossed as we
+        // move down through time.
+        if speed > 0 {
+            while self.pending.front().map_or(false, |v| v.start < block_end) {
+                let v = self.pending.pop_front().unwrap();
+                let raw_pos = v.offset;
+                self.active.push(Active { v, raw_pos });
+            }
+        } else {
+            let mut i = 0;
+            while i < self.pending.len() {
+                let activate = {
+                    let v = &self.pending[i];
+                    v.end <= block_start && v.end > block_end
+                };
+                if activate {
+                    let v = self.pending.remove(i).unwrap();
+                    let step = v.sample.rate * (v.pitch_hz / C5_HZ) / sr;
+                    let note_len = (v.end - v.start).max(0) as f64;
+                    let raw_pos = v.offset + (note_len - 1.0).max(0.0) * step;
+                    self.active.push(Active { v, raw_pos });
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        // ── Sample voices ────────────────────────────────────────────
         let song_volume = self.song_volume;
         let linear = self.linear;
 
         self.active.retain_mut(|a| {
             let v = &a.v;
-            let lo = v.start.max(block_start);
-            let hi = v.end.min(block_end);
             let smp = &*v.sample;
             let len = smp.len() as f64;
             let const_step = smp.rate * (v.pitch_hz / C5_HZ) / sr;
@@ -396,7 +457,27 @@ impl Engine {
             };
             let automated_gain = v.vol_lane.is_some() || v.pan_lane.is_some();
 
-            for f in lo..hi {
+            // Output-sample range where this voice is active.
+            let (i_lo, i_hi) = if speed > 0 {
+                let lo = ((v.start - block_start) as f64 / speed as f64)
+                    .ceil()
+                    .max(0.0) as i64;
+                let hi = ((v.end - block_start) as f64 / speed as f64)
+                    .ceil()
+                    .min(block_len as f64) as i64;
+                (lo, hi)
+            } else {
+                let lo = (((v.end - block_start) as f64 / speed as f64)
+                    .floor() as i64)
+                    + 1;
+                let hi = (((v.start - block_start) as f64 / speed as f64)
+                    .floor() as i64)
+                    + 1;
+                (lo.max(0), hi.min(block_len))
+            };
+
+            for i in i_lo..i_hi {
+                let f = block_start + i * speed;
                 let t = f as f64 / sr;
                 let step = match &v.pitch_lane {
                     Some(l) => smp.rate * (l.value_at(t) / C5_HZ) / sr,
@@ -405,8 +486,13 @@ impl Engine {
 
                 let mut p = a.raw_pos;
                 if let Some((ls, le)) = loop_f {
-                    if p >= le {
-                        p = ls + (p - le).rem_euclid(le - ls);
+                    let ll = le - ls;
+                    if ll > 0.0 {
+                        if p >= le {
+                            p = ls + (p - le).rem_euclid(ll);
+                        } else if p < ls {
+                            p = le - (ls - p).rem_euclid(ll);
+                        }
                     }
                 }
 
@@ -419,21 +505,40 @@ impl Engine {
                     } else {
                         v.const_gain
                     };
-                    let o = (f - block_start) as usize;
+                    let o = i as usize;
                     out_l[o] += sl * gl as f32;
                     out_r[o] += sr_ * gr as f32;
                 }
-                a.raw_pos += step;
+
+                a.raw_pos += step * dir_f;
             }
-            v.end > block_end
+
+            // Retain if we haven't yet crossed the voice's far boundary
+            // in the current traversal direction.
+            if speed > 0 {
+                v.end > block_end
+            } else {
+                block_end > v.start
+            }
         });
 
-        // ── VST voices ─────────────────────────────────────────────────
+        // ── VST voices ───────────────────────────────────────────────
+        //
+        // Forward: run the plugins and record their output into a
+        // rolling history ring.  Reverse: read the ring backward, so
+        // plugin audio plays in reverse too.  Notes still get a
+        // note-off when we enter reverse so a plugin isn't left
+        // sustaining on stale input.
         if !self.hosts.is_empty() {
-            self.render_vsts(out_l, out_r, block_start);
+            if speed > 0 {
+                self.render_vsts(out_l, out_r, block_start);
+                self.vst_hist_head = self.vst_hist_head.max(block_end - 1);
+            } else {
+                self.render_vsts_reverse(out_l, out_r, block_start, speed);
+            }
         }
 
-        // ── master bus effects ─────────────────────────────────────────
+        // ── Master bus effects ───────────────────────────────────────
         if let Some(chain) = self.master_fx.as_mut() {
             if !chain.is_empty() {
                 let mut i = 0;
@@ -445,7 +550,9 @@ impl Engine {
             }
         }
 
-        self.pos = block_end;
+        // Clamp into the song's time range.  Going backward stops at 0;
+        // forward stops at `total` and the caller sees `finished()`.
+        self.pos = block_end.clamp(0, self.total);
     }
 
     /// Drive every installed VST host for this block.  Chunked because the
@@ -456,31 +563,45 @@ impl Engine {
         let mut chunk_start = block_start;
         let block_end = block_start + block_len;
 
+        // Destructure `self` so the borrow checker can see that
+        // `hosts`, `host_scratch`, `vst_scratch_*`, `vst_hist_*`,
+        // `vst_pending` and `vst_active` are disjoint.
+        let Self {
+            hosts,
+            host_scratch,
+            vst_pending,
+            vst_active,
+            vst_scratch_l,
+            vst_scratch_r,
+            vst_hist_l,
+            vst_hist_r,
+            ..
+        } = self;
+
         while chunk_start < block_end {
             let chunk_len =
             ((block_end - chunk_start) as usize).min(VST_BLOCK as usize);
             let chunk_end = chunk_start + chunk_len as i64;
 
             // Note-ons whose start falls in this chunk.
-            while self
-                .vst_pending
+            while vst_pending
                 .front()
                 .map_or(false, |n| n.start < chunk_end)
                 {
-                    let n = self.vst_pending.pop_front().unwrap();
-                    if let Some(host) = self.hosts.get_mut(&n.iid) {
+                    let n = vst_pending.pop_front().unwrap();
+                    if let Some(host) = hosts.get_mut(&n.iid) {
                         let offset = (n.start - chunk_start).max(0) as i32;
                         host.note_on_at(n.note, n.velocity, offset);
                     }
-                    self.vst_active.push(n);
+                    vst_active.push(n);
                 }
 
                 // Note-offs for anything ending in this chunk.
                 let mut i = 0;
-                while i < self.vst_active.len() {
-                    if self.vst_active[i].end <= chunk_end {
-                        let n = self.vst_active.remove(i);
-                        if let Some(host) = self.hosts.get_mut(&n.iid) {
+                while i < vst_active.len() {
+                    if vst_active[i].end <= chunk_end {
+                        let n = vst_active.remove(i);
+                        if let Some(host) = hosts.get_mut(&n.iid) {
                             let offset = (n.end - chunk_start).max(0) as i32;
                             host.note_off_at(n.note, offset);
                         }
@@ -489,33 +610,87 @@ impl Engine {
                     }
                 }
 
-                // Zero scratch for this chunk.
-                for s in self.vst_scratch_l[..chunk_len].iter_mut() {
+                // Zero the summed scratch for this chunk.
+                for s in vst_scratch_l[..chunk_len].iter_mut() {
                     *s = 0.0;
                 }
-                for s in self.vst_scratch_r[..chunk_len].iter_mut() {
+                for s in vst_scratch_r[..chunk_len].iter_mut() {
                     *s = 0.0;
                 }
 
-                // Sum every host into scratch.
-                let hosts = &mut self.hosts;
-                let scratch_l = &mut self.vst_scratch_l;
-                let scratch_r = &mut self.vst_scratch_r;
-                for host in hosts.values_mut() {
-                    host.process(
-                        &mut scratch_l[..chunk_len],
-                        &mut scratch_r[..chunk_len],
-                    );
+                // Process each host into its own scratch, record its
+                // output for reverse playback, push the mono mix to the
+                // TUI scope, then sum into the shared scratch.
+                for (iid, host) in hosts.iter_mut() {
+                    let Some((tl, tr)) = host_scratch.get_mut(iid) else { continue };
+                    for s in tl[..chunk_len].iter_mut() { *s = 0.0; }
+                    for s in tr[..chunk_len].iter_mut() { *s = 0.0; }
+                    host.process(&mut tl[..chunk_len], &mut tr[..chunk_len]);
+
+                    let slot = *iid as usize;
+                    for j in 0..chunk_len {
+                        let mono = (tl[j] + tr[j]) * 0.5;
+                        crate::tui::scope_push(slot, mono);
+                    }
+                    for j in 0..chunk_len {
+                        vst_scratch_l[j] += tl[j];
+                        vst_scratch_r[j] += tr[j];
+                    }
+                }
+
+                // Record the fully-summed VST mix for reverse playback.
+                // Done after all hosts have been summed so the ring holds
+                // the mix, not whichever host happened to go last.
+                if !vst_hist_l.is_empty() {
+                    for j in 0..chunk_len {
+                        let pos = chunk_start + j as i64;
+                        let idx = pos.rem_euclid(vst_hist_l.len() as i64) as usize;
+                        vst_hist_l[idx] = vst_scratch_l[j];
+                        vst_hist_r[idx] = vst_scratch_r[j];
+                    }
                 }
 
                 // Sum scratch into the output at the right offset.
                 let out_off = (chunk_start - block_start) as usize;
                 for j in 0..chunk_len {
-                    out_l[out_off + j] += self.vst_scratch_l[j];
-                    out_r[out_off + j] += self.vst_scratch_r[j];
+                    out_l[out_off + j] += vst_scratch_l[j];
+                    out_r[out_off + j] += vst_scratch_r[j];
                 }
 
                 chunk_start = chunk_end;
+        }
+    }
+
+    /// Play the recorded VST history backward.  Used when the transport
+    /// speed is negative.  Each output sample corresponds to song
+    /// position `block_start + i * speed`; if that position has been
+    /// recorded, its stereo value is summed into the output, otherwise
+    /// the sample is silent.
+    fn render_vsts_reverse(
+        &mut self,
+        out_l: &mut [f32],
+        out_r: &mut [f32],
+        block_start: i64,
+        speed: i64,
+    ) {
+        let head = self.vst_hist_head;
+        if head == i64::MIN {
+            return;
+        }
+        let len = self.vst_hist_l.len() as i64;
+        if len == 0 {
+            return;
+        }
+        let frames = out_l.len() as i64;
+        for i in 0..frames {
+            let pos = block_start + i * speed;
+            // Valid history range: [head - len + 1, head].
+            if pos > head || pos <= head - len {
+                continue;
+            }
+            let idx = pos.rem_euclid(len) as usize;
+            out_l[i as usize] += self.vst_hist_l[idx];
+            out_r[i as usize] += self.vst_hist_r[idx];
         }
     }
 }
