@@ -53,9 +53,13 @@ const LOOKBACK_LINES: usize = 128;
 /// Cap source samples read per pixel row.  Long samples otherwise stall
 /// the renderer at 20 FPS.
 const MAX_SLICE: usize = 512;
-/// Column width in terminal cells.  30 gives 60 braille pixels, wide
-/// enough to see low-frequency detail without crowding the note text.
-const COL_W: usize = 30;
+/// Minimum and maximum width of a tracker column, in terminal cells.
+/// Width is computed per frame: whatever fits, distributed evenly across
+/// the parts currently playing, clamped to this range.  At MIN_COL_W the
+/// column still shows position, pitch name, and the start of the
+/// duration field; at MAX_COL_W the full note token is visible.
+const MIN_COL_W: usize = 10;
+const MAX_COL_W: usize = 40;
 /// Recent samples retained per part for the live scope.  At 48 kHz this
 /// is ~85 ms — comfortably more than one frame.
 const SCOPE_LEN: usize = 4096;
@@ -74,7 +78,10 @@ const SPEED_STEPS: &[i64] = &[1, 4, 16];
 /// hold.  Most terminals don't send `KeyEventKind::Repeat` (that's a
 /// Kitty keyboard protocol feature), so we detect holds by timing.
 const HOLD_WINDOW_MS: u128 = 250;
-
+/// Foreground for unplayed notes (waiting or future).  White reads on
+/// most backgrounds; switch to `Color::Black` if your cover image is
+/// mostly light and white gets lost in it.
+const UNPLAYED_FG: Color = Color::White;
 // ── cover art ──────────────────────────────────────────────────────────
 
 /// A cover image resampled to one dimmed RGB color per terminal cell.
@@ -240,8 +247,6 @@ fn event_loop(
     sample_rate: u32,
     state: &mut RenderState,
 ) -> Result<()> {
-    let sr = sample_rate as f64;
-    let _seek_step = (SEEK_STEP_SECS * sr) as i64;
     let tick = Duration::from_millis(TICK_MS);
 
     loop {
@@ -289,9 +294,6 @@ fn event_loop(
                     let want_sign: i64 = if k.code == KeyCode::Left { -1 } else { 1 };
 
                     if is_hold {
-                        // Same direction as we're already going?  Bump
-                        // the magnitude.  Opposite direction?  Restart
-                        // at 1x in the new direction.
                         let mag = if cur.signum() == want_sign {
                             cur.unsigned_abs() as i64
                         } else {
@@ -304,8 +306,6 @@ fn event_loop(
                             .unwrap_or(*SPEED_STEPS.last().unwrap());
                         tp.speed.store(want_sign * next, Ordering::Release);
                     } else {
-                        // Fresh tap: toggle if we're already going this
-                        // direction, otherwise start at 1x that way.
                         let already = cur.signum() == want_sign;
                         tp.speed.store(
                             if already { 0 } else { want_sign },
@@ -462,12 +462,17 @@ enum NoteState {
 }
 
 impl NoteState {
+    /// Brightness multiplier for the note's hue.  Unplayed and
+    /// currently-playing notes are full brightness; only notes carried
+    /// over from earlier lines are dimmed, so the pattern on the
+    /// current line reads as a whole while you can still see what's
+    /// already sounded.
     fn value(self) -> f64 {
         match self {
             NoteState::Playing => 1.0,
-            NoteState::Waiting => 0.55,
-            NoteState::Future => 0.22,
-            NoteState::Carried => 0.7,
+            NoteState::Waiting => 1.0,
+            NoteState::Future => 1.0,
+            NoteState::Carried => 0.4,
         }
     }
 }
@@ -478,15 +483,25 @@ fn note_style(pitch_hz: f64, vol: f64, state: NoteState) -> Style {
     let sat = (vol / 100.0).clamp(0.0, 1.0);
     match state {
         NoteState::Playing => {
+            // Currently sounding: inverted, still colored by pitch.
             let (r, g, b) = hsv_to_rgb(hue, sat, 1.0);
             Style::default()
             .fg(Color::Black)
             .bg(Color::Rgb(r, g, b))
             .add_modifier(Modifier::BOLD)
         }
-        _ => {
-            let (r, g, b) = hsv_to_rgb(hue, sat, state.value());
+        NoteState::Carried => {
+            // Still ringing from an earlier line.  Dimmed hue so you
+            // can tell it apart from this line's notes.
+            let (r, g, b) = hsv_to_rgb(hue, sat, 0.4);
             Style::default().fg(Color::Rgb(r, g, b))
+        }
+        NoteState::Waiting | NoteState::Future => {
+            // The pattern itself.  Full brightness, bold, single color,
+            // so the whole line reads at a glance.
+            Style::default()
+            .fg(UNPLAYED_FG)
+            .add_modifier(Modifier::BOLD)
         }
     }
 }
@@ -837,12 +852,28 @@ fn draw_tracker(
     let inner = outer.inner(area);
     let inner_w = inner.width as usize;
     let inner_h = inner.height as usize;
-    if inner_w < COL_W + 1 || inner_h < 2 {
+    if inner_w < MIN_COL_W + 1 || inner_h < 2 {
         f.render_widget(outer, area);
         return;
     }
 
-    let visible_cols = (inner_w / (COL_W + 1)).min(path_order.len());
+    // ── Column layout ────────────────────────────────────────────────
+    //
+    // Width is dynamic.  As many columns as there are parts, up to as
+    // many as fit at MIN_COL_W each.  Whatever the terminal gives us is
+    // distributed evenly across the visible columns, then clamped to
+    // [MIN_COL_W, MAX_COL_W].  So three parts get wide columns, ten
+    // parts get narrow ones, and if there are more parts than fit at
+    // minimum width, we render the first N and let the rest fall off
+    // the right edge.  The alternative — a scrolling window — would
+    // fight the persistent column order, which the user wants stable.
+    let path_count = path_order.len();
+    let max_visible = (inner_w / (MIN_COL_W + 1)).max(1);
+    let visible_cols = path_count.min(max_visible);
+    let col_w = (inner_w / visible_cols)
+        .saturating_sub(1)
+        .clamp(MIN_COL_W, MAX_COL_W);
+
     let char_rows = inner_h.saturating_sub(1);
     let pixel_rows = char_rows * 4;
 
@@ -856,6 +887,7 @@ fn draw_tracker(
     let current_row = playhead_frac * rpmeasure;
     let rows_per_sec = rpmeasure / measure_secs.max(1e-9);
 
+    // ── Notes per column ─────────────────────────────────────────────
     let mut columns: Vec<Vec<DisplayNote>> = Vec::with_capacity(visible_cols);
     for col in 0..visible_cols {
         let path = &path_order[col];
@@ -988,12 +1020,16 @@ fn draw_tracker(
             .map(|(n, _)| n.clone())
             .unwrap_or_else(|| "(?)".to_string());
         let mut l = label;
-        if l.len() >= COL_W {
-            l.truncate(COL_W - 1);
-            l.push('…');
+        if l.len() >= col_w {
+            if col_w > 1 {
+                l.truncate(col_w - 1);
+                l.push('…');
+            } else {
+                l.truncate(col_w);
+            }
         }
         header.push(Span::styled(
-            format!("{:<width$}", l, width = COL_W),
+            format!("{:<width$}", l, width = col_w),
                 Style::default().add_modifier(Modifier::BOLD),
         ));
         header.push(Span::raw(" "));
@@ -1006,18 +1042,18 @@ fn draw_tracker(
         for col in 0..visible_cols {
             let playhead_char: Option<usize> = playhead_pys[col].map(|py| py / 4);
 
-            for cx in 0..COL_W {
+            for cx in 0..col_w {
                 let mut bits: u8 = 0;
                 for ly in 0..4 {
                     let py = r * 4 + ly;
                     if py >= pixel_rows { continue; }
                     let (lo, hi) = envelopes[col].get(py).copied().unwrap_or((0.0, 0.0));
-                    let half = (COL_W * 2) as f32 / 2.0;
+                    let half = (col_w * 2) as f32 / 2.0;
                     let center = half;
                     let px_lo = (center + lo * half).round() as isize;
                     let px_hi = (center + hi * half).round() as isize;
                     let px_lo = px_lo.max(0) as usize;
-                    let px_hi = (px_hi.min((COL_W * 2 - 1) as isize)).max(px_lo as isize) as usize;
+                    let px_hi = (px_hi.min((col_w * 2 - 1) as isize)).max(px_lo as isize) as usize;
                     let cell_x0 = cx * 2;
                     let cell_x1 = cx * 2 + 1;
                     if (px_lo..=px_hi).contains(&cell_x0) { bits |= dot_bit(0, ly); }
@@ -1026,7 +1062,14 @@ fn draw_tracker(
 
                 let cell_text: Option<(String, Style)> = columns[col].get(r).map(|dn| {
                     let note_local_row = dn.value_offset + current_row;
-                    let text = fmt_note(&dn.note, note_local_row, dn.subs);
+                    // For notes that haven't started yet, clamp the
+                    // lookup row to the note's own start.  Without this,
+                    // `value_at` returns `None` before the first
+                    // waypoint and the pitch/volume/pan fields never
+                    // render — you'd only see position and duration on
+                    // unplayed notes.
+                    let lookup_row = note_local_row.max(dn.note.start_row);
+                    let text = fmt_note(&dn.note, lookup_row, dn.subs);
                     let playing = dn.display_end > 0.0
                     && dn.display_start <= current_row
                     && current_row < dn.display_end;
@@ -1039,8 +1082,8 @@ fn draw_tracker(
                     } else {
                         NoteState::Waiting
                     };
-                    let pitch = value_at(&dn.note.pitch_points, note_local_row).unwrap_or(440.0);
-                    let vol = value_at(&dn.note.vol_points, note_local_row).unwrap_or(100.0);
+                    let pitch = value_at(&dn.note.pitch_points, lookup_row).unwrap_or(440.0);
+                    let vol = value_at(&dn.note.vol_points, lookup_row).unwrap_or(100.0);
                     (text, note_style(pitch, vol, state))
                 });
 
@@ -1138,7 +1181,6 @@ fn draw_transport(f: &mut Frame<'_>, area: Rect, tp: &Transport) {
     .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
     .split(area);
 
-    // Left: reverse / stop.
     let rev_active = speed < 0;
     let rev_label = if rev_active {
         format!("■   stop    {}x", -speed)
@@ -1162,7 +1204,6 @@ fn draw_transport(f: &mut Frame<'_>, area: Rect, tp: &Transport) {
     .style(rev_style);
     f.render_widget(rev, chunks[0]);
 
-    // Right: forward / stop.
     let fwd_active = speed > 0;
     let fwd_label = if fwd_active {
         format!("■   stop    {}x", speed)

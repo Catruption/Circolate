@@ -37,7 +37,6 @@ impl Scheduled {
 
 // ── scheduled VST note ─────────────────────────────────────────────────
 
-/// A single MIDI note destined for one channel's VST host.
 #[derive(Clone, Debug)]
 pub(crate) struct VstNote {
     pub(crate) start: i64,
@@ -193,14 +192,8 @@ pub(crate) enum Msg {
     Seek  { epoch: u64, pos: i64, samples: Vec<Scheduled>, vsts: Vec<VstNote> },
 }
 
-/// Sample chunk used when driving VST hosts.  Notes are dispatched at
-/// sample offsets within the chunk; the shim supports per-event offsets,
-/// so this value controls the minimum scheduling granularity, not an
-/// audible quantization.
 const VST_BLOCK: i64 = 512;
 
-/// Seconds of VST output retained for reverse playback.  Ten seconds of
-/// 48 kHz stereo is about 3.8 MB.
 const VST_HISTORY_SECS: f64 = 10.0;
 
 pub(crate) struct Engine {
@@ -214,28 +207,27 @@ pub(crate) struct Engine {
     pending: VecDeque<Scheduled>,
     active: Vec<Active>,
 
-    // VST hosting — one instance per channel, keyed by channel iid.
-    // BTreeMap (not HashMap) so iteration is sorted by iid and therefore
-    // deterministic across calls.
     hosts: BTreeMap<u16, VstHost>,
-    /// Per-host scratch, preallocated so the audio thread never allocates.
     host_scratch: BTreeMap<u16, (Vec<f32>, Vec<f32>)>,
     vst_pending: VecDeque<VstNote>,
     vst_active: Vec<VstNote>,
+    /// Every VST note ingested since the last seek, unclamped.  Used to
+    /// rebuild `vst_pending` whenever playback leaves and rejoins normal
+    /// forward speed (reverse, fast-forward), so no notes are lost.
+    vst_log: Vec<VstNote>,
+    /// Keys each host has been told are on (bit n = MIDI key n).  The
+    /// source of truth for "what might be sounding", independent of
+    /// `vst_active`, so a panic can silence exactly those keys.
+    vst_held: BTreeMap<u16, u128>,
+    /// True while the hosts are following the timeline (speed == 1).
+    vst_synced: bool,
     vst_scratch_l: Vec<f32>,
     vst_scratch_r: Vec<f32>,
 
-    /// Rolling stereo history of the summed VST output, indexed by
-    /// absolute song sample position modulo the ring length.  Used to
-    /// play plugin audio backward, since we can't run a plugin in
-    /// reverse.
     vst_hist_l: Vec<f32>,
     vst_hist_r: Vec<f32>,
-    /// The highest song position whose VST output has been recorded.
-    /// `i64::MIN` means nothing has been recorded yet.
     vst_hist_head: i64,
 
-    // Master bus effects — one chain, run on the fully-summed stereo mix.
     master_fx: Option<EffectChain>,
 }
 
@@ -256,6 +248,9 @@ impl Engine {
             host_scratch: BTreeMap::new(),
             vst_pending: VecDeque::new(),
             vst_active: Vec::new(),
+            vst_log: Vec::new(),
+            vst_held: BTreeMap::new(),
+            vst_synced: true,
             vst_scratch_l: vec![0.0; VST_BLOCK as usize],
             vst_scratch_r: vec![0.0; VST_BLOCK as usize],
             vst_hist_l: vec![0.0; hist_len],
@@ -265,8 +260,6 @@ impl Engine {
         }
     }
 
-    /// Install a live VST host for one channel.  Called by the loader
-    /// after resolving the channel's `.instrument` sidecar.
     pub(crate) fn install_host(&mut self, iid: u16, host: VstHost) {
         self.hosts.insert(iid, host);
         self.host_scratch.insert(
@@ -282,7 +275,6 @@ impl Engine {
         self.hosts.len()
     }
 
-    /// Attach a master-bus effect chain.  Runs after all voices are summed.
     pub(crate) fn install_master_fx(&mut self, chain: EffectChain) {
         self.master_fx = Some(chain);
     }
@@ -337,11 +329,14 @@ impl Engine {
         }
     }
 
-    /// Queue VST notes.  Notes that start before `pos` are pinned to `pos`
-    /// so their `note_on` fires at seek time and the plugin plays from the
-    /// seek point.
+    /// Queue VST notes.  Notes whose start is already in the past are
+    /// pinned to `pos` and routed through `vst_pending` so the render
+    /// loop fires their note-on at offset 0.  Without this, the plugin
+    /// never learns the note started, and a later note-off can kill an
+    /// unrelated voice that happens to share the same pitch.
     pub(crate) fn ingest_vst(&mut self, mut notes: Vec<VstNote>) {
         notes.sort_by_key(VstNote::key);
+        self.vst_log.extend(notes.iter().cloned());
         let mut future = Vec::new();
         for mut n in notes {
             if n.end <= self.pos {
@@ -349,10 +344,8 @@ impl Engine {
             }
             if n.start < self.pos {
                 n.start = self.pos;
-                self.vst_active.push(n);
-            } else {
-                future.push(n);
             }
+            future.push(n);
         }
         if !future.is_empty() {
             let mut all: Vec<VstNote> = self.vst_pending.drain(..).collect();
@@ -366,10 +359,54 @@ impl Engine {
         self.pos = to.clamp(0, self.total);
         self.active.clear();
         self.pending.clear();
-        self.vst_active.clear();
+        // Release every key the hosts think is held.  The events queue
+        // and fire on the next `process()` call, ahead of any chase
+        // note-ons ingested below.
+        self.panic_hosts();
         self.vst_pending.clear();
+        self.vst_log.clear();
+        self.vst_synced = true;
+        self.vst_hist_head = i64::MIN;
         self.ready = true;
         self.ingest(voices);
+    }
+
+    /// Note-off for every key a host has been told is on, then forget
+    /// them.  Safe to call at any time; keys that are not sounding are
+    /// simply ignored by the plugin.
+    fn panic_hosts(&mut self) {
+        for (iid, mask) in self.vst_held.iter_mut() {
+            if let Some(host) = self.hosts.get_mut(iid) {
+                for k in 0..128u8 {
+                    if (*mask >> k) & 1 == 1 {
+                        host.note_off_at(k, 0);
+                    }
+                }
+            }
+            *mask = 0;
+        }
+        self.vst_active.clear();
+    }
+
+    /// Rejoin the timeline at `pos` after reverse or fast-forward:
+    /// silence everything, then rebuild the pending queue from the log.
+    /// Notes already sounding at `pos` are chased (note-on at `pos`).
+    fn resync_vsts(&mut self, pos: i64) {
+        self.panic_hosts();
+        let mut rebuilt: Vec<VstNote> = Vec::new();
+        for n in &self.vst_log {
+            if n.end <= pos {
+                continue;
+            }
+            let mut n = n.clone();
+            if n.start < pos {
+                n.start = pos;
+            }
+            rebuilt.push(n);
+        }
+        rebuilt.sort_by_key(VstNote::key);
+        self.vst_pending = rebuilt.into();
+        self.vst_synced = true;
     }
 
     pub(crate) fn handle(&mut self, m: Msg) {
@@ -412,11 +449,6 @@ impl Engine {
         let dir_f = dir as f64;
 
         // ── Voice activation ─────────────────────────────────────────
-        //
-        // Forward: pop pending voices whose start we've crossed as we
-        // move up through time.
-        // Reverse: pop pending voices whose *end* we've crossed as we
-        // move down through time.
         if speed > 0 {
             while self.pending.front().map_or(false, |v| v.start < block_end) {
                 let v = self.pending.pop_front().unwrap();
@@ -457,7 +489,6 @@ impl Engine {
             };
             let automated_gain = v.vol_lane.is_some() || v.pan_lane.is_some();
 
-            // Output-sample range where this voice is active.
             let (i_lo, i_hi) = if speed > 0 {
                 let lo = ((v.start - block_start) as f64 / speed as f64)
                     .ceil()
@@ -513,8 +544,6 @@ impl Engine {
                 a.raw_pos += step * dir_f;
             }
 
-            // Retain if we haven't yet crossed the voice's far boundary
-            // in the current traversal direction.
             if speed > 0 {
                 v.end > block_end
             } else {
@@ -523,18 +552,24 @@ impl Engine {
         });
 
         // ── VST voices ───────────────────────────────────────────────
-        //
-        // Forward: run the plugins and record their output into a
-        // rolling history ring.  Reverse: read the ring backward, so
-        // plugin audio plays in reverse too.  Notes still get a
-        // note-off when we enter reverse so a plugin isn't left
-        // sustaining on stale input.
+        // Synths follow the timeline at exactly 1x.  At any other
+        // speed they can't be scheduled sensibly, so we play back the
+        // recorded history instead of driving the plugins.  The whole
+        // block gets scaled by 1/|speed| at the end of `render`, so
+        // scrubbing stays audible but doesn't blast the speakers.
         if !self.hosts.is_empty() {
-            if speed > 0 {
+            if speed == 1 {
+                if !self.vst_synced {
+                    self.resync_vsts(block_start);
+                }
                 self.render_vsts(out_l, out_r, block_start);
                 self.vst_hist_head = self.vst_hist_head.max(block_end - 1);
             } else {
-                self.render_vsts_reverse(out_l, out_r, block_start, speed);
+                if self.vst_synced {
+                    self.panic_hosts();
+                    self.vst_synced = false;
+                }
+                self.render_vsts_history(out_l, out_r, block_start, speed);
             }
         }
 
@@ -550,27 +585,33 @@ impl Engine {
             }
         }
 
-        // Clamp into the song's time range.  Going backward stops at 0;
-        // forward stops at `total` and the caller sees `finished()`.
+        // ── Monitoring scale ─────────────────────────────────────────
+        // Fast scrubbing is inherently loud because more song content
+        // is packed into the same wall-clock window.  Scale the whole
+        // mix by 1/|speed| so 4x is 6 dB down, 16x is 12 dB down, and
+        // 1x stays at unity.  Applied after master fx so the chain
+        // always sees the true mix level, and so the reverb tail is
+        // scaled along with everything else.
+        if speed != 1 {
+            let scale = 1.0 / (speed.unsigned_abs() as f32);
+            for s in out_l.iter_mut() { *s *= scale; }
+            for s in out_r.iter_mut() { *s *= scale; }
+        }
+
         self.pos = block_end.clamp(0, self.total);
     }
 
-    /// Drive every installed VST host for this block.  Chunked because the
-    /// shim was created with a fixed max block size; notes are dispatched
-    /// with sample offsets so timing stays exact within the chunk.
     fn render_vsts(&mut self, out_l: &mut [f32], out_r: &mut [f32], block_start: i64) {
         let block_len = out_l.len() as i64;
         let mut chunk_start = block_start;
         let block_end = block_start + block_len;
 
-        // Destructure `self` so the borrow checker can see that
-        // `hosts`, `host_scratch`, `vst_scratch_*`, `vst_hist_*`,
-        // `vst_pending` and `vst_active` are disjoint.
         let Self {
             hosts,
             host_scratch,
             vst_pending,
             vst_active,
+            vst_held,
             vst_scratch_l,
             vst_scratch_r,
             vst_hist_l,
@@ -578,95 +619,120 @@ impl Engine {
             ..
         } = self;
 
+        // (offset, kind, iid, note, velocity); kind 0 = off, 1 = on.
+        let mut events: Vec<(i32, u8, u16, u8, u8)> = Vec::new();
+
         while chunk_start < block_end {
             let chunk_len =
             ((block_end - chunk_start) as usize).min(VST_BLOCK as usize);
             let chunk_end = chunk_start + chunk_len as i64;
+            events.clear();
 
-            // Note-ons whose start falls in this chunk.
+            // Note-ons due in this chunk.  If the same key is still held
+            // by an earlier note, that note is cut at the new note's
+            // start: MIDI has no note ids, so a stale note-off arriving
+            // later would otherwise kill the new voice.
             while vst_pending
                 .front()
                 .map_or(false, |n| n.start < chunk_end)
+            {
+                let n = vst_pending.pop_front().unwrap();
+                let off = (n.start - chunk_start).max(0) as i32;
+                if let Some(i) = vst_active
+                    .iter()
+                    .position(|a| a.iid == n.iid && a.note == n.note)
                 {
-                    let n = vst_pending.pop_front().unwrap();
-                    if let Some(host) = hosts.get_mut(&n.iid) {
-                        let offset = (n.start - chunk_start).max(0) as i32;
-                        host.note_on_at(n.note, n.velocity, offset);
-                    }
-                    vst_active.push(n);
+                    vst_active.remove(i);
+                    events.push((off, 0, n.iid, n.note, 0));
                 }
+                events.push((off, 1, n.iid, n.note, n.velocity));
+                vst_active.push(n);
+            }
 
-                // Note-offs for anything ending in this chunk.
-                let mut i = 0;
-                while i < vst_active.len() {
-                    if vst_active[i].end <= chunk_end {
-                        let n = vst_active.remove(i);
-                        if let Some(host) = hosts.get_mut(&n.iid) {
-                            let offset = (n.end - chunk_start).max(0) as i32;
-                            host.note_off_at(n.note, offset);
-                        }
-                    } else {
-                        i += 1;
-                    }
+            // Note-offs due in this chunk.  Strictly before `chunk_end`:
+            // an event at offset == chunk_len is outside the buffer, so a
+            // note ending exactly on the boundary is released at offset 0
+            // of the next chunk instead.  Notes that start and end inside
+            // this chunk are released here too, not a chunk late.
+            let mut i = 0;
+            while i < vst_active.len() {
+                if vst_active[i].end < chunk_end {
+                    let n = vst_active.remove(i);
+                    let off = (n.end - chunk_start).max(0) as i32;
+                    events.push((off, 0, n.iid, n.note, 0));
+                } else {
+                    i += 1;
                 }
+            }
 
-                // Zero the summed scratch for this chunk.
-                for s in vst_scratch_l[..chunk_len].iter_mut() {
-                    *s = 0.0;
+            // Fire in sample order; at equal offsets note-offs go first.
+            events.sort_by_key(|e| (e.0, e.1));
+            for &(off, kind, iid, note, vel) in &events {
+                let Some(host) = hosts.get_mut(&iid) else { continue };
+                let bit = 1u128 << (note.min(127) as u32);
+                let held = vst_held.entry(iid).or_insert(0);
+                if kind == 1 {
+                    host.note_on_at(note, vel, off);
+                    *held |= bit;
+                } else {
+                    host.note_off_at(note, off);
+                    *held &= !bit;
                 }
-                for s in vst_scratch_r[..chunk_len].iter_mut() {
-                    *s = 0.0;
-                }
+            }
 
-                // Process each host into its own scratch, record its
-                // output for reverse playback, push the mono mix to the
-                // TUI scope, then sum into the shared scratch.
-                for (iid, host) in hosts.iter_mut() {
-                    let Some((tl, tr)) = host_scratch.get_mut(iid) else { continue };
-                    for s in tl[..chunk_len].iter_mut() { *s = 0.0; }
-                    for s in tr[..chunk_len].iter_mut() { *s = 0.0; }
-                    host.process(&mut tl[..chunk_len], &mut tr[..chunk_len]);
+            for s in vst_scratch_l[..chunk_len].iter_mut() {
+                *s = 0.0;
+            }
+            for s in vst_scratch_r[..chunk_len].iter_mut() {
+                *s = 0.0;
+            }
 
-                    let slot = *iid as usize;
-                    for j in 0..chunk_len {
-                        let mono = (tl[j] + tr[j]) * 0.5;
-                        crate::tui::scope_push(slot, mono);
-                    }
-                    for j in 0..chunk_len {
-                        vst_scratch_l[j] += tl[j];
-                        vst_scratch_r[j] += tr[j];
-                    }
-                }
+            for (iid, host) in hosts.iter_mut() {
+                let Some((tl, tr)) = host_scratch.get_mut(iid) else { continue };
+                for s in tl[..chunk_len].iter_mut() { *s = 0.0; }
+                for s in tr[..chunk_len].iter_mut() { *s = 0.0; }
+                host.process(&mut tl[..chunk_len], &mut tr[..chunk_len]);
 
-                // Record the fully-summed VST mix for reverse playback.
-                // Done after all hosts have been summed so the ring holds
-                // the mix, not whichever host happened to go last.
-                if !vst_hist_l.is_empty() {
-                    for j in 0..chunk_len {
-                        let pos = chunk_start + j as i64;
-                        let idx = pos.rem_euclid(vst_hist_l.len() as i64) as usize;
-                        vst_hist_l[idx] = vst_scratch_l[j];
-                        vst_hist_r[idx] = vst_scratch_r[j];
-                    }
-                }
-
-                // Sum scratch into the output at the right offset.
-                let out_off = (chunk_start - block_start) as usize;
+                let slot = *iid as usize;
                 for j in 0..chunk_len {
-                    out_l[out_off + j] += vst_scratch_l[j];
-                    out_r[out_off + j] += vst_scratch_r[j];
+                    let mono = (tl[j] + tr[j]) * 0.5;
+                    crate::tui::scope_push(slot, mono);
                 }
+                for j in 0..chunk_len {
+                    vst_scratch_l[j] += tl[j];
+                    vst_scratch_r[j] += tr[j];
+                }
+            }
 
-                chunk_start = chunk_end;
+            if !vst_hist_l.is_empty() {
+                for j in 0..chunk_len {
+                    let pos = chunk_start + j as i64;
+                    let idx = pos.rem_euclid(vst_hist_l.len() as i64) as usize;
+                    vst_hist_l[idx] = vst_scratch_l[j];
+                    vst_hist_r[idx] = vst_scratch_r[j];
+                }
+            }
+
+            let out_off = (chunk_start - block_start) as usize;
+            for j in 0..chunk_len {
+                out_l[out_off + j] += vst_scratch_l[j];
+                out_r[out_off + j] += vst_scratch_r[j];
+            }
+
+            chunk_start = chunk_end;
         }
     }
 
-    /// Play the recorded VST history backward.  Used when the transport
-    /// speed is negative.  Each output sample corresponds to song
-    /// position `block_start + i * speed`; if that position has been
-    /// recorded, its stereo value is summed into the output, otherwise
-    /// the sample is silent.
-    fn render_vsts_reverse(
+    /// Play back the recorded VST history at whatever rate the transport
+    /// is running.  Used for both reverse and fast-forward: we can't
+    /// drive a plugin at a speed other than 1x, but we can replay what
+    /// it produced when the song was played forward.
+    ///
+    /// Each output sample corresponds to song position
+    /// `block_start + i * speed`.  Positions that fall outside the
+    /// recorded range (beyond `vst_hist_head`, or more than one ring
+    /// length behind it) are silent.
+    fn render_vsts_history(
         &mut self,
         out_l: &mut [f32],
         out_r: &mut [f32],
@@ -684,7 +750,6 @@ impl Engine {
         let frames = out_l.len() as i64;
         for i in 0..frames {
             let pos = block_start + i * speed;
-            // Valid history range: [head - len + 1, head].
             if pos > head || pos <= head - len {
                 continue;
             }
