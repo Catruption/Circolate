@@ -209,6 +209,8 @@ pub(crate) struct Engine {
 
     hosts: BTreeMap<u16, VstHost>,
     host_scratch: BTreeMap<u16, (Vec<f32>, Vec<f32>)>,
+    /// Post-plugin output gain per host iid.  Missing = 1.0.
+    vst_gains: BTreeMap<u16, f32>,
     vst_pending: VecDeque<VstNote>,
     vst_active: Vec<VstNote>,
     /// Every VST note ingested since the last seek, unclamped.  Used to
@@ -246,6 +248,7 @@ impl Engine {
             active: Vec::new(),
             hosts: BTreeMap::new(),
             host_scratch: BTreeMap::new(),
+            vst_gains: BTreeMap::new(),
             vst_pending: VecDeque::new(),
             vst_active: Vec::new(),
             vst_log: Vec::new(),
@@ -261,6 +264,14 @@ impl Engine {
     }
 
     pub(crate) fn install_host(&mut self, iid: u16, host: VstHost) {
+        self.install_host_with_gain(iid, host, 1.0);
+    }
+
+    /// Install a VST host with a post-plugin output gain.  Used for
+    /// fallbacks whose default patch is louder than the plugin they
+    /// stand in for.  The gain is applied to the plugin's audio output,
+    /// so it works even on patches that ignore MIDI velocity.
+    pub(crate) fn install_host_with_gain(&mut self, iid: u16, host: VstHost, gain: f32) {
         self.hosts.insert(iid, host);
         self.host_scratch.insert(
             iid,
@@ -269,6 +280,7 @@ impl Engine {
                 vec![0.0f32; VST_BLOCK as usize],
             ),
         );
+        self.vst_gains.insert(iid, gain);
     }
 
     pub(crate) fn host_count(&self) -> usize {
@@ -609,6 +621,7 @@ impl Engine {
         let Self {
             hosts,
             host_scratch,
+            vst_gains,
             vst_pending,
             vst_active,
             vst_held,
@@ -693,14 +706,16 @@ impl Engine {
                 for s in tr[..chunk_len].iter_mut() { *s = 0.0; }
                 host.process(&mut tl[..chunk_len], &mut tr[..chunk_len]);
 
+                let gain = vst_gains.get(iid).copied().unwrap_or(1.0);
+
                 let slot = *iid as usize;
                 for j in 0..chunk_len {
-                    let mono = (tl[j] + tr[j]) * 0.5;
+                    let mono = (tl[j] + tr[j]) * 0.5 * gain;
                     crate::tui::scope_push(slot, mono);
                 }
                 for j in 0..chunk_len {
-                    vst_scratch_l[j] += tl[j];
-                    vst_scratch_r[j] += tr[j];
+                    vst_scratch_l[j] += tl[j] * gain;
+                    vst_scratch_r[j] += tr[j] * gain;
                 }
             }
 

@@ -4,6 +4,7 @@
 //! subcommand modules.
 #![allow(dead_code)]
 
+mod fidelity;
 mod display;
 mod convert;
 mod dump;

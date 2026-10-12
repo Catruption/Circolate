@@ -44,7 +44,7 @@ pub(crate) fn render_offline(
                          .unwrap_or("?"),
                          tag
                 );
-                engine.install_host(vinst.iid, host);
+                engine.install_host_with_gain(vinst.iid, host, vinst.gain);
             }
             Err(e) => {
                 eprintln!("  failed to load VST {} ({:#})", name, e);

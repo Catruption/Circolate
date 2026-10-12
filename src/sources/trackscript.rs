@@ -326,7 +326,10 @@ fn call_rx() -> &'static Regex {
     static RX: OnceLock<Regex> = OnceLock::new();
     RX.get_or_init(|| {
         let src = regex::escape(FIELD_SOURCE);
-        Regex::new(&format!(r"{src}([A-Za-z_][A-Za-z0-9_]*)")).unwrap()
+        // Identifiers may contain dashes: UUID-derived sample names like
+        // `ae2f3f60-10c3-49ec-9131-0edba348a8b8` are emitted by the FLP
+        // converter and would otherwise be truncated at the first dash.
+        Regex::new(&format!(r"{src}([A-Za-z_][A-Za-z0-9_-]*)")).unwrap()
     })
 }
 
@@ -692,7 +695,7 @@ fn parse_block_array(body: &str) -> (BlockMap, PartMap) {
         }
         let name_start = pos + FIELD_SOURCE.len();
         let name_end = body[name_start..]
-        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
         .map(|i| name_start + i)
         .unwrap_or(body.len());
         let name = body[name_start..name_end].to_string();
@@ -930,6 +933,18 @@ pub fn parse_str(text: &str) -> Result<TrackscriptFile> {
         .then(a.pitch.cmp(&b.pitch))
         .then(a.voice.cmp(&b.voice))
     });
+
+    if std::env::var_os("TS_DEBUG").is_some() {
+        eprintln!("ts: {} parts parsed", parts.len());
+        for (name, part) in parts.iter() {
+            if name.contains("ae2f") || name.contains("0fb9") || name.contains("RK_IT5") {
+                eprintln!(
+                    "ts:   {:?} events={} sample_path={:?}",
+                    name, part.events.len(), part.sample_path
+                );
+            }
+        }
+    }
 
     Ok(TrackscriptFile {
         config,

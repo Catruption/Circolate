@@ -9,12 +9,23 @@
 //! reference a channel directly) are placed as synthetic C5 notes covering
 //! the clip, carrying the clip's source offset so playback starts at the
 //! right point in the file.  Disabled (muted) channels are skipped.
+//!
+//! `clip_start_ticks` is an inferred field, not a confirmed one — see the
+//! header comment in `sources/flp.rs`.  When a trim would drop most of a
+//! substantial pattern's notes, the trim is treated as a misread and the
+//! pattern plays from its start instead.
 
 use std::collections::{HashMap, HashSet};
 
 use crate::sources::flp::{Note, Project};
 
 use super::{debug_on, hex, FL_C5_KEY, MAX_NOTE_TICKS};
+
+/// If a trim keeps less than this fraction of a pattern's notes — and the
+/// pattern has more than `ANOMALY_MIN_NOTES` notes — the trim is ignored.
+const TRIM_KEEP_NUMERATOR: usize = 1;
+const TRIM_KEEP_DENOMINATOR: usize = 10;
+const ANOMALY_MIN_NOTES: usize = 20;
 
 #[derive(Clone)]
 pub(super) struct Placed {
@@ -27,6 +38,65 @@ pub(super) struct Placed {
     /// ends, in milliseconds.  `None` for pattern notes; negative means
     /// the clip is untrimmed (the window runs to the end of the file).
     pub(super) clip_end_ms: Option<f32>,
+}
+
+#[derive(Default, Debug)]
+struct DropCounts {
+    disabled_channel: usize,
+    position_over_max: usize,
+    before_window: usize,
+    at_or_after_window: usize,
+    kept: usize,
+}
+
+fn diagnose_anomalous_clip(
+    pat_iid: u16,
+    pat_notes: usize,
+    win_start: u32,
+    win_end: Option<u32>,
+    counts: &DropCounts,
+    notes: &[Note],
+) {
+    const MEASURE_TICKS: u32 = 384;
+    const HIST_MEASURES: usize = 32;
+
+    let mut hist = [0usize; HIST_MEASURES];
+    let mut beyond_hist = 0usize;
+    let mut min_pos = u32::MAX;
+    let mut max_pos = 0u32;
+    for n in notes {
+        if n.position > MAX_NOTE_TICKS {
+            continue;
+        }
+        min_pos = min_pos.min(n.position);
+        max_pos = max_pos.max(n.position);
+        let m = (n.position / MEASURE_TICKS) as usize;
+        if m < HIST_MEASURES {
+            hist[m] += 1;
+        } else {
+            beyond_hist += 1;
+        }
+    }
+    if min_pos == u32::MAX {
+        min_pos = 0;
+    }
+
+    eprintln!(
+        "flp: ANOMALY pat {:>3}: {} notes total, kept {}, window {}..{:?}, note positions {}..{} (ticks)",
+        pat_iid, pat_notes, counts.kept, win_start, win_end, min_pos, max_pos
+    );
+    eprintln!(
+        "flp:   drops: disabled={} over_max={} before_win={} at_or_after_win={}",
+        counts.disabled_channel,
+        counts.position_over_max,
+        counts.before_window,
+        counts.at_or_after_window
+    );
+    eprintln!(
+        "flp:   position histogram (notes per 4/4 measure, first {} measures): {:?}{}",
+        HIST_MEASURES, hist,
+        if beyond_hist > 0 { format!(", +{} beyond", beyond_hist) } else { String::new() }
+    );
 }
 
 pub(super) fn place_notes(prj: &Project) -> (HashMap<u16, Vec<Placed>>, bool, usize) {
@@ -100,21 +170,44 @@ pub(super) fn place_notes(prj: &Project) -> (HashMap<u16, Vec<Placed>>, bool, us
         };
         used_playlist = true;
 
-        // The clip shows pattern ticks [win_start, win_end).  A length of 0
-        // is treated as "no end".
-        // FLP_NO_WINDOW=1 restores the old behaviour (play from pattern tick
-        // 0, cut at the clip length) so the two can be compared.
         let legacy = std::env::var_os("FLP_NO_WINDOW").is_some();
-        let win_start = if legacy { 0 } else { item.clip_start_ticks };
-        let win_end = if item.length > 0 {
+        let mut win_start = if legacy { 0 } else { item.clip_start_ticks };
+        let mut win_end = if item.length > 0 {
             Some(win_start.saturating_add(item.length))
         } else {
             None
         };
-        let mut kept = 0usize;
+
+        // Sanity check the trim.  `clip_start_ticks` is inferred; on a
+        // long pattern a bad read turns a 4-measure clip into a near-
+        // silent slice.  If the trim would keep less than half of a
+        // substantial pattern's notes, discard the trim and play from
+        // the pattern's start.
+        let mut trim_was_overridden = false;
+        if !legacy && item.length > 0 && pat.notes.len() > ANOMALY_MIN_NOTES {
+            let win_end_v = win_end.unwrap();
+            let kept_by_trim = pat
+            .notes
+            .iter()
+            .filter(|n| {
+                !disabled.contains(&n.channel)
+                    && n.position >= win_start
+                    && n.position < win_end_v
+            })
+            .count();
+            let threshold = pat.notes.len() * TRIM_KEEP_NUMERATOR / TRIM_KEEP_DENOMINATOR;
+            if kept_by_trim <= threshold {
+                win_start = 0;
+                win_end = Some(item.length);
+                trim_was_overridden = true;
+            }
+        }
+
+        let mut counts = DropCounts::default();
 
         for n in &pat.notes {
             if disabled.contains(&n.channel) {
+                counts.disabled_channel += 1;
                 continue;
             }
             if n.position > MAX_NOTE_TICKS {
@@ -124,25 +217,27 @@ pub(super) fn place_notes(prj: &Project) -> (HashMap<u16, Vec<Placed>>, bool, us
                         pat.iid, n.channel, n.position, n.length, n.key, n.flags
                     );
                 }
+                counts.position_over_max += 1;
                 dropped += 1;
                 continue;
             }
             if n.position < win_start {
+                counts.before_window += 1;
                 continue;
             }
             if let Some(end) = win_end {
                 if n.position >= end {
+                    counts.at_or_after_window += 1;
                     continue;
                 }
             }
 
             let mut note = n.clone();
-            // A note can't ring past the end of its clip.
             if let Some(end) = win_end {
                 note.length = note.length.min(end - n.position);
             }
 
-            kept += 1;
+            counts.kept += 1;
             placed.entry(n.channel).or_default().push(Placed {
                 abs: item.position.saturating_add(n.position - win_start),
                                                       note,
@@ -150,17 +245,30 @@ pub(super) fn place_notes(prj: &Project) -> (HashMap<u16, Vec<Placed>>, bool, us
                 clip_end_ms: None,
             });
         }
+
         if debug_on() {
+            let tag = if trim_was_overridden { " (trim overridden)" } else { "" };
             eprintln!(
-                "flp: clip pat {:>3} at {:>7} len {:>6} window {}..{:?}: kept {}/{} notes",
+                "flp: clip pat {:>3} at {:>7} len {:>6} window {}..{:?}: kept {}/{} notes{}",
                 pat.iid,
                 item.position,
                 item.length,
                 win_start,
                 win_end,
-                kept,
-                pat.notes.len()
+                counts.kept,
+                pat.notes.len(),
+                tag,
             );
+            if pat.notes.len() > ANOMALY_MIN_NOTES && counts.kept * 2 < pat.notes.len() {
+                diagnose_anomalous_clip(
+                    pat.iid,
+                    pat.notes.len(),
+                    win_start,
+                    win_end,
+                    &counts,
+                    &pat.notes,
+                );
+            }
         }
     }
 
@@ -231,7 +339,6 @@ pub(super) fn place_notes(prj: &Project) -> (HashMap<u16, Vec<Placed>>, bool, us
                 flags: 0,
                 group: 0,
             },
-            // The file stores -1.0 for "no trim"; clamp it to 0.
             clip_offset_ms: Some(item.start_offset_ms.max(0.0)),
             clip_end_ms: Some(item.end_offset_ms),
         });

@@ -43,16 +43,47 @@ case "$verb" in
         ;;
 esac
 
-# Leading flags (e.g. --raw, --no-states) are passed through to the binary.
+# Collect flags and the file path.  Flags may appear before or after the
+# file.  Value-taking flags consume two arguments, so the flag's value
+# never gets mistaken for the file:
+#
+#   run.sh play --render out.wav song.flp
+#   run.sh play song.flp --render out.wav
+#   run.sh play song.flp --start 12 --no-cache
+#
+# Both work, and any of the value-taking flags can appear in any order.
 flags=""
+file=""
 while [ $# -gt 0 ]; do
     case "$1" in
-        -*) flags="$flags $1"; shift ;;
-        *) break ;;
+        --render|--rate|--start|--samples-dir)
+            # Value-taking flag: consume the flag and its value.
+            flags="$flags $1"
+            shift
+            if [ $# -eq 0 ]; then
+                echo "flag $1 needs a value" >&2
+                exit 1
+            fi
+            flags="$flags $1"
+            shift
+            ;;
+        -*)
+            # Boolean flag: consume just the flag.
+            flags="$flags $1"
+            shift
+            ;;
+        *)
+            if [ -z "$file" ]; then
+                file="$1"
+            else
+                echo "unexpected positional argument: $1" >&2
+                exit 1
+            fi
+            shift
+            ;;
     esac
 done
 
-file="${1:-}"
 filter="*.trackscript *.flp *.it|Trackscript sources"
 
 if [ -z "$file" ]; then

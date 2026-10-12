@@ -9,6 +9,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::fidelity::{Fidelity, FIDELITY_FILENAME};
 use crate::sf2::Sf2File;
 use crate::sources::trackscript::{parse_file, TrackscriptEvent, TrackscriptPart, C5_HZ};
 use crate::timing::{AutomationLane, TempoMap, Waypoint};
@@ -127,6 +128,10 @@ pub(crate) struct VstInstrument {
     pub(crate) plugin_path: PathBuf,
     pub(crate) state_bytes: Vec<u8>,
     pub(crate) fallback: bool,
+    /// Post-plugin output gain.  1.0 for exact matches.  Fallbacks use
+    /// this to trim a replacement synth whose default patch is louder
+    /// than the plugin it stands in for.
+    pub(crate) gain: f32,
 }
 
 // ── SF2 instrument ─────────────────────────────────────────────────────
@@ -238,6 +243,44 @@ fn load_sf2_instrument(
     Ok(Sf2Instrument { zones })
 }
 
+// ── multi-sample instrument ────────────────────────────────────────────
+
+struct MultiSampleZone {
+    key_lo: u8,
+    key_hi: u8,
+    sample_id: u32,
+    root_key: u8,
+}
+
+pub(crate) struct MultiSampleInstrument {
+    zones: Vec<MultiSampleZone>,
+}
+
+impl MultiSampleInstrument {
+    fn resolve(&self, key: u8) -> Option<(u32, f64)> {
+        let mut best: Option<(&MultiSampleZone, i32)> = None;
+        for z in &self.zones {
+            if key >= z.key_lo && key <= z.key_hi {
+                let semitones = (key as i32 - z.root_key as i32) as f64;
+                let pitch_hz = C5_HZ * 2f64.powf(semitones / 12.0);
+                return Some((z.sample_id, pitch_hz));
+            }
+            let d = if key < z.key_lo {
+                z.key_lo as i32 - key as i32
+            } else {
+                key as i32 - z.key_hi as i32
+            };
+            if best.map_or(true, |(_, bd)| d < bd) {
+                best = Some((z, d));
+            }
+        }
+        let (z, _) = best?;
+        let semitones = (key as i32 - z.root_key as i32) as f64;
+        let pitch_hz = C5_HZ * 2f64.powf(semitones / 12.0);
+        Some((z.sample_id, pitch_hz))
+    }
+}
+
 // ── templates ──────────────────────────────────────────────────────────
 
 struct TVoice {
@@ -248,15 +291,12 @@ struct TVoice {
     pan: f64,
     sample_id: u32,
     offset: u32,
-    /// Native tempo of the sample (`|bpm`); stretched to the song tempo.
     src_bpm: Option<f64>,
     pitch_wp: Vec<Waypoint>,
     vol_wp: Vec<Waypoint>,
     pan_wp: Vec<Waypoint>,
 }
 
-/// A note destined for a VST host.  Rows are relative to the pattern
-/// start; converted to absolute samples in `prepare_line`.
 #[derive(Clone)]
 struct VstNoteProto {
     rel_row: f64,
@@ -277,6 +317,7 @@ fn build_template(
     samples: &HashMap<u32, Arc<Sample>>,
     sf2_instruments: &HashMap<String, Arc<Sf2Instrument>>,
     vst_instruments: &HashMap<String, Arc<VstInstrument>>,
+    multi_sample_instruments: &HashMap<String, Arc<MultiSampleInstrument>>,
 ) -> PartTemplate {
     let default_sid = path_to_id.get(&part.sample_path).copied();
     let subs = part.subs_per_beat as f64;
@@ -298,7 +339,31 @@ fn build_template(
 
             let dur_beats = ev.dur_beats.filter(|d| *d != 0.0).unwrap_or(1.0);
 
-            // Path 1: direct WAV sample.
+            // Path 0: multi-sample instrument.
+            if let Some(inst) = multi_sample_instruments.get(lookup_path) {
+                let key = ev.pitch_midi.unwrap_or(60).clamp(0, 127) as u8;
+                if let Some((sid, pitch_hz)) = inst.resolve(key) {
+                    if samples.contains_key(&sid) {
+                        voices.push(TVoice {
+                            rel_row: ev.row,
+                            dur_rows: dur_beats * subs,
+                            pitch_hz,
+                            vol: ev.vol.unwrap_or(100.0),
+                                    pan: ev.pan.unwrap_or(0.0),
+                                    sample_id: sid,
+                                    offset: 0,
+                                    src_bpm: None,
+                                    pitch_wp: Vec::new(),
+                                    vol_wp: Vec::new(),
+                                    pan_wp: Vec::new(),
+                        });
+                        last = Some(voices.len() - 1);
+                        continue;
+                    }
+                }
+            }
+
+            // Path 1: direct single WAV sample.
             if let Some(sid) = sid {
                 if samples.contains_key(&sid) {
                     voices.push(TVoice {
@@ -461,7 +526,6 @@ fn hash_part(
 pub(crate) struct Cache {
     enabled: bool,
     map: HashMap<u64, Arc<PartTemplate>>,
-    /// Time-stretched copies of samples, keyed by (sample id, factor bits).
     stretched: HashMap<(u32, u64), Arc<Sample>>,
     hits: u64,
     misses: u64,
@@ -486,6 +550,7 @@ impl Cache {
         samples: &HashMap<u32, Arc<Sample>>,
         sf2_instruments: &HashMap<String, Arc<Sf2Instrument>>,
         vst_instruments: &HashMap<String, Arc<VstInstrument>>,
+        multi_sample_instruments: &HashMap<String, Arc<MultiSampleInstrument>>,
     ) -> Arc<PartTemplate> {
         if self.enabled {
             if let Some(t) = self.map.get(&hash) {
@@ -500,6 +565,7 @@ impl Cache {
             samples,
             sf2_instruments,
             vst_instruments,
+            multi_sample_instruments,
         ));
         if self.enabled {
             self.map.insert(hash, Arc::clone(&t));
@@ -507,8 +573,6 @@ impl Cache {
         t
     }
 
-    /// A copy of `sample` made `factor` times as long without changing its
-    /// pitch.  Built once per (sample, factor) and reused.
     fn stretched(&mut self, sid: u32, sample: &Arc<Sample>, factor: f64) -> Arc<Sample> {
         let key = (sid, factor.to_bits());
         if let Some(s) = self.stretched.get(&key) {
@@ -553,12 +617,14 @@ struct LineInfo {
 pub(crate) struct Project {
     pub(crate) source_dir: PathBuf,
     cover_path: Option<PathBuf>,
+    pub(crate) fidelity: Option<Fidelity>,
     parts: HashMap<String, TrackscriptPart>,
     part_hash: HashMap<String, u64>,
     samples: HashMap<u32, Arc<Sample>>,
     path_to_id: HashMap<String, u32>,
     sf2_instruments: HashMap<String, Arc<Sf2Instrument>>,
     pub(crate) vst_instruments: HashMap<String, Arc<VstInstrument>>,
+    multi_sample_instruments: HashMap<String, Arc<MultiSampleInstrument>>,
     lines: Vec<LineInfo>,
     order: Vec<usize>,
     tempo: TempoMap,
@@ -579,30 +645,22 @@ impl Project {
         self.lines.len()
     }
 
-    /// The sample backing a part, if the part references one.
     pub(crate) fn sample_for_part(&self, part_name: &str) -> Option<Arc<Sample>> {
         let part = self.parts.get(part_name)?;
         let id = self.path_to_id.get(&part.sample_path)?;
         self.samples.get(id).cloned()
     }
 
-    /// The VST channel id backing a part, if the part references one.
-    /// Used by the TUI to find the part's live scope ring in the global
-    /// buffer (scope slots are indexed by VST channel iid).
     pub(crate) fn iid_for_part(&self, part_name: &str) -> Option<u16> {
         let part = self.parts.get(part_name)?;
         let inst = self.vst_instruments.get(&part.sample_path)?;
         Some(inst.iid)
     }
 
-        /// Path to `cover.jpg` next to the trackscript, if present.
     pub(crate) fn cover_path(&self) -> Option<&Path> {
         self.cover_path.as_deref()
     }
 
-    /// The sample or instrument path a part declares.  Two parts with
-    /// the same path are said to "share a declarer" and should be shown
-    /// in the same tracker column, stacked.
     pub(crate) fn part_path(&self, name: &str) -> Option<&str> {
         self.parts.get(name).map(|p| p.sample_path.as_str())
     }
@@ -701,11 +759,44 @@ pub(crate) fn load_project(
     let parsed = parse_file(ts_path)?;
     let base = ts_path.parent().unwrap_or_else(|| Path::new("."));
     let cfg = &parsed.config;
+    let debug = std::env::var_os("FLP_DEBUG").is_some();
 
     let source_dir = base.to_path_buf();
     let cover_path = {
         let p = source_dir.join("cover.jpg");
         if p.exists() { Some(p) } else { None }
+    };
+
+    // Fidelity sidecar is read first because it tells us which channels
+    // are multi-sample.
+    let fidelity: Option<Fidelity> = {
+        let p = base.join(FIDELITY_FILENAME);
+        if p.exists() {
+            match std::fs::read_to_string(&p)
+            .with_context(|| format!("reading {}", p.display()))
+            .and_then(|text| {
+                Fidelity::from_json(&text)
+                .with_context(|| format!("parsing {}", p.display()))
+            }) {
+                Ok(f) => {
+                    println!(
+                        "  fidelity: {} channels, {} automation lanes, {} playlist items, {} insert buses, {} multi-sample groups",
+                        f.channels.len(),
+                        f.channel_automation.len(),
+                        f.playlist.len(),
+                        f.inserts.len(),
+                        f.multi_sample.len(),
+                    );
+                    Some(f)
+                }
+                Err(e) => {
+                    eprintln!("  fidelity: {:#}, ignoring", e);
+                    None
+                }
+            }
+        } else {
+            None
+        }
     };
 
     let mut samples: HashMap<u32, Arc<Sample>> = HashMap::new();
@@ -742,6 +833,14 @@ pub(crate) fn load_project(
                 rate,
                 loop_pts,
             };
+            if rel.contains("ae2f3f60") {
+                let peak_l = smp.left.iter().fold(0.0f32, |a, b| a.max(b.abs()));
+                let peak_r = smp.right.iter().fold(0.0f32, |a, b| a.max(b.abs()));
+                eprintln!(
+                    "ae2f-check: id={} len_l={} len_r={} rate={} stereo={} peak_l={:.6} peak_r={:.6}",
+                    s.id, smp.left.len(), smp.right.len(), rate, stereo, peak_l, peak_r
+                );
+            }
             fps.insert(s.id, fingerprint(&smp));
             samples.insert(s.id, Arc::new(smp));
             if let Some(stripped) = rel.strip_prefix("./") {
@@ -753,6 +852,62 @@ pub(crate) fn load_project(
         eprintln!("  (no samples.json in {})", base.display());
     }
     println!("  loaded {} samples", samples.len());
+
+    // Sample id → path mapping.  Useful when chasing "why is this one
+    // sample silent": grep the debug output for the file's stem.
+    if debug {
+        let mut entries: Vec<(u32, String)> = path_to_id
+        .iter()
+        .map(|(k, v)| (*v, k.clone()))
+        .collect();
+        entries.sort();
+        entries.dedup();
+        eprintln!("flp: sample id map ({} entries):", entries.len());
+        for (id, path) in entries.iter().take(500) {
+            eprintln!("flp:   {:>6} <- {}", id, path);
+        }
+    }
+
+    // ── Multi-sample instruments ──────────────────────────────────────
+    let mut multi_sample_instruments: HashMap<String, Arc<MultiSampleInstrument>> = HashMap::new();
+    if let Some(fid) = &fidelity {
+        for (_iid_str, ms) in &fid.multi_sample {
+            if ms.files.is_empty() {
+                continue;
+            }
+            let n = ms.files.len() as u32;
+            let mut zones: Vec<MultiSampleZone> = Vec::with_capacity(ms.files.len());
+            for (zi, file) in ms.files.iter().enumerate() {
+                let Some(&sid) = path_to_id.get(file) else { continue };
+                let root = ms
+                .root_keys
+                .get(zi)
+                .copied()
+                .flatten()
+                .unwrap_or(60)
+                .clamp(0, 127) as u8;
+                let lo = ((zi as u32) * 128 / n) as u8;
+                let hi = (((zi as u32 + 1) * 128 / n).saturating_sub(1)).min(127) as u8;
+                zones.push(MultiSampleZone {
+                    key_lo: lo,
+                    key_hi: hi,
+                    sample_id: sid,
+                    root_key: root,
+                });
+            }
+            if zones.is_empty() {
+                continue;
+            }
+            let primary = ms.files[0].clone();
+            multi_sample_instruments.insert(primary, Arc::new(MultiSampleInstrument { zones }));
+        }
+    }
+    if !multi_sample_instruments.is_empty() {
+        println!(
+            "  multi-sample: {} instrument(s)",
+            multi_sample_instruments.len()
+        );
+    }
 
     // ── Load instrument sidecars ──────────────────────────────────────
     let mut sf2_instruments: HashMap<String, Arc<Sf2Instrument>> = HashMap::new();
@@ -819,6 +974,7 @@ pub(crate) fn load_project(
                         plugin_path,
                         state_bytes,
                         fallback: inst.fallback,
+                        gain: inst.gain,
                     }),
                 );
             }
@@ -833,10 +989,6 @@ pub(crate) fn load_project(
     let sr = sample_rate as f64;
     let rows_per_measure = cfg.time_signature.0 as f64 * cfg.subdivisions.max(1) as f64;
 
-    // Tempo comes from two sources during the 1.10 → 1.11 migration:
-    //   * the legacy `Tempo { ... }` section (still emitted by the IT converter)
-    //   * `@<..., ƒTempo>` shim events on BlockList lines
-    // Both expand into the same (row, bpm, ramp_rows) shape.
     let mut tempo_events = parsed.tempo_events.clone();
     let shim_tempo = tempo_shims_to_events(&parsed.shims, rows_per_measure);
     if !shim_tempo.is_empty() {
@@ -864,14 +1016,29 @@ pub(crate) fn load_project(
         let placement_row = li as f64 * rows_per_measure;
         let mut names = Vec::new();
         let (mut min_row, mut max_end_row) = (f64::INFINITY, f64::NEG_INFINITY);
-        for call in line {
+                for call in line {
+            if std::env::var_os("TS_DEBUG").is_some() && call.contains("ae2f") {
+                eprintln!(
+                    "ts: block call {:?} parts.contains_key={}",
+                    call,
+                    parsed.parts.contains_key(call)
+                );
+            }
             let part_names: Vec<String> = parsed
             .blocks
             .get(call)
             .cloned()
             .unwrap_or_else(|| vec![call.clone()]);
             for name in part_names {
-                let Some(part) = parsed.parts.get(&name) else { continue };
+                if std::env::var_os("TS_DEBUG").is_some() && name.contains("ae2f") {
+                    eprintln!("ts: resolved part name {:?}", name);
+                }
+                let Some(part) = parsed.parts.get(&name) else {
+                    if std::env::var_os("TS_DEBUG").is_some() && name.contains("ae2f") {
+                        eprintln!("ts: NO PART for {:?}", name);
+                    }
+                    continue;
+                };
                 let tpl = cache.template(
                     part_hash[&name],
                     part,
@@ -879,7 +1046,15 @@ pub(crate) fn load_project(
                     &samples,
                     &sf2_instruments,
                     &vst_instruments,
+                    &multi_sample_instruments,
                 );
+                if std::env::var_os("TS_DEBUG").is_some() && name.contains("ae2f") {
+                    eprintln!(
+                        "ts: template voices={} vst_notes={}",
+                        tpl.voices.len(),
+                        tpl.vst_notes.len()
+                    );
+                }
                 for tv in &tpl.voices {
                     let start_row = placement_row + tv.rel_row;
                     min_row = min_row.min(start_row);
@@ -895,11 +1070,6 @@ pub(crate) fn load_project(
                 names.push(name);
             }
         }
-        // Every line — including empty ones (`;` in the BlockList) — gets
-        // its own measure's time range in the timeline.  Without this,
-        // `current_line` cannot advance through an empty line, and a long
-        // note whose source line has scrolled past keeps the tracker view
-        // frozen on that earlier line for the whole note duration.
         let line_end_row = placement_row + rows_per_measure;
         let (min_start, max_end) = (
             (tempo.time_at_row(placement_row) * sr) as i64,
@@ -916,7 +1086,6 @@ pub(crate) fn load_project(
         bail!("no playable voices (check samples.json and sample paths)");
     }
 
-    // Every line participates in the timeline order, including empty ones.
     let mut order: Vec<usize> = (0..lines.len()).collect();
     order.sort_by_key(|&i| (lines[i].min_start, i));
 
@@ -941,6 +1110,7 @@ pub(crate) fn load_project(
         path_to_id,
         sf2_instruments,
         vst_instruments,
+        multi_sample_instruments,
         lines,
         order,
         tempo,
@@ -954,15 +1124,15 @@ pub(crate) fn load_project(
         initial_bpm: cfg.bpm,
         time_signature: cfg.time_signature,
         voice_count: total_voices,
-        source_dir,       // ← add these two
-        cover_path,       // ← lines
+        source_dir,
+        cover_path,
+        fidelity,
     };
     Ok((Arc::new(project), cache))
 }
 
 // ── loader ─────────────────────────────────────────────────────────────
 
-/// One batch of voices: sample voices and VST notes for the same window.
 pub(crate) struct Loaded {
     pub(crate) samples: Vec<Scheduled>,
     pub(crate) vsts: Vec<VstNote>,
@@ -1032,6 +1202,7 @@ fn prepare_line(
     let sr = project.sample_rate as f64;
     let placement_row = li as f64 * project.rows_per_measure;
     let tempo = &project.tempo;
+    let debug = std::env::var_os("FLP_DEBUG").is_some();
     let mut samples = Vec::new();
     let mut vsts = Vec::new();
     let mut seq = 0u32;
@@ -1045,6 +1216,7 @@ fn prepare_line(
             &project.samples,
             &project.sf2_instruments,
             &project.vst_instruments,
+            &project.multi_sample_instruments,
         );
 
         for tv in &tpl.voices {
@@ -1054,14 +1226,41 @@ fn prepare_line(
             let start = (tempo.time_at_row(start_row) * sr) as i64;
             let end = (tempo.time_at_row(end_row).min(project.render_end_sec) * sr) as i64;
             if end <= start || end <= min_end {
+                if debug {
+                    eprintln!(
+                        "flp: voice skipped: part={} sample_id={} start_row={} end_row={} start={} end={} min_end={} reason={}",
+                        name,
+                        tv.sample_id,
+                        start_row,
+                        end_row,
+                        start,
+                        end,
+                        min_end,
+                        if end <= start { "end<=start" } else { "end<=min_end" }
+                    );
+                }
                 continue;
             }
             let mut sample = Arc::clone(&project.samples[&tv.sample_id]);
             if sample.len() == 0 {
+                if debug {
+                    eprintln!(
+                        "flp: voice DEAD: part={} sample_id={} sample is empty",
+                        name, tv.sample_id
+                    );
+                }
                 continue;
             }
-            // `|bpm`: stretch the sample from its own tempo to the song
-            // tempo where the note starts.
+
+            if (tv.offset as f64) >= sample.len() as f64 {
+                if debug {
+                    eprintln!(
+                        "flp: voice DEAD: part={} sample_id={} offset={} >= sample_len={} (whole voice silent)",
+                        name, tv.sample_id, tv.offset, sample.len()
+                    );
+                }
+            }
+
             let mut offset = tv.offset as f64;
             if let Some(src_bpm) = tv.src_bpm {
                 let beat_secs = tempo.time_at_row(start_row + part.subs_per_beat as f64)
@@ -1100,6 +1299,23 @@ fn prepare_line(
                          pan_lane: mk(&tv.pan_wp, tv.pan),
                          const_gain: gains(tv.vol, tv.pan, project.song_volume, project.linear_pan),
             });
+                        if let Ok(target) = std::env::var("VOICE_TRACE_SAMPLE") {
+                if let Ok(tid) = target.parse::<u32>() {
+                    if tv.sample_id == tid {
+                        eprintln!(
+                            "vtrace: scheduled sample {} start={} end={} ({} samples, {:.3}s) offset={} pitch_hz={:.2} vol={}",
+                            tv.sample_id,
+                            start,
+                            end,
+                            end - start,
+                            (end - start) as f64 / sr,
+                            offset,
+                            tv.pitch_hz,
+                            tv.vol,
+                        );
+                    }
+                }
+            }
         }
 
         for vn in &tpl.vst_notes {

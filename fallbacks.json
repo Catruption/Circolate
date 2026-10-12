@@ -2,224 +2,143 @@
   "version": 1,
   "mappings": [
     {
-      "match": {
-        "vst_basename": "ZENOLOGY.vst",
-        "display_name": "ZENOLOGY"
-      },
-      "fallback": { "name": "Odin 2", "kind": "vst3" },
-      "note": "Roland ROMpler pads/leads — Odin 2 unison + analog oscillators cover most Zenology patches"
+      "match": { "vst_basename": "ZENOLOGY.vst", "display_name": "ZENOLOGY" },
+      "fallback": { "name": "Odin 2", "kind": "vst3", "gain": 0.4 },
+      "note": "Roland ROMpler pads/leads — Odin 2 unison + analog oscillators cover most Zenology patches. Odin 2's default is much hotter than Zenology's, so trim to 0.4."
     },
     {
-      "match": {
-        "vst_basename": "Arcade.vst",
-        "display_name": "Arcade"
-      },
-      "fallback": { "name": "Decent Sampler", "kind": "vst3" },
-      "note": "sample-based instrument — Decent Sampler is the right shape; previously routed to Surge XT when Floe crashed in process()"
+      "match": { "vst_basename": "Arcade.vst", "display_name": "Arcade" },
+      "fallback": { "name": "Decent Sampler", "kind": "vst3", "gain": 1.0 },
+      "note": "sample-based instrument"
     },
     {
-      "match": {
-        "vst_basename": "Splice INSTRUMENT.vst",
-        "display_name": "Splice INSTRUMENT"
-      },
-      "fallback": { "name": "Decent Sampler", "kind": "vst3" },
+      "match": { "vst_basename": "Splice INSTRUMENT.vst", "display_name": "Splice INSTRUMENT" },
+      "fallback": { "name": "Decent Sampler", "kind": "vst3", "gain": 1.0 },
       "note": "Splice sample player"
     },
     {
-      "match": {
-        "vst_basename": "Donkstring.vst",
-        "display_name": "Donkstring"
-      },
-      "fallback": { "name": "TAL-NoiseMaker", "kind": "vst3" },
-      "note": "donk bass — single-osc saw with tight envelope"
+      "match": { "vst_basename": "Donkstring.vst", "display_name": "Donkstring" },
+      "fallback": { "name": "TAL-NoiseMaker", "kind": "vst3", "gain": 1.0 },
+      "note": "donk bass"
     },
     {
-      "match": {
-        "vst_basename": "Drifter.vst",
-        "display_name": "Drifter"
-      },
-      "fallback": { "name": "Odin 2", "kind": "vst3" },
-      "note": "evolving pad — Odin 2 LFOs and unison handle the drift"
+      "match": { "vst_basename": "Drifter.vst", "display_name": "Drifter" },
+      "fallback": { "name": "Odin 2", "kind": "vst3", "gain": 0.5 },
+      "note": "evolving pad"
     },
     {
-      "match": {
-        "vst_basename": "Liquid Reese.vst",
-        "display_name": "Liquid Reese"
-      },
-      "fallback": { "name": "Odin 2", "kind": "vst3" },
-      "note": "reese bass — two detuned saws + lowpass in Odin 2"
+      "match": { "vst_basename": "Liquid Reese.vst", "display_name": "Liquid Reese" },
+      "fallback": { "name": "Odin 2", "kind": "vst3", "gain": 0.5 },
+      "note": "reese bass"
     },
     {
-      "match": {
-        "vst_basename": "Pianopad.vst",
-        "display_name": "Pianopad"
-      },
-      "fallback": { "name": "Dexed", "kind": "vst3" },
-      "note": "FM piano/pad — DX7-style patch"
+      "match": { "vst_basename": "Pianopad.vst", "display_name": "Pianopad" },
+      "fallback": { "name": "Dexed", "kind": "vst3", "gain": 1.0 },
+      "note": "FM piano/pad"
     },
     {
-      "match": {
-        "vst_basename": "Drugs_Pluck.vst",
-        "display_name": "Drugs_Pluck"
-      },
-      "fallback": { "name": "TAL-NoiseMaker", "kind": "vst3" },
-      "note": "short pluck — fast decay on the amp env"
+      "match": { "vst_basename": "Drugs_Pluck.vst", "display_name": "Drugs_Pluck" },
+      "fallback": { "name": "TAL-NoiseMaker", "kind": "vst3", "gain": 1.0 },
+      "note": "short pluck"
     },
     {
-      "match": {
-        "vst_basename": "Drugs_Bass.vst",
-        "display_name": "Drugs_Bass"
-      },
-      "fallback": { "name": "TAL-NoiseMaker", "kind": "vst3" },
+      "match": { "vst_basename": "Drugs_Bass.vst", "display_name": "Drugs_Bass" },
+      "fallback": { "name": "TAL-NoiseMaker", "kind": "vst3", "gain": 1.0 },
       "note": "mono bass"
     },
     {
-      "match": {
-        "vst_basename": "All Strings Staccato.vst",
-        "display_name": "All Strings Staccato"
-      },
-      "fallback": { "name": "Surge XT", "kind": "vst3" },
-      "note": "orchestral strings staccato — Surge XT's string oscillator with a fast attack/decay"
+      "match": { "vst_basename": "All Strings Staccato.vst", "display_name": "All Strings Staccato" },
+      "fallback": { "name": "Surge XT", "kind": "vst3", "gain": 1.0 },
+      "note": "orchestral strings staccato"
     },
     {
-      "match": {
-        "vst_basename": "Acid 5.vst",
-        "display_name": "Acid 5"
-      },
-      "fallback": { "name": "TAL-NoiseMaker", "kind": "vst3" },
-      "note": "303-style acid — saw + resonant lowpass + accent"
+      "match": { "vst_basename": "Acid 5.vst", "display_name": "Acid 5" },
+      "fallback": { "name": "TAL-NoiseMaker", "kind": "vst3", "gain": 1.0 },
+      "note": "303-style acid"
     },
     {
-      "match": {
-        "vst_basename": "Unstable Acid.vst",
-        "display_name": "Unstable Acid"
-      },
-      "fallback": { "name": "TAL-NoiseMaker", "kind": "vst3" },
-      "note": "acid with modulation — add an LFO to cutoff"
+      "match": { "vst_basename": "Unstable Acid.vst", "display_name": "Unstable Acid" },
+      "fallback": { "name": "TAL-NoiseMaker", "kind": "vst3", "gain": 1.0 },
+      "note": "acid with modulation"
     },
     {
-      "match": {
-        "vst_basename": "3x Osc.vst",
-        "display_name": "3x Osc"
-      },
-      "fallback": { "name": "TAL-NoiseMaker", "kind": "vst3" },
-      "note": "FL native 3x Osc — single osc + filter in TAL-NoiseMaker"
+      "match": { "vst_basename": "3x Osc.vst", "display_name": "3x Osc" },
+      "fallback": { "name": "TAL-NoiseMaker", "kind": "vst3", "gain": 1.0 },
+      "note": "FL native 3x Osc"
     },
     {
-      "match": {
-        "vst_basename": "SFLT.vst",
-        "display_name": "SFLT"
-      },
-      "fallback": { "name": "Odin 2", "kind": "vst3" },
-      "note": "SFLT #4 and #9 only; the SFLT channels that parsed as SoundFont are handled by the SF2 path and never reach this table. Verify the actual basename matches — if they are distinct plugins, split into one entry each."
+      "match": { "vst_basename": "SFLT.vst", "display_name": "SFLT" },
+      "fallback": { "name": "Odin 2", "kind": "vst3", "gain": 0.5 },
+      "note": "SFLT #4 and #9 only; SoundFont-parsed channels bypass this table."
     },
     {
-      "match": {
-        "vst_basename": "Face eater.vst",
-        "display_name": "Face eater"
-      },
-      "fallback": { "name": "Odin 2", "kind": "vst3" },
-      "note": "aggressive lead — heavy unison + drive"
+      "match": { "vst_basename": "Face eater.vst", "display_name": "Face eater" },
+      "fallback": { "name": "Odin 2", "kind": "vst3", "gain": 0.5 },
+      "note": "aggressive lead"
     },
     {
-      "match": {
-        "vst_basename": "ARP It Wasn't Tim ToTc.vst",
-        "display_name": "ARP It Wasn't Tim ToTc"
-      },
-      "fallback": { "name": "Odin 2", "kind": "vst3" },
-      "note": "arpeggio synth — Odin 2 has a built-in arp"
+      "match": { "vst_basename": "ARP It Wasn't Tim ToTc.vst", "display_name": "ARP It Wasn't Tim ToTc" },
+      "fallback": { "name": "Odin 2", "kind": "vst3", "gain": 0.5 },
+      "note": "arpeggio synth"
     },
     {
-      "match": {
-        "vst_basename": "partmanage chords1.vst",
-        "display_name": "partmanage chords1"
-      },
-      "fallback": { "name": "Odin 2", "kind": "vst3" },
+      "match": { "vst_basename": "partmanage chords1.vst", "display_name": "partmanage chords1" },
+      "fallback": { "name": "Odin 2", "kind": "vst3", "gain": 0.5 },
       "note": "chord pad"
     },
     {
-      "match": {
-        "vst_basename": "Keyzone Classic.vst",
-        "display_name": "Keyzone Classic"
-      },
-      "fallback": { "name": "Dexed", "kind": "vst3" },
-      "note": "electric piano — DX7 Rhodes patch"
+      "match": { "vst_basename": "Keyzone Classic.vst", "display_name": "Keyzone Classic" },
+      "fallback": { "name": "Dexed", "kind": "vst3", "gain": 1.0 },
+      "note": "electric piano"
     },
     {
-      "match": {
-        "vst_basename": "VOX TakeMe2TheTop MC.vst",
-        "display_name": "VOX TakeMe2TheTop MC"
-      },
-      "fallback": { "name": "Decent Sampler", "kind": "vst3" },
-      "note": "vocal sample — load into Decent Sampler"
+      "match": { "vst_basename": "VOX TakeMe2TheTop MC.vst", "display_name": "VOX TakeMe2TheTop MC" },
+      "fallback": { "name": "Decent Sampler", "kind": "vst3", "gain": 1.0 },
+      "note": "vocal sample"
     },
     {
-      "match": {
-        "vst_basename": "Radio Tech Dubstep.vst",
-        "display_name": "Radio Tech Dubstep"
-      },
-      "fallback": { "name": "Surge XT", "kind": "vst3" },
-      "note": "dubstep bass — Surge XT's FM + waveshaper"
+      "match": { "vst_basename": "Radio Tech Dubstep.vst", "display_name": "Radio Tech Dubstep" },
+      "fallback": { "name": "Surge XT", "kind": "vst3", "gain": 1.0 },
+      "note": "dubstep bass"
     },
     {
-      "match": {
-        "vst_basename": "BEL Leez Banla.vst",
-        "display_name": "BEL Leez Banla"
-      },
-      "fallback": { "name": "Odin 2", "kind": "vst3" },
-      "note": "unidentified — generic subtractive replacement"
+      "match": { "vst_basename": "BEL Leez Banla.vst", "display_name": "BEL Leez Banla" },
+      "fallback": { "name": "Odin 2", "kind": "vst3", "gain": 0.5 },
+      "note": "unidentified"
     },
     {
-      "match": {
-        "vst_basename": "Choir Aahs.vst",
-        "display_name": "Choir Aahs"
-      },
-      "fallback": { "name": "Surge XT", "kind": "vst3" },
-      "note": "choir pad — Surge XT's choir oscillator or a wavetable"
+      "match": { "vst_basename": "Choir Aahs.vst", "display_name": "Choir Aahs" },
+      "fallback": { "name": "Surge XT", "kind": "vst3", "gain": 1.0 },
+      "note": "choir pad"
     },
     {
-      "match": {
-        "vst_basename": "Leviathan Saws.vst",
-        "display_name": "Leviathan Saws"
-      },
-      "fallback": { "name": "Vital", "kind": "vst3" },
-      "note": "saw stack — Vital wavetables + unison. Requires running VitalInstaller first; until then the channel will resolve as Unresolved."
+      "match": { "vst_basename": "Leviathan Saws.vst", "display_name": "Leviathan Saws" },
+      "fallback": { "name": "Vital", "kind": "vst3", "gain": 1.0 },
+      "note": "saw stack"
     },
     {
-      "match": {
-        "vst_basename": "Computermusik.vst",
-        "display_name": "Computermusik"
-      },
-      "fallback": { "name": "Surge XT", "kind": "vst3" },
-      "note": "digital/glitchy — Surge XT's digital oscillators"
+      "match": { "vst_basename": "Computermusik.vst", "display_name": "Computermusik" },
+      "fallback": { "name": "Surge XT", "kind": "vst3", "gain": 1.0 },
+      "note": "digital/glitchy"
     },
     {
-      "match": {
-        "vst_basename": "Serum.vst",
-        "display_name": "Serum"
-      },
-      "fallback": { "name": "Vital", "kind": "vst3" },
-      "note": "closest free wavetable match. Requires running VitalInstaller first; until then the channel will resolve as Unresolved."
+      "match": { "vst_basename": "Serum.vst", "display_name": "Serum" },
+      "fallback": { "name": "Vital", "kind": "vst3", "gain": 1.0 },
+      "note": "closest free wavetable match"
     },
     {
-      "match": {
-        "vst_basename": "GMS.vst",
-        "display_name": "GMS"
-      },
-      "fallback": { "name": "Surge XT", "kind": "vst3" },
-      "note": "sample-based GM player — Surge XT as a placeholder; better served by Decent Sampler if you extract the samples"
+      "match": { "vst_basename": "GMS.vst", "display_name": "GMS" },
+      "fallback": { "name": "Surge XT", "kind": "vst3", "gain": 1.0 },
+      "note": "sample-based GM player"
     },
     {
-      "match": {
-        "vst_basename": "Classic Trancer.vst",
-        "display_name": "Classic Trancer"
-      },
-      "fallback": { "name": "Surge XT", "kind": "vst3" },
-      "note": "supersaw trance lead — Surge XT unison saw"
+      "match": { "vst_basename": "Classic Trancer.vst", "display_name": "Classic Trancer" },
+      "fallback": { "name": "Surge XT", "kind": "vst3", "gain": 1.0 },
+      "note": "supersaw trance lead"
     }
   ],
   "default": {
-    "fallback": { "name": "Surge XT", "kind": "vst3" },
+    "fallback": { "name": "Surge XT", "kind": "vst3", "gain": 1.0 },
     "on_missing": "warn"
   }
 }

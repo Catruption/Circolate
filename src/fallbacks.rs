@@ -47,7 +47,16 @@ pub struct FallbackTarget {
     pub path: String,
     #[serde(default)]
     pub acquire: Option<Acquire>,
+    /// Linear gain multiplier applied to notes routed through this
+    /// fallback.  A replacement synth's default patch is often much
+    /// louder (or quieter) than the plugin it stands in for; this
+    /// trims its channel volume at conversion time so the emitted `%`
+    /// values already account for the difference.  Defaults to 1.0.
+    #[serde(default = "default_gain")]
+    pub gain: f32,
 }
+
+fn default_gain() -> f32 { 1.0 }
 
 /// How to fetch a missing fallback plugin.
 ///

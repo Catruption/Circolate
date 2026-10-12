@@ -9,6 +9,7 @@
 //!         OriginalPlugin: 'ZENOLOGY';
 //!         Replaces: 'ZENOLOGY';
 //!         Fallback: true;
+//!         Gain: 0.4;
 //!         SourceChannel: 2;
 //!     }
 //!
@@ -34,6 +35,10 @@ pub struct Instrument {
     pub fallback: bool,
     pub unresolved: bool,
     pub replaces: String,
+    /// Post-plugin output gain.  Written into fallback sidecars so a
+    /// replacement synth whose default patch is louder than the plugin
+    /// it stands in for can be trimmed.  Defaults to 1.0.
+    pub gain: f32,
     /// The FLP channel this sidecar came from.  Used by the player to key
     /// VST hosts and route notes to the right instance.
     pub source_channel: u16,
@@ -57,6 +62,7 @@ pub fn load(path: &Path) -> Result<Instrument> {
     let mut fallback = false;
     let mut unresolved = false;
     let mut replaces = String::new();
+    let mut gain: f32 = 1.0;
     let mut source_channel: u16 = 0;
 
     for line in text.lines() {
@@ -84,6 +90,7 @@ pub fn load(path: &Path) -> Result<Instrument> {
             "Replaces"       => replaces = value,
             "Fallback"       => fallback = value.eq_ignore_ascii_case("true"),
             "Unresolved"     => unresolved = value.eq_ignore_ascii_case("true"),
+            "Gain"           => gain = value.parse().unwrap_or(1.0),
             "SourceChannel"  => source_channel = value.parse().unwrap_or(0),
             _ => {}
         }
@@ -118,6 +125,7 @@ pub fn load(path: &Path) -> Result<Instrument> {
        fallback,
        unresolved,
        replaces,
+       gain,
        source_channel,
     })
 }
