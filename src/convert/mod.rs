@@ -8,6 +8,8 @@
 
 mod flp;
 mod it;
+mod song;
+pub use flp::{DepKind, ProbeReport};
 
 use anyhow::Result;
 use serde::Serialize;
@@ -84,10 +86,17 @@ pub fn convert_file(src: &Path, opts: &ConvertOptions) -> Result<Converted> {
             Ok(Converted {
                 trackscript: text,
                 samples: Vec::new(),
-               samples_json: String::new(),
-               aux: Vec::new(),
+                samples_json: String::new(),
+                aux: Vec::new(),
             })
         }
+    }
+}
+
+pub fn probe_file(src: &Path, opts: &ConvertOptions) -> Result<ProbeReport> {
+    match SourceKind::from_path(src)? {
+        SourceKind::Flp => flp::probe(src, opts),
+        _ => anyhow::bail!("check only supports .flp files (got {})", src.display()),
     }
 }
 
@@ -179,9 +188,9 @@ fn pos_str(row: f64, subs: u32) -> String {
 #[derive(Serialize)]
 struct SamplesJson {
     format: &'static str,
-        version: u32,
-        samples: Vec<SampleJsonEntry>,
-        instruments: Vec<serde_json::Value>,
+    version: u32,
+    samples: Vec<SampleJsonEntry>,
+    instruments: Vec<serde_json::Value>,
 }
 
 #[derive(Serialize)]

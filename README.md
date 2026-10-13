@@ -12,3 +12,6 @@ your SDK path):
     cmake --build build --target sdk_hosting sdk_common sdk pluginterfaces base
 
 Then `cargo build --release`.
+
+## MAKE SURE TO USE A TERMINAL COMPATABLE WITH BACKGROUNDS!!! 
+## KONSOLE DOESN'T WORK, I KNOW VS CODE WORKS FOR SURE.

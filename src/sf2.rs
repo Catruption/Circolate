@@ -1,15 +1,20 @@
 //! Minimal SoundFont 2 (SF2) reader.
 //!
 //! Parses pdta sections and exposes a flat list of zones.  Each zone has a
-//! key range, a velocity range, a sample reference, and tuning.  The player
-//! picks the last matching zone (later zones override earlier ones).
+//! key range, a velocity range, a sample reference, tuning, and volume
+//! envelope parameters (SF2 generators 33..38).
+//!
+//! Preset support: `load_preset(path, bank, preset)` walks the phdr/pbag/
+//! pgen chain to find the instrument(s) that the requested preset
+//! references, and loads only those zones.  `load(path)` still loads every
+//! zone in the file, which is fine for single-instrument banks but wrong
+//! for GM banks.
 //!
 //! Limitations:
-//!   * Preset structure is ignored; all instrument zones are flattened
-//!     into one list.  Good enough for single-instrument banks; wrong for
-//!     GM banks where many presets share instrument zones.
-//!   * Modulators (pmod/imod) are ignored.
-//!   * No volume envelope, filter, or pan generators applied yet.
+//!   * Modulators (pmod/imod) are ignored; velocity → attenuation uses
+//!     the SF2 default modulator.
+//!   * Filter generators (8, 9) are parsed but not applied yet.
+//!   * Envelope key/velocity scaling (39, 40) is parsed but not applied.
 
 use anyhow::{bail, Context, Result};
 use std::path::Path;
@@ -40,6 +45,17 @@ pub struct Sf2Zone {
     pub loop_start_offset: i32,
     pub loop_end_offset: i32,
     pub loop_mode: u8,
+
+    pub initial_attenuation_cb: i16,
+    pub delay_timecents: i16,
+    pub attack_timecents: i16,
+    pub hold_timecents: i16,
+    pub decay_timecents: i16,
+    pub sustain_level_cb: i16,
+    pub release_timecents: i16,
+
+    pub initial_filter_fc: i16,
+    pub initial_filter_q: i16,
 }
 
 #[derive(Debug)]
@@ -49,14 +65,47 @@ pub struct Sf2File {
     pub pcm: Vec<i16>,
 }
 
+// ── unit conversions (SF2 §8.1.2) ──────────────────────────────────────
+
+pub fn timecents_to_secs(tc: i16) -> f32 {
+    if tc <= -12000 {
+        return 0.0;
+    }
+    (2f32).powf(tc as f32 / 1200.0)
+}
+
+pub fn attenuation_cb_to_linear(cb: i16) -> f32 {
+    if cb <= 0 {
+        return 1.0;
+    }
+    if cb >= 1440 {
+        return 0.0;
+    }
+    (10f32).powf(-(cb as f32) / 200.0)
+}
+
 impl Sf2File {
     pub fn load(path: &Path) -> Result<Self> {
         let data =
-        std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        Self::parse(&data).with_context(|| format!("parsing {}", path.display()))
+            std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        Self::parse(&data, None)
     }
 
-    fn parse(data: &[u8]) -> Result<Self> {
+    pub fn load_preset(path: &Path, bank: u16, preset: u16) -> Result<Self> {
+        let data =
+            std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        Self::parse(&data, Some((bank, preset)))
+    }
+
+    pub fn load_preset_bytes(data: &[u8], bank: u16, preset: u16) -> Result<Self> {
+    Self::parse(data, Some((bank, preset)))
+    }
+
+    pub fn load_bytes(data: &[u8]) -> Result<Self> {
+        Self::parse(data, None)
+    }
+
+    fn parse(data: &[u8], want: Option<(u16, u16)>) -> Result<Self> {
         if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"sfbk" {
             bail!("not an SF2 (missing RIFF/sfbk)");
         }
@@ -69,7 +118,10 @@ impl Sf2File {
         let ibag = find_chunk(pdta, b"ibag").ok_or_else(|| anyhow::anyhow!("no ibag"))?;
         let igen = find_chunk(pdta, b"igen").ok_or_else(|| anyhow::anyhow!("no igen"))?;
 
-        // ── smpl → PCM frames (i16 LE) ─────────────────────────────────
+        let phdr = find_chunk(pdta, b"phdr");
+        let pbag = find_chunk(pdta, b"pbag");
+        let pgen = find_chunk(pdta, b"pgen");
+
         if smpl.len() % 2 != 0 {
             bail!("smpl size is odd");
         }
@@ -78,7 +130,6 @@ impl Sf2File {
             pcm.push(i16::from_le_bytes([c[0], c[1]]));
         }
 
-        // ── shdr → samples ─────────────────────────────────────────────
         if shdr.len() < 46 * 2 || shdr.len() % 46 != 0 {
             bail!("shdr size not multiple of 46");
         }
@@ -108,9 +159,6 @@ impl Sf2File {
             });
         }
 
-        // ── inst → ibag ────────────────────────────────────────────────
-        // Each inst entry (22 bytes) has a u16 at offset 20 pointing into
-        // ibag.  Consecutive entries delimit this instrument's zone range.
         if inst.len() % 22 != 0 {
             bail!("inst size not multiple of 22");
         }
@@ -121,7 +169,6 @@ impl Sf2File {
             inst_bag_idx.push(u16::from_le_bytes([r[20], r[21]]) as usize);
         }
 
-        // ── ibag → igen ────────────────────────────────────────────────
         if ibag.len() % 4 != 0 {
             bail!("ibag size not multiple of 4");
         }
@@ -132,7 +179,6 @@ impl Sf2File {
             ibag_gen_idx.push(u16::from_le_bytes([r[0], r[1]]) as usize);
         }
 
-        // ── igen generators ────────────────────────────────────────────
         if igen.len() % 4 != 0 {
             bail!("igen size not multiple of 4");
         }
@@ -141,17 +187,92 @@ impl Sf2File {
             let r = &igen[i * 4..i * 4 + 4];
             igens.push((
                 u16::from_le_bytes([r[0], r[1]]),
-                        u16::from_le_bytes([r[2], r[3]]),
+                u16::from_le_bytes([r[2], r[3]]),
             ));
         }
 
-        // ── Walk instrument zones ──────────────────────────────────────
-        // The last inst entry is EOI.  For instrument ii:
-        //   ibag range: [inst_bag_idx[ii], inst_bag_idx[ii+1])
-        //   igen range: [ibag_gen_idx[ibag_start], ibag_gen_idx[ibag_end])
-        // Within that igen slice, zones are separated by sampleID (op 53).
+        // ── Filter to a single preset if requested ────────────────────
+        //
+        // phdr entry layout (SF2 §7.4), 38 bytes:
+        //   name[20], preset u16, bank u16, bag_idx u16,
+        //   library u32, genre u32, morphology u32
+        // The last entry is "EOP".
+        //
+        // Each preset's bag range is [bag_idx, next.bag_idx).  Each pbag
+        // entry's first u16 is the start index into pgen.  Walking pgen
+        // for a preset yields any instrument generators (op 41) it uses.
+        let mut inst_filter: Option<Vec<usize>> = None;
+        if let Some((want_bank, want_preset)) = want {
+            if let (Some(phdr), Some(pbag), Some(pgen)) = (phdr, pbag, pgen) {
+                if phdr.len() % 38 == 0 && pbag.len() % 4 == 0 && pgen.len() % 4 == 0 {
+                    let n_phdr = phdr.len() / 38;
+                    let n_pbag = pbag.len() / 4;
+                    let n_pgen = pgen.len() / 4;
+
+                    let mut phdr_entries: Vec<(u16, u16, usize)> = Vec::with_capacity(n_phdr);
+                    for i in 0..n_phdr {
+                        let r = &phdr[i * 38..i * 38 + 38];
+                        let name = cstr(&r[0..20]);
+                        if name == "EOP" {
+                            break;
+                        }
+                        let p = u16::from_le_bytes([r[20], r[21]]);
+                        let b = u16::from_le_bytes([r[22], r[23]]);
+                        let bi = u16::from_le_bytes([r[24], r[25]]) as usize;
+                        phdr_entries.push((p, b, bi));
+                    }
+
+                    let mut pbag_gen_idx: Vec<usize> = Vec::with_capacity(n_pbag);
+                    for i in 0..n_pbag {
+                        let r = &pbag[i * 4..i * 4 + 4];
+                        pbag_gen_idx.push(u16::from_le_bytes([r[0], r[1]]) as usize);
+                    }
+
+                    for pi in 0..phdr_entries.len() {
+                        let (p, b, bag_lo) = phdr_entries[pi];
+                        if p != want_preset || b != want_bank {
+                            continue;
+                        }
+                        let bag_hi = if pi + 1 < phdr_entries.len() {
+                            phdr_entries[pi + 1].2
+                        } else {
+                            pbag_gen_idx.len()
+                        };
+                        if bag_lo >= pbag_gen_idx.len() || bag_hi > pbag_gen_idx.len() {
+                            break;
+                        }
+                        let gen_start = pbag_gen_idx[bag_lo];
+                        let gen_end = if bag_hi < pbag_gen_idx.len() {
+                            pbag_gen_idx[bag_hi]
+                        } else {
+                            n_pgen
+                        };
+                        if gen_start >= gen_end || gen_end > n_pgen {
+                            break;
+                        }
+                        let mut wanted_insts: Vec<usize> = Vec::new();
+                        for gi in gen_start..gen_end {
+                            let r = &pgen[gi * 4..gi * 4 + 4];
+                            let op = u16::from_le_bytes([r[0], r[1]]);
+                            let val = u16::from_le_bytes([r[2], r[3]]);
+                            if op == 41 {
+                                wanted_insts.push(val as usize);
+                            }
+                        }
+                        inst_filter = Some(wanted_insts);
+                        break;
+                    }
+                }
+            }
+        }
+
         let mut zones: Vec<Sf2Zone> = Vec::new();
         for ii in 0..n_inst.saturating_sub(1) {
+            if let Some(ref filter) = inst_filter {
+                if !filter.contains(&ii) {
+                    continue;
+                }
+            }
             let bag_lo = inst_bag_idx[ii];
             let bag_hi = inst_bag_idx[ii + 1];
             if bag_lo >= ibag_gen_idx.len() || bag_hi > ibag_gen_idx.len() {
@@ -173,7 +294,6 @@ impl Sf2File {
             bail!("no instrument zones found");
         }
 
-        // ── Propagate zone loop_mode into the sample ───────────────────
         for z in &zones {
             if z.loop_mode != 0 {
                 if let Some(s) = samples.get_mut(z.sample_idx) {
@@ -183,12 +303,27 @@ impl Sf2File {
         }
 
         if std::env::var_os("SF2_DEBUG").is_some() {
-            eprintln!("sf2: {} samples, {} zones", samples.len(), zones.len());
+            eprintln!(
+                "sf2: {} samples, {} zones{}",
+                samples.len(),
+                zones.len(),
+                match want {
+                    Some((b, p)) => format!(" (bank {} preset {})", b, p),
+                    None => String::new(),
+                }
+            );
             for (i, z) in zones.iter().take(30).enumerate() {
                 eprintln!(
-                    "  zone {:>3}: key {:>3}..{:<3} vel {:>3}..{:<3} sample {:>4} root {:?} tune {}",
+                    "  zone {:>3}: key {:>3}..{:<3} vel {:>3}..{:<3} sample {:>4} \
+                     root {:?} tune {} atten {} a={:.3} h={:.3} d={:.3} s={:.3} r={:.3}",
                     i, z.key_lo, z.key_hi, z.vel_lo, z.vel_hi, z.sample_idx,
-                    z.root_override, z.tune_cents
+                    z.root_override, z.tune_cents,
+                    z.initial_attenuation_cb,
+                    timecents_to_secs(z.attack_timecents),
+                    timecents_to_secs(z.hold_timecents),
+                    timecents_to_secs(z.decay_timecents),
+                    attenuation_cb_to_linear(z.sustain_level_cb),
+                    timecents_to_secs(z.release_timecents),
                 );
             }
         }
@@ -199,13 +334,11 @@ impl Sf2File {
 
 fn walk_igens(
     igens: &[(u16, u16)],
-              gen_start: usize,
-              gen_end: usize,
-              samples: &[Sf2Sample],
-              out: &mut Vec<Sf2Zone>,
+    gen_start: usize,
+    gen_end: usize,
+    samples: &[Sf2Sample],
+    out: &mut Vec<Sf2Zone>,
 ) {
-    // A zone ends with a sampleID generator (op 53).  The generators
-    // before it apply to that sample.  See SF2 spec §7.3.
     let mut cur = ZoneAccum::default();
     for &(op, val) in &igens[gen_start..gen_end] {
         if op == 53 {
@@ -220,7 +353,6 @@ fn walk_igens(
     }
 }
 
-#[derive(Default)]
 struct ZoneAccum {
     key_lo: u8,
     key_hi: u8,
@@ -240,6 +372,49 @@ struct ZoneAccum {
     loop_mode: u8,
     saw_key: bool,
     saw_vel: bool,
+    initial_attenuation_cb: i16,
+    delay_timecents: i16,
+    attack_timecents: i16,
+    hold_timecents: i16,
+    decay_timecents: i16,
+    sustain_level_cb: i16,
+    release_timecents: i16,
+    initial_filter_fc: i16,
+    initial_filter_q: i16,
+}
+
+impl Default for ZoneAccum {
+    fn default() -> Self {
+        ZoneAccum {
+            key_lo: 0,
+            key_hi: 127,
+            vel_lo: 0,
+            vel_hi: 127,
+            coarse_tune: 0,
+            fine_tune: 0,
+            root_override: None,
+            start_offset: 0,
+            end_offset: 0,
+            loop_start_offset: 0,
+            loop_end_offset: 0,
+            start_coarse: 0,
+            end_coarse: 0,
+            loop_start_coarse: 0,
+            loop_end_coarse: 0,
+            loop_mode: 0,
+            saw_key: false,
+            saw_vel: false,
+            initial_attenuation_cb: 0,
+            delay_timecents: -12000,
+            attack_timecents: -12000,
+            hold_timecents: -12000,
+            decay_timecents: -12000,
+            sustain_level_cb: 0,
+            release_timecents: -12000,
+            initial_filter_fc: 13500,
+            initial_filter_q: 0,
+        }
+    }
 }
 
 impl ZoneAccum {
@@ -250,9 +425,15 @@ impl ZoneAccum {
             2 => self.loop_start_offset = val as i16 as i32,
             3 => self.loop_end_offset = val as i16 as i32,
             4 => self.start_coarse = val as i16 as i32,
+            8 => self.initial_filter_fc = val as i16,
+            9 => self.initial_filter_q = val as i16,
             12 => self.end_coarse = val as i16 as i32,
-            45 => self.loop_start_coarse = val as i16 as i32,
-            50 => self.loop_end_coarse = val as i16 as i32,
+            33 => self.delay_timecents = val as i16,
+            34 => self.attack_timecents = val as i16,
+            35 => self.hold_timecents = val as i16,
+            36 => self.decay_timecents = val as i16,
+            37 => self.sustain_level_cb = val as i16,
+            38 => self.release_timecents = val as i16,
             43 => {
                 self.key_lo = (val & 0xFF) as u8;
                 self.key_hi = (val >> 8) as u8;
@@ -263,6 +444,9 @@ impl ZoneAccum {
                 self.vel_hi = (val >> 8) as u8;
                 self.saw_vel = true;
             }
+            45 => self.loop_start_coarse = val as i16 as i32,
+            48 => self.initial_attenuation_cb = val as i16,
+            50 => self.loop_end_coarse = val as i16 as i32,
             51 => self.coarse_tune = val as i8 as i16,
             52 => self.fine_tune = val as i8 as i16,
             54 => self.loop_mode = (val & 0x03) as u8,
@@ -285,6 +469,15 @@ impl ZoneAccum {
             loop_start_offset: self.loop_start_offset + self.loop_start_coarse * 32768,
             loop_end_offset: self.loop_end_offset + self.loop_end_coarse * 32768,
             loop_mode: self.loop_mode,
+            initial_attenuation_cb: self.initial_attenuation_cb,
+            delay_timecents: self.delay_timecents,
+            attack_timecents: self.attack_timecents,
+            hold_timecents: self.hold_timecents,
+            decay_timecents: self.decay_timecents,
+            sustain_level_cb: self.sustain_level_cb,
+            release_timecents: self.release_timecents,
+            initial_filter_fc: self.initial_filter_fc,
+            initial_filter_q: self.initial_filter_q,
         }
     }
 }
@@ -304,7 +497,7 @@ fn find_list<'a>(data: &'a [u8], want: &[u8; 4]) -> Option<&'a [u8]> {
     while p + 8 <= data.len() {
         let id = &data[p..p + 4];
         let size =
-        u32::from_le_bytes([data[p + 4], data[p + 5], data[p + 6], data[p + 7]]) as usize;
+            u32::from_le_bytes([data[p + 4], data[p + 5], data[p + 6], data[p + 7]]) as usize;
         let body = p + 8;
         if body + size > data.len() {
             break;
@@ -325,7 +518,7 @@ fn find_chunk<'a>(data: &'a [u8], want: &[u8; 4]) -> Option<&'a [u8]> {
     while p + 8 <= data.len() {
         let id = &data[p..p + 4];
         let size =
-        u32::from_le_bytes([data[p + 4], data[p + 5], data[p + 6], data[p + 7]]) as usize;
+            u32::from_le_bytes([data[p + 4], data[p + 5], data[p + 6], data[p + 7]]) as usize;
         let body = p + 8;
         if body + size > data.len() {
             break;

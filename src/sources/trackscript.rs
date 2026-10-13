@@ -2,19 +2,34 @@
 //!
 //! 1.11 syntax:
 //!
-//!   ƒNAME(<|N/D, args>)[ events ];    part definition
-//!   ƒNAME(ƒA, ƒB);                    composite block
-//!   ƒNAME();  ƒNAME(<args>);          call in BlockList
-//!   @<§pos, %expr, ƒTarget>;          shim event in BlockList
+//!   ƒNAME(<|N/D, args>)[ ... ];         part definition (flat body)
+//!   ƒNAME(<|N/D, args>)                 part with named sub-blocks
+//!       ƒSubA()[ ... ]
+//!       ƒSubB()[ ... ]
+//!   ;
+//!   ƒNAME(ƒA, ƒB);                      composite block
+//!   ƒNAME();  ƒNAME(<args>);            call in BlockList
+//!   ƒNAME(1,2,3);                       call with measure selection
+//!   @<§pos, %expr, ƒTarget>;            shim event in BlockList
 //!
 //! Args use the same field list as notes.  Fields a definition accepts
 //! become its defaults for that field; a note that omits a field
 //! inherits the default.
 //!
-//! Sections (`|N/D[...]`) are layout markers within a part.  A waypoint
-//! chain crosses section boundaries; the header tells the TUI where to
-//! draw a measure line, and tells the parser where a new coordinate
-//! frame starts.
+//! A part body is one of:
+//!
+//!   * `[ measures... ]`      — a flat sequence of measures
+//!   * `ƒSub()[ ... ] ...`    — one or more named sub-blocks
+//!
+//! Each measure is one line.  A line whose last non-whitespace char is
+//! `,` continues into the next line, so long measures can wrap.  A new
+//! sub-block becomes an addressable part of its own, inheriting the
+//! parent's args (sample path, frame, defaults).  Calling `ƒName(N)`
+//! from BlockList selects measure N of the flattened measure list,
+//! counting sub-blocks in the order they appear.
+//!
+//! Old `|N/D[...]` multi-section bodies still parse, for files written
+//! before this syntax.
 
 use anyhow::{anyhow, Result};
 use regex::Regex;
@@ -71,7 +86,18 @@ pub struct TrackscriptPart {
     pub sample_offset: u32,
     /// Default native tempo of the part's sample (`|bpm` in the part args).
     pub src_bpm: Option<f64>,
+    /// Flat event stream, with each measure's events rebased to the
+    /// part's overall row timeline.  Kept for callers that want a
+    /// single contiguous stream (`parse_str`'s notes list, TUI's
+    /// `part_events`).
     pub events: Vec<TrackscriptEvent>,
+    /// The same events, grouped by measure, each with measure-local
+    /// row coordinates (0..beats*subs).  Sub-block measures appear in
+    /// the order their sub-blocks appear in the body.
+    pub measures: Vec<Vec<TrackscriptEvent>>,
+    /// Length in rows of each measure.  Uniform for new-syntax parts;
+    /// may vary for parts written in the old `|N/D[...]` syntax.
+    pub section_lengths: Vec<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_vol: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -80,8 +106,7 @@ pub struct TrackscriptPart {
     pub default_dur: Option<f64>,
 }
 
-/// A shim event on a BlockList line.  Applies to that line's measure,
-/// starting at `row` (local to the measure).
+/// A shim event on a BlockList line.
 #[derive(Debug, Clone, Serialize)]
 pub struct ShimEvent {
     pub line: usize,
@@ -93,6 +118,29 @@ pub struct ShimEvent {
     pub amount: f64,
     pub interval_rows: f64,
     pub count: Option<u32>,
+}
+
+/// One `ƒName(...)` call on a BlockList line.
+#[derive(Debug, Clone, Serialize)]
+pub struct BlockCall {
+    pub name: String,
+    pub selections: Vec<MeasureSelection>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MeasureSelection {
+    /// 0-based index into the part's measures.
+    pub measure: usize,
+    /// Overrides to apply to every note placed from this measure.
+    pub overrides: Option<CallOverrides>,
+}
+
+#[derive(Debug, Clone, Serialize, Default, PartialEq)]
+pub struct CallOverrides {
+    pub vol: Option<f64>,
+    pub pan: Option<f64>,
+    pub dur: Option<f64>,
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -125,7 +173,7 @@ pub struct Config {
 pub struct TrackscriptFile {
     pub config: Config,
     pub tempo_events: Vec<(f64, f64, f64)>,
-    pub block_list: Vec<Vec<String>>,
+    pub block_list: Vec<Vec<BlockCall>>,
     pub shims: Vec<ShimEvent>,
     pub blocks: HashMap<String, Vec<String>>,
     pub parts: HashMap<String, TrackscriptPart>,
@@ -185,10 +233,10 @@ pub fn parse_pitch_midi(text: &str) -> Option<i32> {
         return Some(n);
     }
     text.trim()
-    .parse::<f64>()
-    .ok()
-    .filter(|h| *h > 0.0)
-    .map(hz_to_note)
+        .parse::<f64>()
+        .ok()
+        .filter(|h| *h > 0.0)
+        .map(hz_to_note)
 }
 
 pub fn parse_pitch_hz(text: &str) -> Option<f64> {
@@ -326,9 +374,6 @@ fn call_rx() -> &'static Regex {
     static RX: OnceLock<Regex> = OnceLock::new();
     RX.get_or_init(|| {
         let src = regex::escape(FIELD_SOURCE);
-        // Identifiers may contain dashes: UUID-derived sample names like
-        // `ae2f3f60-10c3-49ec-9131-0edba348a8b8` are emitted by the FLP
-        // converter and would otherwise be truncated at the first dash.
         Regex::new(&format!(r"{src}([A-Za-z_][A-Za-z0-9_-]*)")).unwrap()
     })
 }
@@ -460,7 +505,6 @@ fn parse_shim_event(inner: &str, line: usize, subs: u32) -> Option<ShimEvent> {
         } else if let Some(rest) = f.strip_prefix(FIELD_SOURCE) {
             target = rest.trim().to_string();
         } else if let Some(sym) = value_field_symbol(&f) {
-            // Try the full operator form first (`%100-0.8^0/2:8`).
             if let Some((s, val, o, amt, ir, cnt)) = parse_operator(&f, subs) {
                 property = s;
                 start_value = val;
@@ -469,7 +513,6 @@ fn parse_shim_event(inner: &str, line: usize, subs: u32) -> Option<ShimEvent> {
                 interval_rows = ir;
                 count = cnt;
             } else {
-                // Plain value: `#110`, `%100`, `¶0`.
                 let rest = &f[sym.len()..];
                 property = sym.to_string();
                 start_value = parse_f(rest).unwrap_or(0.0);
@@ -483,19 +526,17 @@ fn parse_shim_event(inner: &str, line: usize, subs: u32) -> Option<ShimEvent> {
 
     Some(ShimEvent {
         line,
-         row,
-         target,
-         property,
-         start_value,
-         op,
-         amount,
-         interval_rows,
-         count,
+        row,
+        target,
+        property,
+        start_value,
+        op,
+        amount,
+        interval_rows,
+        count,
     })
 }
 
-/// Returns the leading field glyph if `f` starts with one of the
-/// value-carrying symbols (`%`, `#`, `¶`).
 fn value_field_symbol(f: &str) -> Option<&'static str> {
     for sym in [FIELD_VOLUME, FIELD_PITCH, FIELD_PAN] {
         if f.starts_with(sym) {
@@ -505,7 +546,6 @@ fn value_field_symbol(f: &str) -> Option<&'static str> {
     None
 }
 
-/// Parse `%100-0.8^0/2:8` into (symbol, value, op, amount, interval_rows, count).
 fn parse_operator(
     field: &str,
     subs: u32,
@@ -531,8 +571,7 @@ fn parse_operator(
 
 // ── block list ─────────────────────────────────────────────────────────
 
-fn parse_block_list(body: &str, subs: u32) -> (Vec<Vec<String>>, Vec<ShimEvent>) {
-    let call_rx = call_rx();
+fn parse_block_list(body: &str, subs: u32) -> (Vec<Vec<BlockCall>>, Vec<ShimEvent>) {
     let mut lines = Vec::new();
     let mut shims = Vec::new();
 
@@ -541,7 +580,6 @@ fn parse_block_list(body: &str, subs: u32) -> (Vec<Vec<String>>, Vec<ShimEvent>)
             continue;
         }
 
-        // Strip shims out of the line, recording them by index.
         let mut cleaned = String::with_capacity(raw.len());
         let mut rest = raw;
         loop {
@@ -553,7 +591,6 @@ fn parse_block_list(body: &str, subs: u32) -> (Vec<Vec<String>>, Vec<ShimEvent>)
             cleaned.push(' ');
             let after_at = &rest[at_pos + 2..];
             let Some(close_rel) = after_at.find('>') else {
-                // Malformed; drop the rest of the line's shim.
                 break;
             };
             let inner = &after_at[..close_rel];
@@ -563,22 +600,137 @@ fn parse_block_list(body: &str, subs: u32) -> (Vec<Vec<String>>, Vec<ShimEvent>)
             rest = &after_at[close_rel + 1..];
         }
 
-        let names: Vec<String> = call_rx
-        .captures_iter(&cleaned)
-        .map(|c| c[1].to_string())
-        .collect();
-
-        lines.push(names);
+        lines.push(parse_block_calls(&cleaned));
     }
 
     (lines, shims)
 }
 
+/// Parse every `ƒName(args)` call out of a BlockList line.
+fn parse_block_calls(text: &str) -> Vec<BlockCall> {
+    let mut out = Vec::new();
+    let src = FIELD_SOURCE;
+    let src_len = src.len();
+    let bytes = text.as_bytes();
+    let mut pos = 0usize;
+
+    while pos < bytes.len() {
+        if !text[pos..].starts_with(src) {
+            pos = next_char_boundary(text, pos);
+            continue;
+        }
+        pos += src_len;
+
+        let name_start = pos;
+        while pos < bytes.len() {
+            let c = bytes[pos];
+            if c.is_ascii_alphanumeric() || c == b'_' || c == b'-' {
+                pos += 1;
+            } else {
+                break;
+            }
+        }
+        let name = text[name_start..pos].to_string();
+        if name.is_empty() {
+            continue;
+        }
+
+        let mut p = pos;
+        while p < bytes.len() && bytes[p].is_ascii_whitespace() {
+            p += 1;
+        }
+
+        if p < bytes.len() && bytes[p] == b'(' {
+            let close = match_pair(text, p, b'(', b')');
+            let args = &text[p + 1..close];
+            let selections = parse_call_selections(args);
+            out.push(BlockCall { name, selections });
+            pos = close + 1;
+        } else {
+            out.push(BlockCall { name, selections: Vec::new() });
+        }
+    }
+
+    out
+}
+
+/// Parse the inside of a call's argument list.  Returns an empty Vec
+/// for "all measures."
+fn parse_call_selections(args: &str) -> Vec<MeasureSelection> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    for item in split_fields(trimmed) {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let (num_str, ov_str) = if let Some(lt) = item.find('<') {
+            (&item[..lt], Some(&item[lt..]))
+        } else {
+            (item, None)
+        };
+
+        let Ok(n) = num_str.trim().parse::<usize>() else {
+            continue;
+        };
+        if n == 0 {
+            continue;
+        }
+        let overrides = ov_str.and_then(parse_call_overrides);
+        out.push(MeasureSelection {
+            measure: n - 1,
+            overrides,
+        });
+    }
+    out
+}
+
+/// Parse a `<...>` override block in a call.  Returns None if nothing
+/// usable was in it.
+fn parse_call_overrides(text: &str) -> Option<CallOverrides> {
+    let inner = text
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim();
+    if inner.is_empty() {
+        return None;
+    }
+    let mut ov = CallOverrides::default();
+    let src_rx = source_rx();
+
+    for f in split_fields(inner) {
+        if let Some(rest) = f.strip_prefix(FIELD_VOLUME) {
+            if let Some(v) = parse_f(rest.trim_start_matches('+')) {
+                ov.vol = Some(v);
+            }
+        } else if let Some(rest) = f.strip_prefix(FIELD_PAN) {
+            if let Some(v) = parse_f(rest) {
+                ov.pan = Some(v);
+            }
+        } else if let Some(rest) = f.strip_prefix(FIELD_DURATION) {
+            if let Some(v) = parse_f(rest.trim_start_matches('+')) {
+                ov.dur = Some(v);
+            }
+        } else if f.starts_with(FIELD_SOURCE) {
+            if let Some(c) = src_rx.captures(&f) {
+                ov.source = Some(c[1].to_string());
+            }
+        }
+    }
+
+    if ov == CallOverrides::default() {
+        None
+    } else {
+        Some(ov)
+    }
+}
+
 // ── part events ────────────────────────────────────────────────────────
 
-/// Parse a section body into events.  `absolute_offset_rows` is the row
-/// at which this section begins within the part, accumulated across all
-/// preceding sections at their own resolution.
 fn parse_part_events(
     body: &str,
     subs: u32,
@@ -623,8 +775,6 @@ fn parse_part_events(
                     }
                 }
             } else if let Some(rest) = f.strip_prefix(PART_HEADER_SIGIL) {
-                // `|135` is the sample's native BPM.  `|4/4` is a frame
-                // and means nothing on a note.
                 if !rest.contains('/') {
                     ev.src_bpm = parse_f(rest).filter(|b| *b > 0.0);
                 }
@@ -647,36 +797,329 @@ fn parse_part_events(
                 if let Some(c) = src_rx.captures(&f) {
                     ev.sample_override = Some(c[1].to_string());
                     let raw = c
-                    .get(2)
-                    .filter(|m| !m.as_str().is_empty())
-                    .or_else(|| c.get(3))
-                    .map(|m| m.as_str())
-                    .unwrap_or("");
-                    // No offset specified → inherit the part default rather
-                    // than resetting to zero.
+                        .get(2)
+                        .filter(|m| !m.as_str().is_empty())
+                        .or_else(|| c.get(3))
+                        .map(|m| m.as_str())
+                        .unwrap_or("");
                     ev.offset = if raw.is_empty() {
                         None
                     } else {
                         raw.parse().ok()
                     };
-                    if std::env::var_os("TS_OFFSET_DEBUG").is_some() {
-                        eprintln!(
-                            "ts-offset: field={:?} path={:?} raw={:?} -> offset={:?}",
-                            f, &c[1], raw, ev.offset,
-                        );
-                    }
                 }
             }
         }
 
         let (Some(b), Some(s)) = (beat, sub) else { continue };
-        ev.row = absolute_offset_rows
-        + (b - 1.0) * subs as f64
-        + s;
+        ev.row = absolute_offset_rows + (b - 1.0) * subs as f64 + s;
         events.push(ev);
     }
 
     events
+}
+
+// ── part body parser ───────────────────────────────────────────────────
+
+/// One item in a part body: a single measure's events, or a named
+/// sub-block (which itself contains more items).
+enum BodyItem {
+    Measure(Vec<TrackscriptEvent>),
+    SubBlock { name: String, items: Vec<BodyItem> },
+}
+
+/// A byte-level cursor over the body text.  All operations keep `pos`
+/// on UTF-8 char boundaries because we only advance past ASCII markers
+/// or whole multi-byte constants.
+struct Cursor<'a> {
+    s: &'a str,
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(s: &'a str, pos: usize) -> Self {
+        Cursor { s, pos }
+    }
+
+    fn eof(&self) -> bool {
+        self.pos >= self.s.len()
+    }
+
+    fn peek_byte(&self) -> Option<u8> {
+        self.s.as_bytes().get(self.pos).copied()
+    }
+
+    fn peek(&self) -> Option<char> {
+        if self.eof() {
+            return None;
+        }
+        self.s[self.pos..].chars().next()
+    }
+
+    fn bump(&mut self) {
+        if let Some(c) = self.peek() {
+            self.pos += c.len_utf8();
+        }
+    }
+
+    /// Skip spaces, tabs, and carriage returns (not newlines).
+    fn skip_h_ws(&mut self) {
+        while matches!(self.peek(), Some(' ') | Some('\t') | Some('\r')) {
+            self.pos += 1;
+        }
+    }
+
+    /// Skip any whitespace, including newlines.
+    fn skip_all_ws(&mut self) {
+        while self.peek().map_or(false, |c| c.is_whitespace()) {
+            self.bump();
+        }
+    }
+
+    fn expect_byte(&mut self, b: u8) -> bool {
+        if self.peek_byte() == Some(b) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Locate the `>` matching the `<` at `start`.  Returns the byte index
+/// one past the `>`, or None if no match is found.
+fn find_matching_gt(s: &str, start: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'<' => depth += 1,
+            b'>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn parse_identifier(c: &mut Cursor) -> String {
+    let start = c.pos;
+    match c.peek_byte() {
+        Some(b) if b.is_ascii_alphabetic() || b == b'_' => {
+            c.pos += 1;
+        }
+        _ => return String::new(),
+    }
+    while let Some(b) = c.peek_byte() {
+        if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' {
+            c.pos += 1;
+        } else {
+            break;
+        }
+    }
+    c.s[start..c.pos].to_string()
+}
+
+/// One measure: a sequence of events (each optionally prefixed by a
+/// waypoint marker) separated by `,`, ending at a bare newline, a `]`,
+/// or EOF.  A newline immediately after a `,` is a continuation, not an
+/// end-of-measure.
+fn parse_measure(c: &mut Cursor, subs: u32, beats: u32) -> Vec<TrackscriptEvent> {
+    let mut events = Vec::new();
+    loop {
+        c.skip_h_ws();
+        let start = c.pos;
+
+        // Optional waypoint prefix.
+        if c.peek_byte() == Some(b'&') {
+            c.pos += 1;
+            c.skip_h_ws();
+        }
+
+        if c.peek_byte() != Some(b'<') {
+            c.pos = start;
+            break;
+        }
+
+        let Some(end) = find_matching_gt(c.s, c.pos) else {
+            c.pos = start;
+            break;
+        };
+        let ev_str = &c.s[start..end];
+        if let Some(ev) = parse_part_events(ev_str, subs, beats, 0.0).into_iter().next() {
+            events.push(ev);
+        }
+        c.pos = end;
+
+        c.skip_h_ws();
+        match c.peek_byte() {
+            Some(b',') => {
+                c.pos += 1;
+                c.skip_all_ws();
+                if matches!(c.peek_byte(), None | Some(b']')) {
+                    break;
+                }
+            }
+            Some(b'\n') => {
+                c.pos += 1;
+                break;
+            }
+            Some(b'&') => {
+                // A waypoint follows immediately; keep parsing this measure.
+                continue;
+            }
+            Some(b']') | None => break,
+            _ => break,
+        }
+    }
+    events
+}
+
+/// Parse a part body into an ordered list of measures and sub-blocks.
+/// Stops at an unmatched `]` (leaving the `]` for the caller) or EOF.
+fn parse_body(c: &mut Cursor, subs: u32, beats: u32) -> Vec<BodyItem> {
+    let mut items = Vec::new();
+    loop {
+        c.skip_all_ws();
+        if c.eof() {
+            break;
+        }
+        let b = c.peek_byte().unwrap();
+        if b == b']' {
+            break;
+        }
+        if b == b'[' {
+            c.pos += 1;
+            let inner = parse_body(c, subs, beats);
+            if !c.expect_byte(b']') {
+                break;
+            }
+            items.extend(inner);
+            continue;
+        }
+        if c.s[c.pos..].starts_with(FIELD_SOURCE) {
+            c.pos += FIELD_SOURCE.len();
+            let name = parse_identifier(c);
+            if name.is_empty() {
+                break;
+            }
+            c.skip_all_ws();
+            if !c.expect_byte(b'(') {
+                break;
+            }
+            c.skip_all_ws();
+            if !c.expect_byte(b')') {
+                break;
+            }
+            c.skip_all_ws();
+            if !c.expect_byte(b'[') {
+                break;
+            }
+            let sub_items = parse_body(c, subs, beats);
+            if !c.expect_byte(b']') {
+                break;
+            }
+            items.push(BodyItem::SubBlock { name, items: sub_items });
+            continue;
+        }
+        if b == b'<' || b == b'&' {
+            let evs = parse_measure(c, subs, beats);
+            if evs.is_empty() {
+                break;
+            }
+            items.push(BodyItem::Measure(evs));
+            continue;
+        }
+        // Unknown token — stop cleanly.
+        break;
+    }
+    items
+}
+
+/// Flatten every measure reachable from `items`, in order, expanding
+/// sub-blocks inline.
+fn flatten_body_items(items: &[BodyItem], out: &mut Vec<Vec<TrackscriptEvent>>) {
+    for item in items {
+        match item {
+            BodyItem::Measure(events) => out.push(events.clone()),
+            BodyItem::SubBlock { items, .. } => flatten_body_items(items, out),
+        }
+    }
+}
+
+/// Register every sub-block reachable from `items` as its own part,
+/// sharing the parent's args.
+fn register_sub_blocks(
+    items: &[BodyItem],
+    args: &PartArgs,
+    parts: &mut HashMap<String, TrackscriptPart>,
+) {
+    for item in items {
+        if let BodyItem::SubBlock { name, items: sub_items } = item {
+            let mut measures = Vec::new();
+            flatten_body_items(sub_items, &mut measures);
+            let frame_len = args.beats_per_measure as f64 * args.subs_per_beat as f64;
+            let section_lengths = vec![frame_len; measures.len()];
+            parts.insert(
+                name.clone(),
+                make_part(name.clone(), args, measures, section_lengths),
+            );
+            register_sub_blocks(sub_items, args, parts);
+        }
+    }
+}
+
+/// Shared args parsed from the part's `<...>` header.
+struct PartArgs {
+    sample_path: String,
+    sample_offset: u32,
+    src_bpm: Option<f64>,
+    beats_per_measure: u32,
+    subs_per_beat: u32,
+    default_vol: Option<f64>,
+    default_pan: Option<f64>,
+    default_dur: Option<f64>,
+}
+
+/// Build a `TrackscriptPart`, rebasing each measure's events to the
+/// part's overall row timeline.
+fn make_part(
+    name: String,
+    args: &PartArgs,
+    measures: Vec<Vec<TrackscriptEvent>>,
+    section_lengths: Vec<f64>,
+) -> TrackscriptPart {
+    let mut events = Vec::new();
+    let mut offset = 0.0;
+    for (i, evs) in measures.iter().enumerate() {
+        for ev in evs {
+            let mut e = ev.clone();
+            e.row += offset;
+            events.push(e);
+        }
+        offset += section_lengths.get(i).copied().unwrap_or(0.0);
+    }
+    TrackscriptPart {
+        name,
+        sample_path: args.sample_path.clone(),
+        beats_per_measure: args.beats_per_measure,
+        subs_per_beat: args.subs_per_beat,
+        len_beats: None,
+        sample_offset: args.sample_offset,
+        src_bpm: args.src_bpm,
+        events,
+        measures,
+        section_lengths,
+        default_vol: args.default_vol,
+        default_pan: args.default_pan,
+        default_dur: args.default_dur,
+    }
 }
 
 // ── block array ────────────────────────────────────────────────────────
@@ -707,9 +1150,9 @@ fn parse_block_array(body: &str) -> (BlockMap, PartMap) {
         }
         let name_start = pos + FIELD_SOURCE.len();
         let name_end = body[name_start..]
-        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
-        .map(|i| name_start + i)
-        .unwrap_or(body.len());
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+            .map(|i| name_start + i)
+            .unwrap_or(body.len());
         let name = body[name_start..name_end].to_string();
         if name.is_empty() {
             pos = next_char_boundary(body, pos);
@@ -738,9 +1181,9 @@ fn parse_block_array(body: &str) -> (BlockMap, PartMap) {
         // ── composite: args don't start with `<` ──────────────────────
         if !args_str.starts_with('<') {
             let calls: Vec<String> = call_rx
-            .captures_iter(&args_str)
-            .map(|c| c[1].to_string())
-            .collect();
+                .captures_iter(&args_str)
+                .map(|c| c[1].to_string())
+                .collect();
             blocks.insert(name, calls);
             if pos < bytes.len() && bytes[pos] == b';' {
                 pos += 1;
@@ -750,9 +1193,9 @@ fn parse_block_array(body: &str) -> (BlockMap, PartMap) {
 
         // ── part: args are `<|N/D, ƒ'path', %vol, ¶pan, ~dur>` ────────
         let inner = args_str
-        .trim_start_matches('<')
-        .trim_end_matches('>')
-        .trim();
+            .trim_start_matches('<')
+            .trim_end_matches('>')
+            .trim();
 
         let mut sample_path = String::new();
         let mut sample_offset: u32 = 0;
@@ -773,16 +1216,15 @@ fn parse_block_array(body: &str) -> (BlockMap, PartMap) {
                         frame_from_args = true;
                     }
                 } else {
-                    // `|135`: the sample's native BPM.
                     src_bpm = parse_f(rest).filter(|b| *b > 0.0);
                 }
             } else if f.starts_with(FIELD_SOURCE) {
                 if let Some(c) = src_rx.captures(&f) {
                     sample_path = c[1].to_string();
                     sample_offset = c
-                    .get(2)
-                    .map(|m| m.as_str().parse().unwrap_or(0))
-                    .unwrap_or(0);
+                        .get(2)
+                        .map(|m| m.as_str().parse().unwrap_or(0))
+                        .unwrap_or(0);
                 }
             } else if let Some(rest) = f.strip_prefix(FIELD_VOLUME) {
                 default_vol = parse_f(rest.trim_start_matches('+'));
@@ -793,27 +1235,27 @@ fn parse_block_array(body: &str) -> (BlockMap, PartMap) {
             }
         }
 
+        let args = PartArgs {
+            sample_path,
+            sample_offset,
+            src_bpm,
+            beats_per_measure,
+            subs_per_beat,
+            default_vol,
+            default_pan,
+            default_dur,
+        };
+
         // ── body ───────────────────────────────────────────────────────
-        let mut all_events: Vec<TrackscriptEvent> = Vec::new();
+        let mut measures: Vec<Vec<TrackscriptEvent>> = Vec::new();
+        let mut section_lengths: Vec<f64> = Vec::new();
+        let mut body_items: Vec<BodyItem> = Vec::new();
 
-        if pos < bytes.len() && bytes[pos] == b'[' {
-            // Single section; frame came from the args.
-            let open = pos;
-            let close = match_pair(body, open, b'[', b']');
-            let events_str = &body[open + 1..close];
-            all_events.extend(parse_part_events(
-                events_str,
-                subs_per_beat,
-                beats_per_measure,
-                0.0,
-            ));
-            pos = close + 1;
-        } else if pos < bytes.len() && bytes[pos] == PART_HEADER_SIGIL.as_bytes()[0] {
-            // Multi-section body.  Each `|N/D[events]` has its own frame.
-            // Sections accumulate row offsets so a waypoint chain crossing
-            // a boundary lands on the correct absolute row within the part.
-            let mut section_start_row: f64 = 0.0;
-
+        if pos < bytes.len() && bytes[pos] == PART_HEADER_SIGIL.as_bytes()[0] {
+            // Old multi-section body: `|N/D[events] |N/D[events] ...`.
+            // (Single-section bodies end up here too — one section only.)
+            // Args-level `|N/D` wins if it was given; otherwise the
+            // section header's frame is authoritative for its events.
             while pos < bytes.len() && bytes[pos] == PART_HEADER_SIGIL.as_bytes()[0] {
                 let hdr_start = pos + PART_HEADER_SIGIL.len();
                 let Some(bracket_rel) = body[hdr_start..].find('[') else { break };
@@ -823,33 +1265,38 @@ fn parse_block_array(body: &str) -> (BlockMap, PartMap) {
                 let Some((nb_str, ns_str)) = header.split_once('/') else { break };
                 let (Ok(nb), Ok(ns)) = (
                     nb_str.trim().parse::<u32>(),
-                                        ns_str.trim().parse::<u32>(),
+                    ns_str.trim().parse::<u32>(),
                 ) else { break };
 
-                if !frame_from_args {
-                    beats_per_measure = nb;
-                    subs_per_beat = ns;
-                    frame_from_args = true;
-                }
+                // Frame for this section's events.  If args carried a
+                // `|N/D`, the section header is informational; otherwise
+                // it defines the frame.
+                let (sec_b, sec_s) = if frame_from_args {
+                    (beats_per_measure, subs_per_beat)
+                } else {
+                    (nb, ns)
+                };
 
                 let bracket_close = match_pair(body, bracket_open, b'[', b']');
                 let events_str = &body[bracket_open + 1..bracket_close];
-                all_events.extend(parse_part_events(
-                    events_str,
-                    ns,
-                    nb,
-                    section_start_row,
-                ));
-
-                // One section = one measure.  Advance by its own length
-                // at its own resolution so mixed-meter parts accumulate.
-                section_start_row += nb as f64 * ns as f64;
+                let evs = parse_part_events(events_str, sec_s, sec_b, 0.0);
+                measures.push(evs);
+                section_lengths.push(sec_b as f64 * sec_s as f64);
 
                 pos = bracket_close + 1;
                 while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
                     pos += 1;
                 }
             }
+        } else {
+            // New syntax: `[ ... ]` or `ƒSub()[ ... ] ...`.
+            let mut cur = Cursor::new(body, pos);
+            body_items = parse_body(&mut cur, subs_per_beat, beats_per_measure);
+            pos = cur.pos;
+
+            flatten_body_items(&body_items, &mut measures);
+            let frame_len = beats_per_measure as f64 * subs_per_beat as f64;
+            section_lengths = vec![frame_len; measures.len()];
         }
 
         if pos < bytes.len() && bytes[pos] == b';' {
@@ -858,20 +1305,9 @@ fn parse_block_array(body: &str) -> (BlockMap, PartMap) {
 
         parts.insert(
             name.clone(),
-                     TrackscriptPart {
-                         name,
-                         sample_path,
-                         beats_per_measure,
-                         subs_per_beat,
-                         len_beats: None,
-                         sample_offset,
-                         src_bpm,
-                         events: all_events,
-                         default_vol,
-                         default_pan,
-                         default_dur,
-                     },
+            make_part(name, &args, measures, section_lengths),
         );
+        register_sub_blocks(&body_items, &args, &mut parts);
     }
 
     (blocks, parts)
@@ -879,41 +1315,51 @@ fn parse_block_array(body: &str) -> (BlockMap, PartMap) {
 
 // ── top level ──────────────────────────────────────────────────────────
 
+/// Build a section-header regex from a keyword.  The parenthesized
+/// argument list is optional.
+fn section_rx(keyword: &str) -> Regex {
+    Regex::new(&format!(
+        r"\b{}\s*(?:\([^)]*\))?\s*\{{",
+        regex::escape(keyword)
+    ))
+    .unwrap()
+}
+
 pub fn parse_str(text: &str) -> Result<TrackscriptFile> {
     let text = strip_comments(text);
 
-    let config_rx = Regex::new(r"\bConfig\s*\{").unwrap();
+    let config_rx = section_rx("Config");
     let config = extract_block(&text, &config_rx)
-    .map(parse_config)
-    .unwrap_or_default();
+        .map(parse_config)
+        .unwrap_or_default();
 
-    let tempo_rx = Regex::new(r"\bTempo\s*\{").unwrap();
+    let tempo_rx = section_rx("Tempo");
     let tempo = extract_block(&text, &tempo_rx)
-    .map(|b| parse_tempo(b, config.subdivisions))
-    .unwrap_or_default();
+        .map(|b| parse_tempo(b, config.subdivisions))
+        .unwrap_or_default();
 
-    let bl_rx = Regex::new(r"\bBlockList\s*\([^)]*\)\s*\{").unwrap();
+    let bl_rx = section_rx("BlockList");
     let (block_list, shims) = extract_block(&text, &bl_rx)
-    .map(|b| parse_block_list(b, config.subdivisions))
-    .unwrap_or_default();
+        .map(|b| parse_block_list(b, config.subdivisions))
+        .unwrap_or_default();
 
-    let ba_rx = Regex::new(r"\bBlockArray\s*\([^)]*\)\s*\{").unwrap();
+    let ba_rx = section_rx("BlockArray");
     let (blocks, parts) = extract_block(&text, &ba_rx)
-    .map(parse_block_array)
-    .unwrap_or_default();
+        .map(parse_block_array)
+        .unwrap_or_default();
 
     let mut notes = Vec::new();
     for (placement_index, calls) in block_list.iter().enumerate() {
         for call in calls {
             let names: Vec<String> = blocks
-            .get(call)
-            .cloned()
-            .unwrap_or_else(|| vec![call.clone()]);
+                .get(&call.name)
+                .cloned()
+                .unwrap_or_else(|| vec![call.name.clone()]);
             for part_name in &names {
                 let Some(part) = parts.get(part_name) else { continue };
                 let placement_row = placement_index as f64
-                * part.beats_per_measure as f64
-                * part.subs_per_beat as f64;
+                    * part.beats_per_measure as f64
+                    * part.subs_per_beat as f64;
                 for ev in &part.events {
                     if ev.is_waypoint() {
                         continue;
@@ -925,14 +1371,14 @@ pub fn parse_str(text: &str) -> Result<TrackscriptFile> {
                         pitch: midi,
                         pitch_hz: hz,
                         voice: format!("{}@{}", part_name, placement_index),
-                               sample: ev
-                               .sample_override
-                               .clone()
-                               .or_else(|| Some(part.sample_path.clone())),
-                               duration_rows: dur_rows,
-                               duration_beats: ev.dur_beats,
-                               section: placement_index,
-                               source: format!("TS row {} {}", placement_row + ev.row, part_name),
+                        sample: ev
+                            .sample_override
+                            .clone()
+                            .or_else(|| Some(part.sample_path.clone())),
+                        duration_rows: dur_rows,
+                        duration_beats: ev.dur_beats,
+                        section: placement_index,
+                        source: format!("TS row {} {}", placement_row + ev.row, part_name),
                     });
                 }
             }
@@ -940,10 +1386,10 @@ pub fn parse_str(text: &str) -> Result<TrackscriptFile> {
     }
     notes.sort_by(|a, b| {
         a.row
-        .partial_cmp(&b.row)
-        .unwrap_or(std::cmp::Ordering::Equal)
-        .then(a.pitch.cmp(&b.pitch))
-        .then(a.voice.cmp(&b.voice))
+            .partial_cmp(&b.row)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.pitch.cmp(&b.pitch))
+            .then(a.voice.cmp(&b.voice))
     });
 
     if std::env::var_os("TS_DEBUG").is_some() {
@@ -951,8 +1397,8 @@ pub fn parse_str(text: &str) -> Result<TrackscriptFile> {
         for (name, part) in parts.iter() {
             if name.contains("ae2f") || name.contains("0fb9") || name.contains("RK_IT5") {
                 eprintln!(
-                    "ts:   {:?} events={} sample_path={:?}",
-                    name, part.events.len(), part.sample_path
+                    "ts:   {:?} measures={} events={} sample_path={:?}",
+                    name, part.measures.len(), part.events.len(), part.sample_path
                 );
             }
         }
@@ -960,17 +1406,17 @@ pub fn parse_str(text: &str) -> Result<TrackscriptFile> {
 
     Ok(TrackscriptFile {
         config,
-       tempo_events: tempo,
-       block_list,
-       shims,
-       blocks,
-       parts,
-       notes,
+        tempo_events: tempo,
+        block_list,
+        shims,
+        blocks,
+        parts,
+        notes,
     })
 }
 
 pub fn parse_file(path: &Path) -> Result<TrackscriptFile> {
     let text = fs::read_to_string(path)
-    .map_err(|e| anyhow!("reading {}: {}", path.display(), e))?;
+        .map_err(|e| anyhow!("reading {}: {}", path.display(), e))?;
     parse_str(&text)
 }

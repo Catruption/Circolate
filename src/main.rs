@@ -6,6 +6,7 @@
 
 mod fidelity;
 mod display;
+mod check;
 mod convert;
 mod dump;
 mod effects;
@@ -24,6 +25,9 @@ mod tui;
 mod vst_host_ffi;
 mod vst_smoke;
 mod spec;
+mod archive;
+mod asset;
+mod audio_decode;
 
 use anyhow::{bail, Result};
 
@@ -45,6 +49,7 @@ fn main() -> Result<()> {
         Some("export")    => export::run(rest),
         Some("dump")      => dump::run(rest),
         Some("test")      => test::run(rest),
+        Some("check")     => check::run(rest),
         Some("plugins")   => plugins::run(rest),
         Some("fetch")     => fetch::run(rest),
         Some("vst-smoke") => vst_smoke::run(rest),
@@ -72,6 +77,7 @@ fn print_help() {
     println!("  export    <file> [-o DIR]   convert a source file to trackscript");
     println!("  dump      <file>            print a file's parsed structure as JSON");
     println!("  test      <file>            run diagnostics");
+    println!("  check     [path]            recursively probe .flp files for missing deps");
     println!("  plugins   [--paths]         list discovered VST3 / LV2 / CLAP");
     println!("  fetch     [--dry] [--only NAME]");
     println!("                              download missing fallback plugins");

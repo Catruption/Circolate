@@ -1,26 +1,96 @@
-//! `trackscript-player play` — play a song, or render it to WAV offline.
+//! `trackscript-player play` — play a song, or convert it.
 //!
-//! Accepts any supported source: `.trackscript` plays directly, `.flp` and
-//! `.it` are converted to a temp directory first.
+//! Live playback owns the terminal for the entire session: the TUI comes
+//! up once, stays up across song changes, and only tears down on quit.
+//! Every write that would corrupt the display is either suppressed via
+//! `load_project`'s `quiet` flag or swallowed by a temporary redirect of
+//! stdout/stderr to /dev/null.
 
 use anyhow::{anyhow, bail, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use ratatui::{backend::CrosstermBackend, Terminal};
+use std::io::Stdout;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::archive;
 use crate::convert::{self, ConvertOptions};
-use crate::display;
 use crate::effects::EffectChain;
 use crate::player::{self, Cache, Engine, Loader, Msg, Project, Transport};
 use crate::sources::SourceKind;
 use crate::tui;
+use crate::tui::queue;
 use crate::vst_host_ffi::VstHost;
 
+// ── silence guard ──────────────────────────────────────────────────────
+//
+// Wraps a block of work in a redirection of stdout/stderr to /dev/null
+// for the duration.  Restores the original fds on drop, panic-safe.
+// Used to swallow anything printed during project load that the `quiet`
+// flag doesn't already suppress — vendor printfs, plugin debug output,
+// stray eprintlns.
+
+#[cfg(unix)]
+mod silence {
+    pub struct Silence {
+        saved_out: i32,
+        saved_err: i32,
+    }
+
+    impl Silence {
+        pub fn new() -> Option<Self> {
+            unsafe {
+                let saved_out = libc::dup(1);
+                let saved_err = libc::dup(2);
+                if saved_out < 0 || saved_err < 0 {
+                    if saved_out >= 0 { libc::close(saved_out); }
+                    if saved_err >= 0 { libc::close(saved_err); }
+                    return None;
+                }
+                let devnull = libc::open(
+                    b"/dev/null\0".as_ptr() as *const libc::c_char,
+                    libc::O_WRONLY,
+                );
+                if devnull < 0 {
+                    libc::close(saved_out);
+                    libc::close(saved_err);
+                    return None;
+                }
+                libc::dup2(devnull, 1);
+                libc::dup2(devnull, 2);
+                libc::close(devnull);
+                Some(Silence { saved_out, saved_err })
+            }
+        }
+    }
+
+    impl Drop for Silence {
+        fn drop(&mut self) {
+            unsafe {
+                libc::dup2(self.saved_out, 1);
+                libc::dup2(self.saved_err, 2);
+                libc::close(self.saved_out);
+                libc::close(self.saved_err);
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+mod silence {
+    pub struct Silence;
+    impl Silence {
+        pub fn new() -> Option<Self> { Some(Silence) }
+    }
+}
+
+// ── CLI ────────────────────────────────────────────────────────────────
+
 struct Args {
-    song: PathBuf,
+    song: Option<PathBuf>,
     render: Option<PathBuf>,
     rate: u32,
     start: f64,
@@ -34,7 +104,7 @@ struct Args {
 
 fn parse_args(argv: &[String]) -> Result<Args> {
     let mut it = argv.iter();
-    let mut song = None;
+    let mut song: Option<PathBuf> = None;
     let mut render = None;
     let mut rate = 44100u32;
     let mut start = 0.0f64;
@@ -76,20 +146,78 @@ fn parse_args(argv: &[String]) -> Result<Args> {
             _ => bail!("unexpected argument {a}"),
         }
     }
-    let song = song.ok_or_else(|| {
-        anyhow!(
-            "usage: trackscript-player play <song> \
-[--start SEC] [--samples-dir DIR] [--skip-native] [--no-cache] [--verify-cache] \
-[--no-master-fx] [--no-watch] [--render out.wav [--rate HZ]]"
-        )
-    })?;
     Ok(Args {
-        song, render, rate, start, no_cache, verify,
-        samples_dir, skip_native, no_master_fx, no_watch,
+        song,
+        render,
+        rate,
+        start,
+        no_cache,
+        verify,
+        samples_dir,
+        skip_native,
+        no_master_fx,
+        no_watch,
     })
 }
 
-/// A temporary directory that deletes itself on drop.
+// ── helpers ────────────────────────────────────────────────────────────
+
+fn is_archive(path: &Path) -> bool {
+    path.extension()
+        .and_then(|s| s.to_str())
+        .map_or(false, |e| e.eq_ignore_ascii_case(archive::EXTENSION))
+}
+
+/// Look up a queue name in `trackscripts/`.  Accepts a full path, a
+/// bare stem (`winds` → `trackscripts/winds.tsz`), or a filename with
+/// extension.  Falls back to walking up from the running binary's
+/// location so a konsole-launched session from `$HOME` still resolves.
+fn resolve_song(name: &str) -> Result<PathBuf> {
+    let name = name.trim();
+    if name.is_empty() {
+        bail!("empty song name");
+    }
+
+    let direct = Path::new(name);
+    if direct.is_file() {
+        return Ok(direct.to_path_buf());
+    }
+
+    let dir = Path::new("trackscripts");
+    for ext in ["tsz", "trackscript", "flp", "it"] {
+        let candidate = dir.join(format!("{}.{}", name, ext));
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    let candidate = dir.join(name);
+    if candidate.is_file() {
+        return Ok(candidate);
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        let mut d = exe.parent().map(Path::to_path_buf);
+        while let Some(p) = d {
+            let ts_dir = p.join("trackscripts");
+            for ext in ["tsz", "trackscript", "flp", "it"] {
+                let candidate = ts_dir.join(format!("{}.{}", name, ext));
+                if candidate.is_file() {
+                    return Ok(candidate);
+                }
+            }
+            let candidate = ts_dir.join(name);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+            d = p.parent().map(Path::to_path_buf);
+        }
+    }
+
+    bail!("no such song: {:?} (looked in trackscripts/)", name)
+}
+
+// ── temporary bundle (for FLP/IT → trackscript conversion) ─────────────
+
 struct TempBundle {
     dir: PathBuf,
 }
@@ -109,7 +237,6 @@ impl TempBundle {
     fn write(&self, c: &convert::Converted, stem: &str) -> Result<PathBuf> {
         let ts_path = self.dir.join(format!("{}.trackscript", stem));
         std::fs::write(&ts_path, &c.trackscript)?;
-
         for s in &c.samples {
             let p = self.dir.join(&s.rel_path);
             if let Some(parent) = p.parent() {
@@ -138,6 +265,9 @@ impl Drop for TempBundle {
 }
 
 fn resolve_source(src: &Path, args: &Args) -> Result<(PathBuf, Option<TempBundle>)> {
+    if is_archive(src) {
+        return Ok((src.to_path_buf(), None));
+    }
     match SourceKind::from_path(src)? {
         SourceKind::Trackscript => Ok((src.to_path_buf(), None)),
         _ => {
@@ -146,83 +276,64 @@ fn resolve_source(src: &Path, args: &Args) -> Result<(PathBuf, Option<TempBundle
                 opts.samples_dir = Some(d.clone());
             }
             opts.skip_native = args.skip_native;
-            let conv = convert::convert_file(src, &opts)?;
-            let mut in_footer = false;
-            for line in conv.trackscript.lines() {
-                if line.starts_with("// ------") {
-                    in_footer = true;
-                } else if in_footer && line.starts_with("//") {
-                    println!("  {}", line);
-                }
-            }
+
+            // Conversion runs its own prints on the way out.  Swallow
+            // them so nothing leaks into the TUI's alternate screen.
+            let conv = {
+                let _s = silence::Silence::new();
+                convert::convert_file(src, &opts)?
+            };
+
             let tb = TempBundle::new("play")?;
             let stem = convert::output_stem(src);
             let ts = tb.write(&conv, &stem)?;
+            if let Some(parent) = src.parent() {
+                for name in ["cover.jpg", "cover.jpeg", "cover.png", "cover.webp"] {
+                    let candidate = parent.join(name);
+                    if candidate.is_file() {
+                        let _ = std::fs::copy(&candidate, tb.dir.join(name));
+                        break;
+                    }
+                }
+            }
             Ok((ts, Some(tb)))
         }
     }
 }
 
+// ── audio install helpers ──────────────────────────────────────────────
+
 fn install_vst_hosts(engine: &mut Engine, project: &player::Project) {
     for (name, vinst) in &project.vst_instruments {
-        let Some(path_str) = vinst.plugin_path.to_str() else {
-            eprintln!("  (skipping VST with non-UTF8 path: {})", name);
-            continue;
-        };
+        let Some(path_str) = vinst.plugin_path.to_str() else { continue };
         match VstHost::load(path_str, &vinst.state_bytes, project.sample_rate) {
             Ok(host) => {
-                let tag = if vinst.fallback { "fallback" } else { "exact" };
-                println!(
-                    "  loaded VST [{}] {} ({})",
-                    vinst.iid,
-                    vinst.plugin_path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("?"),
-                    tag
-                );
                 engine.install_host_with_gain(vinst.iid, host, vinst.gain);
             }
-            Err(e) => {
-                eprintln!("  failed to load VST {} ({:#})", name, e);
+            Err(_) => {
+                let _ = name;
             }
         }
     }
-    println!("  installed {} VST host(s)", engine.host_count());
 }
 
 fn install_master_fx(engine: &mut Engine, project: &player::Project, disabled: bool) {
     if disabled {
         return;
     }
-    match EffectChain::load_default(project.sample_rate) {
-        Ok(chain) => {
-            if !chain.is_empty() {
-                println!("  {}", chain.describe());
-            }
+    if let Ok(chain) = EffectChain::load_default(project.sample_rate) {
+        if !chain.is_empty() {
             engine.install_master_fx(chain);
         }
-        Err(e) => eprintln!("  master fx: {:#}", e),
     }
 }
 
-/// A newly-parsed project waiting for the loader worker to pick it up.
-/// The watcher thread writes, the worker thread reads and clears.  Both
-/// sides hold the mutex for microseconds.
+// ── live-reload watcher ────────────────────────────────────────────────
+
 struct ReloadSlot {
     pending: Mutex<Option<(Arc<Project>, Cache)>>,
 }
 
-/// Watch the trackscript's mtime.  On change (debounced against a
-/// mid-write state), re-parse and hand the result to the worker.
-///
-/// This thread does the expensive work — sample loading, VST sidecar
-/// reads, template pre-build.  It touches no audio state and takes no
-/// locks the audio thread cares about.  All diagnostics are silent: no
-/// stdout or stderr writes, because writing to the terminal while the
-/// TUI is active scrambles the screen.  The worker's `reload_count` is
-/// the only user-visible signal, and it flows through the normal render
-/// path.
 fn watch_for_changes(
     path: PathBuf,
     rate: u32,
@@ -237,16 +348,12 @@ fn watch_for_changes(
 
     while !tp.stop.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(400));
-
         let mtime = std::fs::metadata(&path)
             .and_then(|m| m.modified())
             .ok();
         if mtime == last_mtime {
             continue;
         }
-
-        // Debounce: wait a beat and re-stat.  If the mtime moved again,
-        // the editor is still writing — loop and retry next poll.
         std::thread::sleep(Duration::from_millis(300));
         let settled = std::fs::metadata(&path)
             .and_then(|m| m.modified())
@@ -254,13 +361,11 @@ fn watch_for_changes(
         if settled != mtime {
             continue;
         }
-
+        let _s = silence::Silence::new();
         match player::load_project(&path, rate, use_cache, true) {
             Ok((project, cache)) => {
                 let new_hashes = project.part_hash_map().clone();
                 if new_hashes == last_hashes {
-                    // Content is byte-identical to what's playing.
-                    // Skip: no seek, no VST panic, no interruption.
                     last_mtime = mtime;
                     continue;
                 }
@@ -270,15 +375,12 @@ fn watch_for_changes(
                 }
                 last_mtime = mtime;
             }
-            Err(_) => {
-                // Parse failed — usually a half-saved file.  Do NOT
-                // update `last_mtime`; the next poll sees the same
-                // mtime and retries once the writer finishes.  No
-                // output; the TUI must not be disturbed.
-            }
+            Err(_) => {}
         }
     }
 }
+
+// ── loader worker ──────────────────────────────────────────────────────
 
 fn worker(
     mut loader: Loader,
@@ -289,23 +391,15 @@ fn worker(
 ) {
     let mut epoch = 0u64;
     while !tp.stop.load(Ordering::Relaxed) {
-        // Pick up any pending reload before checking for a seek.  The
-        // new loader replaces the old; the seek we issue will re-fetch
-        // voices from the current position using the new project.  The
-        // audio thread has no idea a reload happened — it just sees an
-        // ordinary seek, which it has handled since day one.
         if let Some(slot) = &slot {
             let pending = slot.pending.lock().ok().and_then(|mut g| g.take());
             if let Some((new_project, new_cache)) = pending {
                 loader = Loader::new(new_project, new_cache);
                 let cur = tp.position.load(Ordering::Relaxed);
                 tp.seek_to.store(cur, Ordering::Release);
-                // Bump the counter so the TUI can flash a "reloaded"
-                // indicator.  No stdout/stderr output.
                 tp.reload_count.fetch_add(1, Ordering::Relaxed);
             }
         }
-
         let req = tp.seek_to.swap(i64::MIN, Ordering::AcqRel);
         if req != i64::MIN {
             epoch += 1;
@@ -339,16 +433,17 @@ fn worker(
     }
 }
 
-fn verify_cache(args: &Args) -> Result<()> {
+// ── verify-cache ───────────────────────────────────────────────────────
+
+fn verify_cache(args: &Args, song: &Path) -> Result<()> {
     let rate = args.rate;
-    let (path, _guard) = resolve_source(&args.song, args)?;
+    let (path, _guard) = resolve_source(song, args)?;
     let (p1, c1) = player::load_project(&path, rate, true, false)?;
     let (a_l, a_r, c1) = player::render_offline(&p1, c1, 0, true);
     println!("  with cache:    {}", c1.describe());
     let (p2, c2) = player::load_project(&path, rate, false, false)?;
     let (b_l, b_r, c2) = player::render_offline(&p2, c2, 0, true);
     println!("  without cache: {}", c2.describe());
-
     let diffs = |a: &[f32], b: &[f32]| {
         a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count()
     };
@@ -366,32 +461,19 @@ fn verify_cache(args: &Args) -> Result<()> {
     }
 }
 
-pub fn run(argv: &[String]) -> Result<()> {
-    let args = parse_args(argv)?;
-    println!("loading {}", args.song.display());
+// ── one session ────────────────────────────────────────────────────────
 
-    if args.verify {
-        return verify_cache(&args);
-    }
+enum Outcome {
+    Quit,
+    Next { name: String, queue: queue::QueueState },
+}
 
-    if let Some(out) = &args.render {
-        let (path, _guard) = resolve_source(&args.song, &args)?;
-        let (project, cache) = player::load_project(&path, args.rate, !args.no_cache, false)?;
-        let t0 = std::time::Instant::now();
-        let start = (args.start * args.rate as f64) as i64;
-        let (l, r, cache) = player::render_offline(&project, cache, start, args.no_master_fx);
-        player::write_wav(out, &l, &r, args.rate)?;
-        println!(
-            "  wrote {} ({:.2}s of audio in {:.1}s; {})",
-            out.display(),
-            l.len() as f64 / args.rate as f64,
-            t0.elapsed().as_secs_f64(),
-            cache.describe()
-        );
-        return Ok(());
-    }
-
-    // Live playback.
+fn play_one(
+    term: &mut Terminal<CrosstermBackend<Stdout>>,
+    args: &Args,
+    song: Option<&Path>,
+    queue: queue::QueueState,
+) -> Result<Outcome> {
     let host = cpal::default_host();
     let device = host
         .default_output_device()
@@ -406,29 +488,38 @@ pub fn run(argv: &[String]) -> Result<()> {
     let sample_rate = device_config.sample_rate().0;
     let stream_config: cpal::StreamConfig = device_config.into();
     let channels = stream_config.channels as usize;
-    println!(
-        "output: {:?}  {} Hz  {} ch",
-        device.name().unwrap_or_default(),
-        sample_rate,
-        channels
-    );
 
-    let is_native_trackscript = matches!(
-        SourceKind::from_path(&args.song)?,
-        SourceKind::Trackscript
-    );
+    let is_watchable_trackscript = song.map_or(false, |p| {
+        !is_archive(p)
+            && matches!(SourceKind::from_path(p), Ok(SourceKind::Trackscript))
+    });
 
-    let (project_path, _guard) = resolve_source(&args.song, &args)?;
+    let (project, cache, project_path, _guard) = match song {
+        Some(p) => {
+            let (ts_path, guard) = resolve_source(p, args)?;
 
-    let (project, cache) =
-        player::load_project(&project_path, sample_rate, !args.no_cache, false)?;
-    println!("  {}", cache.describe());
-    display::banner(&project, sample_rate);
+            // `quiet: true` suppresses load_project's progress prints.
+            // The silence guard catches anything else — vendor
+            // printfs, plugin debug spew, stray eprintlns.
+            let (project, cache) = {
+                let _s = silence::Silence::new();
+                player::load_project(&ts_path, sample_rate, !args.no_cache, true)?
+            };
+            (project, cache, ts_path, guard)
+        }
+        None => {
+            let project = Arc::new(Project::empty(sample_rate));
+            let cache = Cache::new(!args.no_cache);
+            (project, cache, PathBuf::new(), None)
+        }
+    };
+
     let total = project.total_samples;
     let start = ((args.start * sample_rate as f64) as i64).clamp(0, total);
+    let initial_speed: i64 = if project.voice_count > 0 { 1 } else { 0 };
 
     let transport = Arc::new(Transport {
-        speed: AtomicI64::new(0),
+        speed: AtomicI64::new(initial_speed),
         seek_to: AtomicI64::new(start),
         position: AtomicI64::new(start),
         done: AtomicBool::new(false),
@@ -438,7 +529,7 @@ pub fn run(argv: &[String]) -> Result<()> {
         reload_count: AtomicI64::new(0),
     });
 
-    let reload_slot = if is_native_trackscript && !args.no_watch {
+    let reload_slot = if is_watchable_trackscript && !args.no_watch {
         let slot = Arc::new(ReloadSlot {
             pending: Mutex::new(None),
         });
@@ -458,7 +549,6 @@ pub fn run(argv: &[String]) -> Result<()> {
                 initial_hashes,
             )
         });
-        println!("  watching {} for changes", project_path.display());
         Some(slot)
     } else {
         None
@@ -495,13 +585,19 @@ pub fn run(argv: &[String]) -> Result<()> {
 
             let speed = tp.speed.load(Ordering::Relaxed);
             let reached_end = speed > 0 && engine.finished();
-            if speed == 0 || reached_end {
+            if reached_end {
                 data.fill(0.0);
-                if reached_end {
-                    tp.done.store(true, Ordering::Release);
-                }
+                tp.done.store(true, Ordering::Release);
                 return;
             }
+            if speed == 0 {
+                data.fill(0.0);
+                return;
+            }
+            // Actively producing audio — clear any stale done flag from
+            // a previous completion so the TUI's auto-advance doesn't
+            // re-fire.
+            tp.done.store(false, Ordering::Release);
 
             let frames = data.len() / channels;
             if left.len() < frames {
@@ -527,14 +623,97 @@ pub fn run(argv: &[String]) -> Result<()> {
             }
             tp.position.store(engine.pos, Ordering::Relaxed);
         },
-        |err| eprintln!("stream error: {err}"),
+        |_err| {},
         None,
     )?;
 
     stream.play()?;
-    println!("playing — Ctrl+C to stop");
-    tui::run(Arc::clone(&transport), Arc::clone(&project), sample_rate)?;
+
+    let (request, queue) = tui::run_against(
+        term,
+        Arc::clone(&transport),
+        Arc::clone(&project),
+        sample_rate,
+        queue,
+    )?;
     transport.stop.store(true, Ordering::Relaxed);
-    println!("done");
-    Ok(())
+    drop(stream);
+
+    match request {
+        None => Ok(Outcome::Quit),
+        Some(name) => Ok(Outcome::Next { name, queue }),
+    }
+}
+
+// ── entry point ────────────────────────────────────────────────────────
+
+pub fn run(argv: &[String]) -> Result<()> {
+    let args = parse_args(argv)?;
+
+    if args.verify {
+        let song = args
+            .song
+            .as_ref()
+            .ok_or_else(|| anyhow!("--verify-cache needs a song file"))?;
+        return verify_cache(&args, song);
+    }
+
+    if let Some(out) = &args.render {
+        let song = args
+            .song
+            .as_ref()
+            .ok_or_else(|| anyhow!("--render needs a song file"))?;
+        let (path, _guard) = resolve_source(song, &args)?;
+        let (project, cache) =
+            player::load_project(&path, args.rate, !args.no_cache, false)?;
+        let t0 = std::time::Instant::now();
+        let start = (args.start * args.rate as f64) as i64;
+        let (l, r, cache) = player::render_offline(&project, cache, start, args.no_master_fx);
+        player::write_wav(out, &l, &r, args.rate)?;
+        println!(
+            "  wrote {} ({:.2}s of audio in {:.1}s; {})",
+            out.display(),
+            l.len() as f64 / args.rate as f64,
+            t0.elapsed().as_secs_f64(),
+            cache.describe()
+        );
+        return Ok(());
+    }
+
+    // Live playback: the TUI owns the terminal for the entire loop.
+    // It comes up once, stays up across song changes, and only tears
+    // down on quit.
+    let mut term = tui::setup()?;
+    let mut song = args.song.clone();
+    let mut queue = queue::QueueState::new();
+
+    let result = (|| -> Result<()> {
+        loop {
+            // Draw the empty TUI (queue widget included) while the
+            // next project loads.  No console logs leak through — the
+            // load itself is under the silence guard, and `quiet: true`
+            // suppresses load_project's own progress prints.
+            let msg = match &song {
+                Some(p) => format!("loading {}...", p.display()),
+                None => {
+                    "no song — queue box is focused; type a name and press enter".into()
+                }
+            };
+            tui::show_loading(&mut term, &queue, &msg)?;
+
+            match play_one(&mut term, &args, song.as_deref(), queue.clone())? {
+                Outcome::Quit => return Ok(()),
+                Outcome::Next { name, queue: q } => {
+                    queue = q;
+                    match resolve_song(&name) {
+                        Ok(p) => song = Some(p),
+                        Err(_) => song = None,
+                    }
+                }
+            }
+        }
+    })();
+
+    let _ = tui::restore(&mut term);
+    result
 }

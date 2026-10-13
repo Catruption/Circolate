@@ -5,20 +5,9 @@
 //! plugins (with their saved-state blobs kept opaque), patterns with notes,
 //! mixer inserts, and the playlist.  Does not run or emulate any plugin.
 //!
-//! Confidence notes mirror the Python module:
-//!   * Header, event framing, tempo, version, text events, channel types,
-//!     note records (24 bytes) and plugin wrapper paths are well established.
-//!   * Playlist items use a 60-byte record in FL 21+ (32 before that).  Only
-//!     the first fields are decoded; the rest is kept as raw bytes.
-//!   * Insert/effect slot ownership is read from the first dword of the
-//!     NewPlugin event (0 for channels, otherwise the insert index).  Treat
-//!     as inferred.
-//!   * Channel sound-shaping structs (EnvelopeLFO, Levels, Tracking,
-//!     LevelAdjusts) are ported from PyFLP v2.2.1 `channel.py`.  All ints
-//!     are little-endian.  The 5 EnvelopeLFO events per channel arrive in
-//!     stream order and map to (Panning, Volume, Mod X, Mod Y, Pitch).
-//!   * Anything not decoded keeps its raw event id and bytes in
-//!     `Project::events`.
+//! A truncated final event is treated as a warning, not an error: the
+//! file is still useful up to the truncation point.  Only a missing
+//! FLhd/FLdt header is fatal.
 
 use anyhow::{anyhow, bail, Result};
 use serde::Serialize;
@@ -73,12 +62,8 @@ fn u32le(b: &[u8], o: usize) -> u32 {
     u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
 }
 
-// ── channel substructures (PyFLP channel.py v2.2.1) ────────────────────
+// ── channel substructures ──────────────────────────────────────────────
 
-/// One of the five `EnvelopeLFO` events a channel can carry (event 218,
-/// 68 bytes).  Stream order matches PyFLP's `EnvelopeName.__args__`:
-/// index 0 = Panning, 1 = Volume, 2 = Mod X, 3 = Mod Y, 4 = Pitch.
-/// The LFO fields in the same event modulate the same target.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct EnvelopeLfo {
     pub flags: i32,
@@ -106,26 +91,16 @@ pub const ENV_MOD_X: usize = 2;
 pub const ENV_MOD_Y: usize = 3;
 pub const ENV_PITCH: usize = 4;
 
-/// Channel default pan/volume/pitch and filter (event 219, 24 bytes).
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Levels {
-    /// 0..12800, 6400 = center (see `Channel::pan_norm`).
     pub pan: i32,
-    /// 0..12800; 12800 = 100%, 10000 = FL's default (78%).
     pub volume: u32,
-    /// -4800..4800 cents.
     pub pitch_shift: i32,
-    /// Filter cutoff (0..256 typical).
     pub filter_mod_x: u32,
-    /// Filter resonance.
     pub filter_mod_y: u32,
-    /// 0 = FastLP, 1 = LP, 2 = BP, 3 = HP, 4 = BS,
-    /// 5 = LPx2, 6 = SVFLP, 7 = SVFLPx2.
     pub filter_type: u32,
 }
 
-/// One of the (up to two) Tracking events (event 228, 16 bytes).
-/// Index 0 = volume tracking, index 1 = keyboard tracking.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Tracking {
     pub middle_value: u32,
@@ -134,7 +109,6 @@ pub struct Tracking {
     pub mod_y: i32,
 }
 
-/// Level adjustments (event 229, 20 bytes).
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct LevelAdjusts {
     pub pan: i32,
@@ -149,22 +123,22 @@ fn decode_env_lfo(b: &[u8]) -> Option<EnvelopeLfo> {
     }
     Some(EnvelopeLfo {
         flags: i32le(b, 0),
-         env_enabled: i32le(b, 4),
-         env_predelay: i32le(b, 8),
-         env_attack: i32le(b, 12),
-         env_hold: i32le(b, 16),
-         env_decay: i32le(b, 20),
-         env_sustain: i32le(b, 24),
-         env_release: i32le(b, 28),
-         env_amount: i32le(b, 32),
-         lfo_predelay: u32le(b, 36),
-         lfo_attack: u32le(b, 40),
-         lfo_amount: i32le(b, 44),
-         lfo_speed: u32le(b, 48),
-         lfo_shape: i32le(b, 52),
-         env_attack_tension: i32le(b, 56),
-         env_decay_tension: i32le(b, 60),
-         env_release_tension: i32le(b, 64),
+        env_enabled: i32le(b, 4),
+        env_predelay: i32le(b, 8),
+        env_attack: i32le(b, 12),
+        env_hold: i32le(b, 16),
+        env_decay: i32le(b, 20),
+        env_sustain: i32le(b, 24),
+        env_release: i32le(b, 28),
+        env_amount: i32le(b, 32),
+        lfo_predelay: u32le(b, 36),
+        lfo_attack: u32le(b, 40),
+        lfo_amount: i32le(b, 44),
+        lfo_speed: u32le(b, 48),
+        lfo_shape: i32le(b, 52),
+        env_attack_tension: i32le(b, 56),
+        env_decay_tension: i32le(b, 60),
+        env_release_tension: i32le(b, 64),
     })
 }
 
@@ -174,11 +148,11 @@ fn decode_levels(b: &[u8]) -> Option<Levels> {
     }
     Some(Levels {
         pan: i32le(b, 0),
-         volume: u32le(b, 4),
-         pitch_shift: i32le(b, 8),
-         filter_mod_x: u32le(b, 12),
-         filter_mod_y: u32le(b, 16),
-         filter_type: u32le(b, 20),
+        volume: u32le(b, 4),
+        pitch_shift: i32le(b, 8),
+        filter_mod_x: u32le(b, 12),
+        filter_mod_y: u32le(b, 16),
+        filter_type: u32le(b, 20),
     })
 }
 
@@ -188,9 +162,9 @@ fn decode_tracking(b: &[u8]) -> Option<Tracking> {
     }
     Some(Tracking {
         middle_value: u32le(b, 0),
-         pan: i32le(b, 4),
-         mod_x: i32le(b, 8),
-         mod_y: i32le(b, 12),
+        pan: i32le(b, 4),
+        mod_x: i32le(b, 8),
+        mod_y: i32le(b, 12),
     })
 }
 
@@ -200,9 +174,9 @@ fn decode_level_adjusts(b: &[u8]) -> Option<LevelAdjusts> {
     }
     Some(LevelAdjusts {
         pan: i32le(b, 0),
-         volume: u32le(b, 4),
-         mod_x: i32le(b, 12),
-         mod_y: i32le(b, 16),
+        volume: u32le(b, 4),
+        mod_x: i32le(b, 12),
+        mod_y: i32le(b, 16),
     })
 }
 
@@ -257,25 +231,13 @@ pub struct Channel {
     pub sample_path: String,
     pub plugin: Option<Plugin>,
 
-    // ── sound-shaping fields (ported from PyFLP channel.py) ──────────
-    /// `IsEnabled` (event 0).  `None` means the flag was not present in
-    /// the file; treat as enabled.
     pub enabled: Option<bool>,
-    /// Channel default pan/volume/pitch/filter (event 219).
     pub levels: Option<Levels>,
-    /// Up to 5 events (218), in stream order:
-    /// 0 = Panning, 1 = Volume, 2 = Mod X, 3 = Mod Y, 4 = Pitch.
     pub envelopes: Vec<EnvelopeLfo>,
-    /// Up to 2 events (228), in stream order: 0 = volume, 1 = keyboard.
     pub tracking: Vec<Tracking>,
-    /// Level adjustments (event 229).
     pub level_adjusts: Option<LevelAdjusts>,
-    /// `SamplerFlags` (event 143).  Bit 0 = Resample, 1 = LoadRegions,
-    /// 2 = LoadSliceMarkers, 3 = UsesLoopPoints, 8 = KeepOnDisk.
     pub sampler_flags: Option<u32>,
-    /// Sample root key (event 135).  FL's C5 = 60.
     pub root_note: Option<u32>,
-    /// Fine tune in cents (event 142).
     pub fine_tune: Option<i32>,
 }
 
@@ -300,17 +262,11 @@ impl Channel {
         }
     }
 
-    /// Accessor for a specific envelope by slot, if it was present.
     pub fn envelope(&self, slot: usize) -> Option<&EnvelopeLfo> {
         self.envelopes.get(slot)
     }
 
-    /// Normalised pan in -1.0..1.0.  Prefers `Levels`, falls back to
-    /// `LevelAdjusts`, then to 0.0.
     pub fn pan_norm(&self) -> f64 {
-        // `Levels.pan` is stored 0..12800 with 6400 = centre (every sample
-        // channel in the test project reads exactly 6400, which the old
-        // `pan / 12800` turned into +0.5, i.e. everything panned right).
         if let Some(l) = &self.levels {
             return ((l.pan as f64 - 6400.0) / 6400.0).clamp(-1.0, 1.0);
         }
@@ -320,8 +276,6 @@ impl Channel {
         0.0
     }
 
-    /// Linear volume scalar.  `Levels.volume` is 0..12800, 12800 = 100%.
-    /// Prefers `Levels`, falls back to `LevelAdjusts`, then to 1.0.
     pub fn volume_scale(&self) -> f64 {
         if let Some(l) = &self.levels {
             if l.volume == 0 {
@@ -355,13 +309,8 @@ pub struct PlaylistItem {
     #[serde(rename = "ref")]
     pub ref_id: u16,
     pub flags: u16,
-    /// Clip start offset into the source file, in milliseconds.
     pub start_offset_ms: f32,
-    /// Clip end offset into the source file, in milliseconds.
     pub end_offset_ms: f32,
-    /// Pattern clips only: tick inside the pattern where this clip starts
-    /// playing (the clip shows pattern ticks [start, start + length)).
-    /// 0 when untrimmed; the file stores -1 for "no trim".
     pub clip_start_ticks: u32,
     #[serde(skip)]
     pub raw: Vec<u8>,
@@ -391,11 +340,20 @@ pub struct Project {
     pub samples: Vec<String>,
     #[serde(skip)]
     pub events: Vec<(u8, Vec<u8>)>,
+    /// Non-fatal issues encountered while parsing (e.g. a truncated
+    /// final event).  Callers may surface these in `check` output.
+    #[serde(default)]
+    pub parse_warnings: Vec<String>,
 }
 
 // ── event stream ───────────────────────────────────────────────────────
 
-fn read_events(data: &[u8]) -> Result<(u16, Vec<(u8, Vec<u8>)>)> {
+/// Read the FLP event stream.
+///
+/// Returns `(ppq, events, warnings)`.  A truncated event at the end of
+/// the file is not fatal — the parser stops cleanly and records a
+/// warning.  Missing `FLhd` / `FLdt` headers are still errors.
+fn read_events(data: &[u8]) -> Result<(u16, Vec<(u8, Vec<u8>)>, Vec<String>)> {
     if data.len() < 14 || &data[0..4] != b"FLhd" {
         bail!("not an FL Studio project (missing FLhd)");
     }
@@ -407,14 +365,18 @@ fn read_events(data: &[u8]) -> Result<(u16, Vec<(u8, Vec<u8>)>)> {
         bail!("missing FLdt data chunk");
     }
     let length =
-    u32::from_le_bytes([data[p + 4], data[p + 5], data[p + 6], data[p + 7]]) as usize;
+        u32::from_le_bytes([data[p + 4], data[p + 5], data[p + 6], data[p + 7]]) as usize;
     p += 8;
     let end = (p + length).min(data.len());
 
     let mut events = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+
     while p < end {
+        let ev_off = p;
         let ev = data[p];
         p += 1;
+
         let size = if ev < 64 {
             1
         } else if ev < 128 {
@@ -422,11 +384,16 @@ fn read_events(data: &[u8]) -> Result<(u16, Vec<(u8, Vec<u8>)>)> {
         } else if ev < 192 {
             4
         } else {
+            // 7-bit varint length.
             let mut size: usize = 0;
             let mut shift: u32 = 0;
             loop {
-                if p >= data.len() {
-                    bail!("truncated event length");
+                if p >= end {
+                    warnings.push(format!(
+                        "truncated varint length for event {:#04x} at offset {:#x}; stopping parse",
+                        ev, ev_off
+                    ));
+                    return Ok((ppq, events, warnings));
                 }
                 let b = data[p];
                 p += 1;
@@ -436,18 +403,27 @@ fn read_events(data: &[u8]) -> Result<(u16, Vec<(u8, Vec<u8>)>)> {
                     break;
                 }
                 if shift > 28 {
-                    bail!("event length overflow");
+                    bail!("event length overflow at offset {:#x}", ev_off);
                 }
             }
             size
         };
-        if p + size > data.len() {
-            bail!("truncated event body");
+
+        if p + size > end {
+            // Truncated final event — accept the partial parse.
+            let have = end.saturating_sub(p);
+            warnings.push(format!(
+                "truncated event {:#04x} at offset {:#x}: needs {} byte(s), {} available; stopping parse",
+                ev, ev_off, size, have
+            ));
+            return Ok((ppq, events, warnings));
         }
+
         events.push((ev, data[p..p + size].to_vec()));
         p += size;
     }
-    Ok((ppq, events))
+
+    Ok((ppq, events, warnings))
 }
 
 // ── text decoding ──────────────────────────────────────────────────────
@@ -469,9 +445,9 @@ fn text(ev: u8, raw: &[u8]) -> String {
         end += 2;
     }
     let units: Vec<u16> = (0..end)
-    .step_by(2)
-    .map(|i| u16::from_le_bytes([raw[i], raw[i + 1]]))
-    .collect();
+        .step_by(2)
+        .map(|i| u16::from_le_bytes([raw[i], raw[i + 1]]))
+        .collect();
     String::from_utf16_lossy(&units)
 }
 
@@ -585,8 +561,6 @@ fn decode_playlist(raw: &[u8], major: Option<u32>) -> Vec<PlaylistItem> {
         let rv = u16::from_le_bytes([rec[12], rec[13]]);
         let flags = u16::from_le_bytes([rec[18], rec[19]]);
 
-        // Real entries always carry pattern_base == 20480 (0x5000).
-        // Anything else — fillers (0) and misaligned reads — skip.
         if base != 0x5000 {
             i += size;
             continue;
@@ -608,8 +582,7 @@ fn decode_playlist(raw: &[u8], major: Option<u32>) -> Vec<PlaylistItem> {
         } else {
             ("channel".to_string(), idx)
         };
-        // For pattern clips bytes 24..28 are an integer tick offset into the
-        // pattern (not an f32 as for audio clips); 0xFFFFFFFF (-1) = no trim.
+
         let clip_start_ticks = if kind == "pattern" && size >= 28 {
             let s = i32::from_le_bytes([rec[24], rec[25], rec[26], rec[27]]);
             if s > 0 {
@@ -620,6 +593,7 @@ fn decode_playlist(raw: &[u8], major: Option<u32>) -> Vec<PlaylistItem> {
         } else {
             0
         };
+
         items.push(PlaylistItem {
             position: pos,
             length,
@@ -655,9 +629,11 @@ impl PluginRef {
 }
 
 pub fn parse(data: &[u8]) -> Result<Project> {
-    let (ppq, events) = read_events(data)?;
+    let (ppq, events, parse_warnings) = read_events(data)?;
+
     let mut prj = Project {
         ppq,
+        parse_warnings,
         ..Default::default()
     };
 
@@ -699,7 +675,7 @@ pub fn parse(data: &[u8]) -> Result<Project> {
             EV_COLOR if raw.len() == 4 && pat_idx.is_none() => {
                 if let Some(i) = chan_idx {
                     prj.channels[i].color =
-                    Some(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]));
+                        Some(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]));
                 }
             }
             EV_TEXT_CHAN_NAME => {
@@ -787,7 +763,7 @@ pub fn parse(data: &[u8]) -> Result<Project> {
                     let ins = prj.inserts.entry(owner).or_insert_with(|| Insert {
                         index: owner,
                         name: String::new(),
-                                                                      plugins: Vec::new(),
+                        plugins: Vec::new(),
                     });
                     ins.plugins.push(blank);
                     let j = ins.plugins.len() - 1;
@@ -808,8 +784,6 @@ pub fn parse(data: &[u8]) -> Result<Project> {
                     if let Some(p) = pr.get_mut(&mut prj) {
                         p.display_name = s.clone();
                     }
-                }
-                if let Some(pr) = plug_ref {
                     if let PluginRef::Channel(i) = pr {
                         if prj.channels[i].name.is_empty() {
                             prj.channels[i].name = s;
@@ -832,15 +806,10 @@ pub fn parse(data: &[u8]) -> Result<Project> {
 
             EV_NEW_PAT if raw.len() == 2 => {
                 let iid = u16::from_le_bytes([raw[0], raw[1]]);
-                // FL emits NewPattern twice per pattern and can fire several
-                // of them in a row before any Notes events arrive.  Reusing
-                // the existing entry here misroutes notes to the wrong
-                // pattern.  Keep both entries; the converter merges by
-                // preferring the one with more notes.
                 prj.patterns.push(Pattern {
                     iid,
                     name: String::new(),
-                                  notes: Vec::new(),
+                    notes: Vec::new(),
                 });
                 pat_idx = Some(prj.patterns.len() - 1);
                 chan_idx = None;

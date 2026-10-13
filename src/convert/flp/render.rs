@@ -1,22 +1,14 @@
 // src/convert/flp/render.rs
-//! Part rendering: notes in a measure → Trackscript `@beats/subs[...]`
-//! block, one part per channel per measure, with dedup across identical
-//! renders.
+//! Part rendering: notes in a measure → Trackscript `<...>` events,
+//! combined into one section per measure by the caller.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
-use crate::convert::{fmt, identifier, note_name, pos_str};
+use crate::convert::{fmt, note_name, pos_str};
 use crate::sources::flp::Channel;
 
 use super::place::Placed;
 use super::{MAX_FULL_BEATS, PLAY_FULL_SAMPLE};
-
-pub(super) struct Part {
-    pub(super) name: String,
-    pub(super) iid: u16,
-    pub(super) rendered: String,
-    pub(super) kind: &'static str,
-}
 
 pub(super) struct EmbeddedSample {
     pub(super) wav: Vec<u8>,
@@ -64,13 +56,6 @@ fn pan_norm(p: u8) -> f64 {
 
 /// The sample's native tempo for an audio clip that FL has time-stretched,
 /// or `None` if the clip plays at its natural speed.
-///
-/// FL stores the part of the file a clip shows (`start..end`, in ms) and
-/// the clip's own length on the playlist.  If the window is not as long as
-/// the clip, the audio was stretched: `speed = window / clip` is how many
-/// source seconds play per output second.  The sample's own tempo is then
-/// `project bpm / speed`; Trackscript writes that as `|bpm` and the player
-/// stretches to the song tempo.
 fn source_bpm(p: &Placed, ppq: u32, style: &NoteStyle) -> Option<f64> {
     let start_ms = p.clip_offset_ms? as f64;
     let ticks = p.note.length;
@@ -79,17 +64,13 @@ fn source_bpm(p: &Placed, ppq: u32, style: &NoteStyle) -> Option<f64> {
     }
     let clip_ms = ticks as f64 / ppq as f64 * 60_000.0 / style.bpm;
 
-    // `end < 0` means "untrimmed": the window runs to the end of the file.
     let end_ms = match p.clip_end_ms {
         Some(e) if e >= 0.0 => e as f64,
         _ => style.full_secs? * 1000.0,
     };
 
     let speed = (end_ms - start_ms) / clip_ms;
-    // One tick of rounding in the clip length is not a stretch.
     let tolerance = (1.0 / ticks as f64).max(0.005);
-    // Ratios far outside normal stretching mean the end offset is not a
-    // window (e.g. a one-shot trimmed by length); do not stretch those.
     if (0.25..=4.0).contains(&speed) && (speed - 1.0).abs() > tolerance {
         Some(style.bpm / speed)
     } else {
@@ -97,7 +78,7 @@ fn source_bpm(p: &Placed, ppq: u32, style: &NoteStyle) -> Option<f64> {
     }
 }
 
-fn render_part(
+pub(super) fn render_part(
     notes: &[&Placed],
     measure_start: u32,
     subs: u32,
@@ -122,9 +103,6 @@ fn render_part(
             let key = n.key as i32 + style.transpose;
             let mut dur_beats = (n.length as f64 / ppq as f64).max(0.05);
 
-            // NOTE: this branch only runs when PLAY_FULL_SAMPLE is false
-            // (the `false` in the pattern), and never for audio clips
-            // (`clip_offset_ms` must be None).  Left as it was.
             if let (false, Some(secs), None) =
                 (PLAY_FULL_SAMPLE, style.full_secs, p.clip_offset_ms)
             {
@@ -139,7 +117,6 @@ fn render_part(
                 format!("~{}", fmt(dur_beats, 2)),
             ];
 
-            // Audio clips carry their own gain, which can exceed unity.
             let (gain, vol_max) = if p.clip_offset_ms.is_some() {
                 (p.clip_gain as f64, 400.0)
             } else {
@@ -165,7 +142,6 @@ fn render_part(
                 }
             }
 
-            // Time-stretched audio clip: declare the sample's own tempo.
             if let Some(bpm) = source_bpm(p, ppq, &style) {
                 fields.push(format!("|{}", fmt(bpm, 2)));
             }
@@ -174,49 +150,11 @@ fn render_part(
         }
     }
 
-    pieces.join(",\n")
+    pieces.join(",")
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn emit_part(
-    seen: &mut HashMap<(u16, String), usize>,
-    parts: &mut Vec<Part>,
-    part_name_used: &mut HashMap<String, u32>,
-    chan: &Channel,
-    notes: &[&Placed],
-    m_start: u32,
-    subs: u32,
-    ppq: u32,
-    kind: &'static str,
-    style: NoteStyle,
-    source_path: &str,
-) -> usize {
-    let rendered = render_part(notes, m_start, subs, ppq, style, source_path);
-    let key = (chan.iid, rendered.clone());
-    if let Some(&idx) = seen.get(&key) {
-        return idx;
-    }
-    let base_raw = if chan.name.is_empty() {
-        format!("Ch{:02}", chan.iid)
-    } else {
-        chan.name.clone()
-    };
-    let base = identifier(&base_raw);
-    let count_ref = part_name_used.entry(base.clone()).or_insert(0);
-    *count_ref += 1;
-    let count = *count_ref;
-    let name = if count == 1 {
-        base
-    } else {
-        format!("{}{:02}", base, count)
-    };
-    let idx = parts.len();
-    seen.insert(key, idx);
-    parts.push(Part {
-        name,
-        iid: chan.iid,
-        rendered,
-        kind,
-    });
-    idx
-}
+// `Channel` is imported for the type in the signature of the
+// `render_part` caller, but is otherwise unused inside this module.
+// Silence the warning if nothing here mentions it.
+#[allow(dead_code)]
+fn _assert_channel_in_scope(_: &Channel) {}

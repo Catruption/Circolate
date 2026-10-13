@@ -1,5 +1,5 @@
 //! All rendering.  The main `draw` splits the frame into header /
-//! tracker / footer and dispatches to the individual painters.
+//! tracker and dispatches to the individual painters.
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -9,18 +9,19 @@ use ratatui::{
     Frame,
 };
 
-use crate::player::{Project, Transport};
-use crate::sources::trackscript::C5_HZ;
 use crate::tui::cover::{Cover, COVER_DIM};
 use crate::tui::envelope::{
     synth_envelope_live, synth_envelope_static, whole_sample_envelope, wrapped_pos,
 };
 use crate::tui::mute;
 use crate::tui::notes::{fmt_note, split_notes, value_at, ColumnLine, DisplayNote};
+use crate::tui::queue;
 use crate::tui::scope::scope_snapshot;
 use crate::tui::spiral::{build_spiral, SpiralLayout, SpiralState, SPIRAL_MAX_H};
 use crate::tui::style::{braille_char, dot_bit, note_style, NoteState};
 use crate::tui::{theme, RenderState, TrackerColumnHit, TrackerHit};
+use crate::player::{Project, Transport};
+use crate::sources::trackscript::C5_HZ;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -45,10 +46,8 @@ pub fn draw(
     let area = f.area();
 
     // Poll the reload counter.  When it ticks past the last value we
-    // saw, start a flash timer.  The footer shows "reloaded" for
-    // RELOAD_FLASH_MS after each successful reload.  All feedback
-    // flows through this path — nothing writes to stderr during
-    // playback, because stderr writes scramble the raw-mode terminal.
+    // saw, start the flash timer (RELOAD_FLASH_MS).  Nothing displays
+    // the flash since the footer went away.
     let rc = tp.reload_count.load(Ordering::Relaxed);
     if rc > state.player.last_reload_count {
         state.player.last_reload_count = rc;
@@ -56,6 +55,7 @@ pub fn draw(
             Some(Instant::now() + Duration::from_millis(RELOAD_FLASH_MS));
     }
 
+    // ── Cover image ──────────────────────────────────────────────────
     let cover_dims = (area.width as usize, area.height as usize);
     if state.cover_source.as_deref() != project.cover_path() || state.cover_dims != cover_dims {
         state.cover = project
@@ -66,25 +66,26 @@ pub fn draw(
     }
 
     let total_measures = project.line_count();
-    let available_footer_h = (area.height as usize).saturating_sub(3 + 6).max(3);
-    let max_grid_h = available_footer_h.min(SPIRAL_MAX_H);
-    let spiral_layout = build_spiral(total_measures, max_grid_h);
-    let footer_h = spiral_layout.grid_h.max(3);
+    // The spiral now lives inside the queue box (bottom-right of the
+    // tracker), so its height is capped by the box.
+    let spiral_layout = build_spiral(total_measures, queue::VISIBLE_LINES.min(SPIRAL_MAX_H));
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(6),
-            Constraint::Length(footer_h),
-        ])
+        .constraints([Constraint::Length(3), Constraint::Min(6)])
         .split(area);
 
-    draw_header(f, chunks[0], project, tp, sample_rate);
-    draw_tracker(f, chunks[1], tp, project, state);
-    draw_footer(f, chunks[2], tp, project, sample_rate, state, spiral_layout);
+        draw_header(f, chunks[0], project, tp, sample_rate, state.loading.as_deref());
+    if area.height as f32 * 2.0 > area.width as f32 {
+        crate::tui::draw_vertical::draw_tracker_vertical(
+            f, chunks[1], tp, project, state,
+        );
+    } else {
+        draw_tracker(f, chunks[1], tp, project, state);
+    }
 
-    // ── Mosaic background pass ──────────────────────────────────────
+
+        // ── Mosaic background pass ──────────────────────────────────────
     if let Some(cover) = &state.cover {
         let buf = f.buffer_mut();
         let w = buf.area.width;
@@ -101,6 +102,32 @@ pub fn draw(
         }
     }
 
+    // ── Queue box + spiral ──────────────────────────────────────────
+    // Notched into the tracker's bottom-right corner: the box carves its
+    // own space out of the tracker frame and hosts the spiral.  Runs
+    // after the mosaic pass because it paints its own background.
+    let spd = tp.speed.load(Ordering::Relaxed);
+    state.queue.direction = match spd.signum() {
+        1 => '▶',
+        -1 => '◀',
+        _ => '■',
+    };
+    state.queue.speed_label = format!("{}x", spd.abs().max(1));
+
+    let spiral_size = (spiral_layout.grid_w.max(1), spiral_layout.grid_h);
+    let placed = queue::render(
+        &state.queue,
+        chunks[1],
+        f.buffer_mut(),
+        &queue::Theme::default(),
+        spiral_size,
+    );
+    state.queue_placed = placed;
+    match placed {
+        Some(p) => draw_spiral(f, p.spiral, tp, project, state, spiral_layout),
+        None => state.spiral = None,
+    }
+
     // ── Help overlay ────────────────────────────────────────────────
     if state.player.show_help {
         draw_help(f, area);
@@ -113,6 +140,7 @@ fn draw_header(
     p: &Project,
     tp: &Transport,
     sr: u32,
+    loading: Option<&str>,
 ) {
     let (num, den) = p.time_signature;
     let pos = tp.position.load(Ordering::Relaxed).max(0) as f64;
@@ -124,9 +152,10 @@ fn draw_header(
         s if s > 0 => format!("▶{}x", s),
         s => format!("◀{}x", -s),
     };
+    let title = loading.unwrap_or(&p.title);
     let line = Line::from(vec![
-        Span::styled(" ♪ ", Style::default().fg(Color::Cyan)),
-        Span::styled(p.title.clone(), Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(" 🎵 ", Style::default().fg(Color::Cyan)),
+        Span::styled(title.to_string(), Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(format!(
             "    {} BPM    {}/{}    {} voices    {} lines    {}  {:>5.1}s / {:.1}s",
             p.initial_bpm.round() as i64,
@@ -163,34 +192,51 @@ fn draw_tracker(
 
     let rpmeasure = p.rows_per_measure();
     let lookback = LOOKBACK_LINES.min(li);
-    let current_line_parts = p.line_parts(li);
 
-    let mut by_path: HashMap<String, Vec<(String, f64)>> = HashMap::new();
+    // Sources for this column, keyed by sample path.  The value is a
+    // list of (part name, offset_rows, measure_start, measure_len):
+    //   * `offset_rows` is how far the selected measure's start is from
+    //     the current line's start.  0 for the current line's calls;
+    //     k*rpmeasure for sources carried back k lines.
+    //   * `measure_start` / `measure_len` locate the selected measure
+    //     inside the part's multi-section timeline.  Events outside
+    //     that range belong to other sections and must not render here.
+    let mut by_path: HashMap<String, Vec<(String, f64, f64, f64)>> = HashMap::new();
     let mut discovery: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
-    for name in current_line_parts {
-        let Some(path) = p.part_path(name) else { continue };
+    for call in p.line_calls(li) {
+        let Some(path) = p.part_path(&call.name) else { continue };
         let key = path.to_string();
         if seen.insert(key.clone()) {
             discovery.push(key.clone());
         }
-        by_path.entry(key).or_default().push((name.clone(), 0.0));
+        by_path.entry(key).or_default().push((
+            call.name.clone(),
+            0.0,
+            call.pattern_measure_start,
+            call.pattern_measure_len,
+        ));
     }
 
     for k in 1..=lookback {
         let prev_li = li - k;
         let offset_rows = k as f64 * rpmeasure;
-        for name in p.line_parts(prev_li) {
-            let Some(path) = p.part_path(name) else { continue };
-            let subs = p.part_subs_per_beat(name);
+        for call in p.line_calls(prev_li) {
+            let Some(path) = p.part_path(&call.name) else { continue };
+            let subs = p.part_subs_per_beat(&call.name);
+            let measure_end = call.pattern_measure_start + call.pattern_measure_len;
             let still_on = split_notes(
-                p.part_events(name),
+                p.part_events(&call.name),
                 subs,
-                p.part_sample_offset_u32(name),
+                p.part_sample_offset_u32(&call.name),
             )
             .iter()
-            .any(|n| n.end_row > offset_rows);
+            .any(|n| {
+                n.start_row >= call.pattern_measure_start
+                    && n.start_row < measure_end
+                    && (n.end_row - call.pattern_measure_start) > offset_rows
+            });
             if !still_on {
                 continue;
             }
@@ -198,7 +244,12 @@ fn draw_tracker(
             if seen.insert(key.clone()) {
                 discovery.push(key.clone());
             }
-            by_path.entry(key).or_default().push((name.clone(), offset_rows));
+            by_path.entry(key).or_default().push((
+                call.name.clone(),
+                offset_rows,
+                call.pattern_measure_start,
+                call.pattern_measure_len,
+            ));
         }
     }
 
@@ -251,7 +302,7 @@ fn draw_tracker(
 
     let header_names: Vec<Option<String>> = path_order
         .iter()
-        .map(|path| by_path[path].first().map(|(n, _)| n.clone()))
+        .map(|path| by_path[path].first().map(|(n, _, _, _)| n.clone()))
         .collect();
 
     let (muted_parts, soloed_parts, muted_notes) = mute::snapshot();
@@ -266,16 +317,35 @@ fn draw_tracker(
         let mut notes: Vec<DisplayNote> = Vec::new();
         let mut block_line_for_note: Vec<usize> = Vec::new();
 
-        for (name, offset_rows) in sources {
+        for (name, offset_rows, measure_start, measure_len) in sources {
             let subs = p.part_subs_per_beat(name);
             let is_current = *offset_rows == 0.0;
             let offset_lines = (offset_rows / rpmeasure).round() as usize;
             let note_block_line = li.saturating_sub(offset_lines);
-            for note in split_notes(
+            let measure_end = measure_start + measure_len;
+
+            for mut note in split_notes(
                 p.part_events(name),
                 subs,
                 p.part_sample_offset_u32(name),
             ) {
+                // Only notes that START in the selected measure.  A note
+                // whose start falls in another section belongs to that
+                // section's call, not this one.
+                if note.start_row < *measure_start || note.start_row >= measure_end {
+                    continue;
+                }
+
+                // Rebase everything to measure-local coordinates so the
+                // rest of the renderer (which assumes a single measure)
+                // works unchanged.
+                let ms = *measure_start;
+                note.start_row -= ms;
+                note.end_row -= ms;
+                for pt in &mut note.pitch_points { pt.row -= ms; }
+                for pt in &mut note.vol_points   { pt.row -= ms; }
+                for pt in &mut note.pan_points   { pt.row -= ms; }
+
                 let active = note.end_row > *offset_rows;
                 let has_vol_waypoints = note.vol_points.len() > 1;
                 let dur_beats = note.dur_beats.unwrap_or(1.0);
@@ -351,7 +421,7 @@ fn draw_tracker(
     let mut envelopes: Vec<Vec<(f32, f32)>> = Vec::with_capacity(visible_cols);
     for col in 0..visible_cols {
         let path = &path_order[col];
-        let Some((name, _)) = by_path[path].first() else {
+        let Some((name, _, _, _)) = by_path[path].first() else {
             envelopes.push(vec![(0.0, 0.0); pixel_rows]);
             continue;
         };
@@ -398,7 +468,7 @@ fn draw_tracker(
     let mut playhead_pys: Vec<Option<usize>> = Vec::with_capacity(visible_cols);
     for col in 0..visible_cols {
         let path = &path_order[col];
-        let Some((name, _)) = by_path[path].first() else {
+        let Some((name, _, _, _)) = by_path[path].first() else {
             playhead_pys.push(None);
             continue;
         };
@@ -477,7 +547,7 @@ fn draw_tracker(
         let path = &path_order[col];
         let label = by_path[path]
             .first()
-            .map(|(n, _)| n.clone())
+            .map(|(n, _, _, _)| n.clone())
             .unwrap_or_else(|| "(?)".to_string());
         let mut l = label;
         if l.len() >= col_w {
@@ -660,169 +730,6 @@ fn draw_tracker(
     });
 }
 
-// ── footer ─────────────────────────────────────────────────────────────
-
-fn draw_footer(
-    f: &mut Frame<'_>,
-    area: Rect,
-    tp: &Transport,
-    p: &Project,
-    _sr: u32,
-    state: &mut RenderState,
-    spiral_layout: SpiralLayout,
-) {
-    let spiral_w = spiral_layout.grid_w.max(1);
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Min(16),
-            Constraint::Length(22),
-            Constraint::Length(spiral_w),
-        ])
-        .split(area);
-
-    draw_footer_info(f, chunks[0], tp, p, state);
-    draw_footer_transport(f, chunks[1], tp);
-    draw_spiral(f, chunks[2], tp, p, state, spiral_layout);
-}
-
-fn draw_footer_info(
-    f: &mut Frame<'_>,
-    area: Rect,
-    tp: &Transport,
-    p: &Project,
-    state: &RenderState,
-) {
-    let pos = tp.position.load(Ordering::Relaxed);
-    let active = tp.active_voices.load(Ordering::Relaxed);
-    let done = tp.done.load(Ordering::Relaxed);
-    let speed = tp.speed.load(Ordering::Relaxed);
-    let reload_flashing = state
-        .player
-        .reload_flash_until
-        .map_or(false, |t| t > Instant::now());
-
-    let (state_str, state_col) = if done {
-        ("finished", Color::DarkGray)
-    } else if speed == 0 {
-        ("stopped", Color::DarkGray)
-    } else if speed > 0 {
-        ("forward", Color::Green)
-    } else {
-        ("reverse", Color::Cyan)
-    };
-    let now_line = p
-        .current_line(pos)
-        .map(|i| format!("{}", i + 1))
-        .unwrap_or_else(|| "—".into());
-
-    let loop_status = if state.player.loop_enabled {
-        if state.player.loop_measures.is_empty() {
-            "loop  on (empty)"
-        } else {
-            "loop  on"
-        }
-    } else {
-        "loop  off"
-    };
-
-    let mode_style = if state.player.verb_mode {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-
-    let mut text = vec![
-        Line::from(vec![
-            Span::styled("state  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(state_str, Style::default().fg(state_col)),
-        ]),
-        Line::from(format!("line   {} / {}", now_line, p.line_count())),
-        Line::from(format!("voices {}", active)),
-        Line::from(Span::styled(loop_status, Style::default().fg(Color::DarkGray))),
-        Line::from(Span::styled(
-            if state.player.verb_mode {
-                "mode   MUTE"
-            } else {
-                "mode   normal"
-            },
-            mode_style,
-        )),
-    ];
-
-    if reload_flashing {
-        text.push(Line::from(Span::styled(
-            "reloaded",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        )));
-    }
-
-    text.extend([
-        Line::from(""),
-        Line::from(Span::styled(
-            "←→ play · L loop",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(Span::styled(
-            "[ ] block · h l col",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(Span::styled(
-            "v mute-mode · m mute · s solo",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(Span::styled(
-            "? help · q quit",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ]);
-
-    f.render_widget(Paragraph::new(text), area);
-}
-
-fn draw_footer_transport(f: &mut Frame<'_>, area: Rect, tp: &Transport) {
-    let speed = tp.speed.load(Ordering::Relaxed);
-
-    let rev_active = speed < 0;
-    let rev_label = if rev_active {
-        format!("■ stop   {}x", -speed)
-    } else {
-        "◀  rewind".to_string()
-    };
-    let rev_style = if rev_active {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Gray)
-    };
-
-    let fwd_active = speed > 0;
-    let fwd_label = if fwd_active {
-        format!("■ stop   {}x", speed)
-    } else {
-        "▶  play".to_string()
-    };
-    let fwd_style = if fwd_active {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Green)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Gray)
-    };
-
-    let text = vec![
-        Line::from(Span::styled(rev_label, rev_style)),
-        Line::from(Span::styled(fwd_label, fwd_style)),
-    ];
-    f.render_widget(Paragraph::new(text), area);
-}
-
 fn spiral_dirs(layout: &SpiralLayout, gx: usize, gy: usize) -> theme::PathDirs {
     let gw = layout.grid_w as usize;
     let gh = layout.grid_h as usize;
@@ -840,12 +747,21 @@ fn spiral_dirs(layout: &SpiralLayout, gx: usize, gy: usize) -> theme::PathDirs {
             .map(|n| (n as i64 - m).abs() == step)
             .unwrap_or(false)
     };
-    theme::PathDirs {
+    let mut dirs = theme::PathDirs {
         left: gx > 0 && check(gx - 1, gy),
         right: gx + 1 < gw && check(gx + 1, gy),
         up: gy > 0 && check(gx, gy - 1),
         down: gy + 1 < gh && check(gx, gy + 1),
+    };
+
+    // Innermost cell of the spiral: close it into a corner so the
+    // centre reads as a curl rather than an open line.  The phantom
+    // edge is a render-time decision — see `SpiralLayout::is_center`.
+    if layout.is_center(gx, gy) && !dirs.down {
+        dirs.down = true;
     }
+
+    dirs
 }
 
 fn draw_spiral(
@@ -941,6 +857,8 @@ fn draw_help(f: &mut Frame<'_>, area: Rect) {
     lines.push(row("c", "clear all mutes and solos"));
     lines.push(row("L", "toggle loop playback"));
     lines.push(row("v", "toggle mute mode (clicks = right-click)"));
+    lines.push(row("click queue", "type · enter plays · esc leaves"));
+    lines.push(row("pgup / pgdn", "loop count (or click [n])"));
     lines.push(row("?", "toggle this help"));
     lines.push(row("q / esc", "quit"));
     lines.push(Line::from(Span::styled("", desc)));

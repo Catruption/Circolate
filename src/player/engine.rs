@@ -10,7 +10,7 @@ use crate::timing::AutomationLane;
 use crate::tui::mute;
 use crate::vst_host_ffi::VstHost;
 
-use super::project::{Project, Sample};
+use super::project::{Project, Sample, Sf2VoiceEnvelope};
 
 // ── scheduled sample voice ─────────────────────────────────────────────
 
@@ -34,6 +34,10 @@ pub(crate) struct Scheduled {
     /// the voice was placed on) these form the key the UI toggles.
     pub(crate) part_path: String,
     pub(crate) source_row: f64,
+    /// SF2 volume envelope for this voice.  `None` for voices that play
+    /// at constant gain (WAV samples, embedded audio, WAV-based multi
+    /// samples).
+    pub(crate) env: Option<Sf2VoiceEnvelope>,
 }
 
 impl Scheduled {
@@ -194,11 +198,71 @@ fn interpolate(smp: &Sample, pos: f64, step: f64, raw_pos: f64) -> (f32, f32) {
     (l as f32, r as f32)
 }
 
+// ── envelope phase boundaries ──────────────────────────────────────────
+
+/// Pre-computed envelope phase boundaries for one active SF2 voice.
+/// All times are in seconds from the voice's scheduled start.
+struct EnvState {
+    attack_end: f64,
+    hold_end: f64,
+    decay_end: f64,
+    /// When the release phase begins (seconds from start).
+    release_start: f64,
+    /// When the voice is fully silent (seconds from start).
+    release_end: f64,
+    /// Peak amplitude (from attenuation + velocity).
+    peak: f32,
+    /// Sustain level as an absolute amplitude (peak * fraction).
+    sustain: f32,
+    attack_inv: f32,
+    decay_inv: f32,
+    release_inv: f32,
+    /// Absolute sample position of note-on, for `t = (f - start) / sr`.
+    start_sample: i64,
+}
+
+#[inline]
+fn env_level_at(state: &EnvState, t_sec: f64) -> f32 {
+    if t_sec < 0.0 {
+        return 0.0;
+    }
+    if t_sec >= state.release_end {
+        return 0.0;
+    }
+    if t_sec >= state.release_start {
+        // Release: ramp from the level at release_start down to zero.
+        let at_release = env_sustain_level(state, state.release_start);
+        let ft = ((t_sec - state.release_start) * state.release_inv as f64)
+            .clamp(0.0, 1.0) as f32;
+        return at_release * (1.0 - ft);
+    }
+    env_sustain_level(state, t_sec)
+}
+
+#[inline]
+fn env_sustain_level(state: &EnvState, t_sec: f64) -> f32 {
+    if t_sec < state.attack_end {
+        if state.attack_end <= 0.0 {
+            return state.peak;
+        }
+        return (t_sec * state.attack_inv as f64) as f32 * state.peak;
+    }
+    if t_sec < state.hold_end {
+        return state.peak;
+    }
+    if t_sec < state.decay_end {
+        let f = ((t_sec - state.hold_end) * state.decay_inv as f64).clamp(0.0, 1.0) as f32;
+        return state.peak - (state.peak - state.sustain) * f;
+    }
+    state.sustain
+}
+
 // ── engine ─────────────────────────────────────────────────────────────
 
 struct Active {
     v: Scheduled,
     raw_pos: f64,
+    env_state: Option<EnvState>,
 }
 
 pub(crate) enum Msg {
@@ -209,6 +273,13 @@ pub(crate) enum Msg {
 const VST_BLOCK: i64 = 512;
 
 const VST_HISTORY_SECS: f64 = 10.0;
+
+/// How long the "hold last sample value" tail lasts for one-shot SF2
+/// voices.  Bounded so DC can't accumulate: a fixed output of a
+/// non-zero sample feeds any downstream feedback effect, and the
+/// master reverb would grow without bound.  20 ms is long enough to
+/// smooth a click, short enough to be inaudible as DC.
+const HOLD_TAIL_SECS: f64 = 0.020;
 
 pub(crate) struct Engine {
     sr: f64,
@@ -318,19 +389,67 @@ impl Engine {
         match &v.pitch_lane {
             None => {
                 v.offset
-                + (to - v.start) as f64
-                * (v.sample.rate * (v.pitch_hz / C5_HZ) / self.sr)
+                    + (to - v.start) as f64
+                        * (v.sample.rate * (v.pitch_hz / C5_HZ) / self.sr)
             }
             Some(lane) => {
                 let mut p = v.offset;
                 for f in v.start..to {
                     p += v.sample.rate
-                    * (lane.value_at(f as f64 / self.sr) / C5_HZ)
-                    / self.sr;
+                        * (lane.value_at(f as f64 / self.sr) / C5_HZ)
+                        / self.sr;
                 }
                 p
             }
         }
+    }
+
+    fn env_state_for(&self, v: &Scheduled) -> Option<EnvState> {
+        let env = v.env?;
+        let sr = self.sr;
+        let note_dur_sec = ((v.end - v.start) as f64 / sr).max(0.0);
+
+        let attack_end = env.attack_sec as f64;
+        let hold_end = attack_end + env.hold_sec as f64;
+        let decay_end = hold_end + env.decay_sec as f64;
+
+        // Release occupies the last `release_sec` seconds of the note,
+        // capped at half the note so short hits still have a body.
+        let release_sec = (env.release_sec as f64).min(note_dur_sec * 0.5);
+        let release_start = (note_dur_sec - release_sec).max(0.0);
+
+        let attack_inv = if env.attack_sec > 0.0 {
+            1.0 / env.attack_sec
+        } else {
+            0.0
+        };
+        let decay_inv = if env.decay_sec > 0.0 {
+            1.0 / env.decay_sec
+        } else {
+            0.0
+        };
+        let release_inv = if release_sec > 0.0 {
+            (1.0 / release_sec) as f32
+        } else {
+            0.0
+        };
+
+        let peak = env.peak.clamp(0.0, 1.0);
+        let sustain = peak * env.sustain_fraction.clamp(0.0, 1.0);
+
+        Some(EnvState {
+            attack_end,
+            hold_end,
+            decay_end,
+            release_start,
+            release_end: note_dur_sec,
+            peak,
+            sustain,
+            attack_inv,
+            decay_inv,
+            release_inv,
+            start_sample: v.start,
+        })
     }
 
     pub(crate) fn ingest(&mut self, mut voices: Vec<Scheduled>) {
@@ -352,7 +471,8 @@ impl Engine {
                     continue;
                 }
                 let raw_pos = self.raw_pos_at(&v, self.pos);
-                self.active.push(Active { v, raw_pos });
+                let env_state = self.env_state_for(&v);
+                self.active.push(Active { v, raw_pos, env_state });
             } else {
                 future.push(v);
             }
@@ -497,7 +617,8 @@ impl Engine {
                     continue;
                 }
                 let raw_pos = v.offset;
-                self.active.push(Active { v, raw_pos });
+                let env_state = self.env_state_for(&v);
+                self.active.push(Active { v, raw_pos, env_state });
             }
         } else {
             let mut i = 0;
@@ -514,7 +635,10 @@ impl Engine {
                     let step = v.sample.rate * (v.pitch_hz / C5_HZ) / sr;
                     let note_len = (v.end - v.start).max(0) as f64;
                     let raw_pos = v.offset + (note_len - 1.0).max(0.0) * step;
-                    self.active.push(Active { v, raw_pos });
+                    // No envelope in reverse: keep the pre-existing
+                    // const-gain behavior so reversing doesn't
+                    // produce a ghost envelope tail.
+                    self.active.push(Active { v, raw_pos, env_state: None });
                 } else {
                     i += 1;
                 }
@@ -539,7 +663,7 @@ impl Engine {
             let const_step = smp.rate * (v.pitch_hz / C5_HZ) / sr;
             let loop_f = match smp.loop_pts {
                 Some((s, e)) if e > s => Some((s as f64, e as f64)),
-                               _ => None,
+                _ => None,
             };
             let automated_gain = v.vol_lane.is_some() || v.pan_lane.is_some();
 
@@ -566,7 +690,7 @@ impl Engine {
                 let t = f as f64 / sr;
                 let step = match &v.pitch_lane {
                     Some(l) => smp.rate * (l.value_at(t) / C5_HZ) / sr,
-                               None => const_step,
+                    None => const_step,
                 };
 
                 let mut p = a.raw_pos;
@@ -581,19 +705,57 @@ impl Engine {
                     }
                 }
 
-                if p >= 0.0 && p < len {
-                    let (sl, sr_) = interpolate(smp, p, step, a.raw_pos);
-                    let (gl, gr) = if automated_gain {
+                let gain_pair = || -> (f64, f64) {
+                    if automated_gain {
                         let vol = v.vol_lane.as_ref().map_or(v.vol, |l| l.value_at(t));
                         let pan = v.pan_lane.as_ref().map_or(v.pan, |l| l.value_at(t));
                         gains(vol, pan, song_volume, linear)
                     } else {
                         v.const_gain
-                    };
+                    }
+                };
+                let env_gain = || -> f32 {
+                    match &a.env_state {
+                        Some(state) => {
+                            let t_sec = (f - state.start_sample) as f64 / sr;
+                            env_level_at(state, t_sec)
+                        }
+                        None => 1.0,
+                    }
+                };
+
+                if p >= 0.0 && p < len {
+                    // Normal playback: read interpolated sample data.
+                    let (sl, sr_) = interpolate(smp, p, step, a.raw_pos);
+                    let (gl, gr) = gain_pair();
+                    let eg = env_gain();
                     let o = i as usize;
-                    out_l[o] += sl * gl as f32;
-                    out_r[o] += sr_ * gr as f32;
+                    out_l[o] += sl * gl as f32 * eg;
+                    out_r[o] += sr_ * gr as f32 * eg;
+                } else if p >= len && loop_f.is_none() && a.env_state.is_some() && len > 0.0 {
+                    // One-shot SF2 sample has ended before the note
+                    // did.  Hold the final value for a short fade
+                    // window, then silence.  The window is bounded
+                    // (HOLD_TAIL_SECS) so we never emit DC for longer
+                    // than that — a fixed non-zero output feeds any
+                    // downstream feedback effect, and the master
+                    // reverb would grow without bound.
+                    let over = p - len;
+                    let fade_len = HOLD_TAIL_SECS * sr;
+                    if over < fade_len {
+                        let fade = (1.0 - (over / fade_len)).clamp(0.0, 1.0) as f32;
+                        let last_i = (len as usize).saturating_sub(1);
+                        let sl = smp.left[last_i];
+                        let sr_ = if smp.stereo { smp.right[last_i] } else { sl };
+                        let (gl, gr) = gain_pair();
+                        let eg = env_gain();
+                        let o = i as usize;
+                        out_l[o] += sl * gl as f32 * eg * fade;
+                        out_r[o] += sr_ * gr as f32 * eg * fade;
+                    }
+                    // Else: beyond the hold tail — silent.
                 }
+                // Else: p < 0 (before start) — silent.
 
                 a.raw_pos += step * dir_f;
             }
@@ -622,6 +784,21 @@ impl Engine {
             }
         }
 
+        // ── NaN / inf guard (pre-FX) ─────────────────────────────────
+        // A single NaN anywhere in the mix poisons everything
+        // downstream.  Catch it before the master chain so a bad
+        // sample or a runaway envelope can't corrupt the reverb state.
+        for s in out_l.iter_mut() {
+            if !s.is_finite() {
+                *s = 0.0;
+            }
+        }
+        for s in out_r.iter_mut() {
+            if !s.is_finite() {
+                *s = 0.0;
+            }
+        }
+
         // ── Master bus effects ───────────────────────────────────────
         if let Some(chain) = self.master_fx.as_mut() {
             if !chain.is_empty() {
@@ -631,6 +808,21 @@ impl Engine {
                     chain.process(&mut out_l[i..i + n], &mut out_r[i..i + n]);
                     i += n;
                 }
+            }
+        }
+
+        // ── NaN / inf guard (post-FX) ────────────────────────────────
+        // The reverb's feedback delay network can amplify a DC offset
+        // into infinity over time.  Catch it here so the buffer
+        // handed to the audio device is always finite.
+        for s in out_l.iter_mut() {
+            if !s.is_finite() {
+                *s = 0.0;
+            }
+        }
+        for s in out_r.iter_mut() {
+            if !s.is_finite() {
+                *s = 0.0;
             }
         }
 
@@ -668,7 +860,7 @@ impl Engine {
 
         while chunk_start < block_end {
             let chunk_len =
-            ((block_end - chunk_start) as usize).min(VST_BLOCK as usize);
+                ((block_end - chunk_start) as usize).min(VST_BLOCK as usize);
             let chunk_end = chunk_start + chunk_len as i64;
             events.clear();
 

@@ -2,8 +2,8 @@
 Type=Application
 Name=Play Trackscript
 Comment=Open a .trackscript, .flp, or .it in the Circolate player
-Exec=/run/media/cashmere/Creationism/Circolate/run.sh play %F
-Icon=/run/media/cashmere/Creationism/Circolate/icons/Play.png
+Exec=/run/media/cashmere/Creationism/Circolate/share/run.sh play %F
+Icon=/run/media/cashmere/Creationism/Circolate/share/icons/Play.png
 Terminal=false
 Categories=AudioVideo;Audio;Player;
 MimeType=application/x-trackscript;

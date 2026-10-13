@@ -9,6 +9,9 @@ pub mod scope;
 pub mod spiral;
 pub mod style;
 pub mod theme;
+pub mod volume;
+pub mod draw_vertical;
+pub mod queue;
 
 pub use scope::scope_push;
 
@@ -44,6 +47,10 @@ use crate::tui::spiral::SpiralState;
 #[allow(dead_code)]
 const SEEK_STEP_SECS: f64 = 5.0;
 const TICK_MS: u64 = 50;
+/// After an in-place rewind, ignore `tp.done` for this long.  Gives the
+/// worker thread time to land the seek before the audio callback stops
+/// re-arming the finished flag.
+const REWIND_COOLDOWN_MS: u64 = 1000;
 const SPEED_STEPS: &[i64] = &[1, 4, 16];
 const HOLD_WINDOW_MS: u128 = 250;
 const DOUBLE_CLICK_MS: u128 = 350;
@@ -87,11 +94,7 @@ pub struct PlayerUi {
     pub show_help: bool,
     pub last_left_click: Option<(std::time::Instant, u16, u16)>,
     pub verb_mode: bool,
-    /// Last `reload_count` value the TUI has seen.  When the transport's
-    /// counter ticks past this, the flash timer starts.
     pub last_reload_count: i64,
-    /// Set when a reload is freshly observed.  The footer flashes
-    /// "reloaded" until this instant passes.
     pub reload_flash_until: Option<std::time::Instant>,
 }
 
@@ -126,10 +129,20 @@ pub struct RenderState {
     pub sample_env_cache: HashMap<(String, usize), Vec<(f32, f32)>>,
     pub player: PlayerUi,
     pub tracker_hit: Option<TrackerHit>,
+    pub volume_state: Option<(f64, bool)>,
+    pub volume_last_poll: std::time::Instant,
+    pub queue: queue::QueueState,
+    pub queue_placed: Option<queue::Placed>,
+    pub play_request: Option<String>,
+    pub loading: Option<String>,
+    /// Set when an in-place rewind is initiated.  Suppresses the next
+    /// `tp.done` sighting so the loop counter doesn't double-decrement
+    /// while the seek is in flight.
+    pub rewind_cooldown_until: Option<std::time::Instant>,
 }
 
 impl RenderState {
-    fn new() -> Self {
+    fn new(queue: queue::QueueState) -> Self {
         Self {
             last_synth_env: Vec::new(),
             snapshot: Vec::with_capacity(scope::SCOPE_LEN),
@@ -143,30 +156,24 @@ impl RenderState {
             sample_env_cache: HashMap::new(),
             player: PlayerUi::default(),
             tracker_hit: None,
+            volume_state: None,
+            volume_last_poll: std::time::Instant::now(),
+            queue,
+            queue_placed: None,
+            play_request: None,
+            loading: None,
+            rewind_cooldown_until: None,
         }
     }
 }
 
-// ── entry point ────────────────────────────────────────────────────────
+// ── terminal lifecycle ─────────────────────────────────────────────────
 
-pub fn run(transport: Arc<Transport>, project: Arc<Project>, sample_rate: u32) -> Result<()> {
-    let mut term = setup()?;
-    let mut state = RenderState::new();
-    let result = event_loop(&mut term, &transport, &project, sample_rate, &mut state);
-    let _ = restore(&mut term);
-    transport.stop.store(true, Ordering::Relaxed);
-    result
-}
-
-fn setup() -> Result<Terminal<CrosstermBackend<Stdout>>> {
+pub fn setup() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut out = io::stdout();
     execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
 
-    // Signal handlers so SIGINT/SIGTERM/SIGHUP restore the terminal
-    // instead of leaving it in raw mode with the alternate screen
-    // active.  Without this, `kill <pid>` or a terminal-side hangup
-    // wedges the session until the user runs `reset`.
     #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGINT, handle_signal as *const () as libc::sighandler_t);
@@ -174,10 +181,6 @@ fn setup() -> Result<Terminal<CrosstermBackend<Stdout>>> {
         libc::signal(libc::SIGHUP, handle_signal as *const () as libc::sighandler_t);
     }
 
-    // Panic hook: restore the terminal before the default hook prints
-    // the panic message.  Otherwise a panic in the render loop leaves
-    // the terminal in raw mode and the panic text is rendered inside
-    // the alternate screen, which is then lost on exit.
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
@@ -193,14 +196,9 @@ fn setup() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     Ok(Terminal::new(CrosstermBackend::new(out))?)
 }
 
-/// Async-signal handler that restores the terminal, then re-raises the
-/// signal with the default disposition so the process exits with the
-/// correct status.
 #[cfg(unix)]
 extern "C" fn handle_signal(sig: libc::c_int) {
     unsafe {
-        // Ignore further signals while we restore, so a second Ctrl-C
-        // doesn't race us.
         libc::signal(sig, libc::SIG_IGN);
         let _ = disable_raw_mode();
         let _ = execute!(
@@ -214,12 +212,59 @@ extern "C" fn handle_signal(sig: libc::c_int) {
     }
 }
 
-fn restore(t: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+pub fn restore(t: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     disable_raw_mode()?;
     execute!(t.backend_mut(), LeaveAlternateScreen, DisableMouseCapture, Show)?;
     t.show_cursor()?;
     Ok(())
 }
+
+// ── session entry points ───────────────────────────────────────────────
+
+pub fn show_loading(
+    term: &mut Terminal<CrosstermBackend<Stdout>>,
+    queue: &queue::QueueState,
+    msg: &str,
+) -> Result<()> {
+    use std::sync::atomic::{AtomicBool, AtomicI64};
+
+    let tp = Arc::new(Transport {
+        speed: AtomicI64::new(0),
+        seek_to: AtomicI64::new(0),
+        position: AtomicI64::new(0),
+        done: AtomicBool::new(false),
+        stop: AtomicBool::new(false),
+        active_voices: AtomicI64::new(0),
+        loaded_lines: AtomicI64::new(0),
+        reload_count: AtomicI64::new(0),
+    });
+    let project = Arc::new(Project::empty(44100));
+    let mut state = RenderState::new(queue.clone());
+    state.loading = Some(msg.to_string());
+    term.draw(|f| draw(f, &tp, &project, 44100, &mut state))?;
+    Ok(())
+}
+
+pub fn run_against(
+    term: &mut Terminal<CrosstermBackend<Stdout>>,
+    transport: Arc<Transport>,
+    project: Arc<Project>,
+    sample_rate: u32,
+    queue: queue::QueueState,
+) -> Result<(Option<String>, queue::QueueState)> {
+    let mut state = RenderState::new(queue);
+
+    if project.voice_count == 0 {
+        state.queue.focused = true;
+    }
+
+    event_loop(term, &transport, &project, sample_rate, &mut state)?;
+    let request = state.play_request.take();
+    let queue = state.queue;
+    Ok((request, queue))
+}
+
+// ── event loop ─────────────────────────────────────────────────────────
 
 fn event_loop(
     term: &mut Terminal<CrosstermBackend<Stdout>>,
@@ -237,16 +282,20 @@ fn event_loop(
         if event::poll(tick)? {
             match event::read()? {
                 Event::Key(k) => {
-                    if k.kind == KeyEventKind::Press
+                    let is_ctrl_c = k.code == KeyCode::Char('c')
+                        && k.modifiers.contains(KeyModifiers::CONTROL);
+                    let typing =
+                        state.queue.focused && !state.player.show_help && !is_ctrl_c;
+                    if !typing
+                        && k.kind == KeyEventKind::Press
                         && matches!(k.code, KeyCode::Left | KeyCode::Right)
                     {
                         handle_direction(k.code, state, tp);
                     }
                     if k.kind != KeyEventKind::Release {
-                        let is_ctrl_c = k.code == KeyCode::Char('c')
-                            && k.modifiers.contains(KeyModifiers::CONTROL);
-
-                        if state.player.show_help
+                        if typing {
+                            handle_queue_key(k.code, k.modifiers, state);
+                        } else if state.player.show_help
                             && (k.code == KeyCode::Esc
                                 || k.code == KeyCode::Char('q')
                                 || is_ctrl_c)
@@ -256,12 +305,6 @@ fn event_loop(
                             || k.code == KeyCode::Esc
                             || is_ctrl_c
                         {
-                            // Break out of the loop so `run()` can call
-                            // `restore()`.  Do NOT call
-                            // `std::process::exit` anywhere in this
-                            // function — it skips the terminal cleanup
-                            // and leaves the user's shell wedged in
-                            // raw mode.
                             break;
                         } else {
                             handle_key(k.code, k.modifiers, tp, project, state);
@@ -275,18 +318,67 @@ fn event_loop(
             }
         }
 
-        if tp.done.load(Ordering::Acquire) {
-            term.draw(|f| draw(f, tp, project, sample_rate, state))?;
-            std::thread::sleep(Duration::from_millis(500));
+        if state.play_request.is_some() {
             break;
+        }
+
+        // Song-finished handling.  Two paths:
+        //
+        //   * The queue points at a different name — hand it back to
+        //     the caller so a fresh project can be loaded.
+        //   * The same song is next (loop counter > 1, or the queue is
+        //     exhausted, or no queue involvement at all) — replay in
+        //     place by seeking to zero.  No disk reload, no stream
+        //     teardown, no loading flicker.
+        //
+        // After an in-place seek, `done` stays true until the seek
+        // lands and the audio callback notices it's producing again.
+        // A short cooldown suppresses re-advancing during that window.
+        let speed = tp.speed.load(Ordering::Relaxed);
+        let done = tp.done.load(Ordering::Acquire);
+        let cooling = state
+            .rewind_cooldown_until
+            .map_or(false, |t| t > std::time::Instant::now());
+
+        if !done {
+            // Audio is flowing.  Any in-flight rewind has landed;
+            // drop the cooldown so the next end-of-song is handled
+            // promptly.
+            state.rewind_cooldown_until = None;
+        } else if speed > 0 && !cooling {
+            state.rewind_cooldown_until = Some(
+                std::time::Instant::now()
+                    + Duration::from_millis(REWIND_COOLDOWN_MS),
+            );
+
+            if state.queue.playing.is_some() {
+                let prev = state.queue.now_playing.clone();
+                match state.queue.advance() {
+                    Some(next_name) if Some(&next_name) == prev.as_ref() => {
+                        // Same song on loop — replay in place.
+                        tp.seek_to.store(0, Ordering::Release);
+                    }
+                    Some(next_name) => {
+                        // Different song — hand back to the caller.
+                        state.play_request = Some(next_name);
+                        break;
+                    }
+                    None => {
+                        // Queue exhausted — rewind and stay open.
+                        tp.seek_to.store(0, Ordering::Release);
+                    }
+                }
+            } else {
+                // No queue involvement — rewind and stay open.
+                tp.seek_to.store(0, Ordering::Release);
+            }
         }
     }
     Ok(())
 }
 
-/// Enforce loop playback.  Every tick, if the transport is playing
-/// forward and the current measure isn't in the loop set, seek to the
-/// nearest measure that is.
+// ── loop enforcement ───────────────────────────────────────────────────
+
 fn loop_tick(tp: &Arc<Transport>, p: &Project, state: &mut RenderState) {
     if !state.player.loop_enabled || state.player.loop_measures.is_empty() {
         return;
@@ -318,15 +410,10 @@ fn loop_tick(tp: &Arc<Transport>, p: &Project, state: &mut RenderState) {
         .unwrap_or_else(|| *state.player.loop_measures.iter().min().unwrap());
     let target = p.line_start_sample(next);
 
-    if std::env::var_os("LOOP_DEBUG").is_some() {
-        eprintln!(
-            "loop: pos={} cur={} loop_set={:?} -> seeking measure {} (sample {})",
-            pos, cur, state.player.loop_measures, next, target
-        );
-    }
-
     tp.seek_to.store(target, Ordering::Release);
 }
+
+// ── key handling ───────────────────────────────────────────────────────
 
 fn handle_direction(code: KeyCode, state: &mut RenderState, tp: &Arc<Transport>) {
     let now = std::time::Instant::now();
@@ -361,8 +448,6 @@ fn handle_key(
     p: &Project,
     state: &mut RenderState,
 ) {
-    // Ctrl-C is handled by the event loop (it needs to break out of
-    // the run loop so `restore()` runs).  Nothing to do here for it.
     let _ = modifiers;
 
     match code {
@@ -383,6 +468,23 @@ fn handle_key(
         }
         KeyCode::Char('v') => {
             state.player.verb_mode = !state.player.verb_mode;
+        }
+        KeyCode::Char('+') | KeyCode::Char('=') => {
+            volume_step(state, 0.05);
+        }
+        KeyCode::Char('-') | KeyCode::Char('_') => {
+            volume_step(state, -0.05);
+        }
+        KeyCode::Up => {
+            volume_step(state, 0.05);
+        }
+        KeyCode::Down => {
+            volume_step(state, -0.05);
+        }
+        KeyCode::Char('M') => {
+            volume::toggle_mute();
+            state.volume_last_poll = std::time::Instant::now()
+                - std::time::Duration::from_secs(60);
         }
         KeyCode::Char('[') => {
             let pos = tp.position.load(Ordering::Relaxed);
@@ -420,6 +522,30 @@ fn handle_key(
     }
 }
 
+fn handle_queue_key(code: KeyCode, modifiers: KeyModifiers, state: &mut RenderState) {
+    let plain = !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    match code {
+        KeyCode::Esc => state.queue.focused = false,
+        KeyCode::Enter => {
+            if let Some(name) = state.queue.play_current() {
+                state.play_request = Some(name);
+            }
+        }
+        KeyCode::Char(c) if plain => state.queue.insert_char(c),
+        KeyCode::Backspace => state.queue.backspace(),
+        KeyCode::Delete => state.queue.delete_char(),
+        KeyCode::Left => state.queue.cursor_left(),
+        KeyCode::Right => state.queue.cursor_right(),
+        KeyCode::Up => state.queue.cursor_up(),
+        KeyCode::Down => state.queue.cursor_down(),
+        KeyCode::Home => state.queue.cursor_home(),
+        KeyCode::End => state.queue.cursor_end(),
+        KeyCode::PageUp => state.queue.cycle_loop(1),
+        KeyCode::PageDown => state.queue.cycle_loop(-1),
+        _ => {}
+    }
+}
+
 fn focus_step(state: &mut RenderState, dir: i32) {
     let order = &state.column_order;
     if order.is_empty() {
@@ -440,10 +566,14 @@ fn focus_step(state: &mut RenderState, dir: i32) {
     state.player.focused_part = Some(order[next_idx].clone());
 }
 
-/// One mouse event.  Splits into three regions: spiral, tracker, or
-/// elsewhere.  Right-click actions are exposed through a sticky "mute
-/// mode" toggled by `v`, because every modifier-key combination
-/// conflicts with some window manager or terminal feature.
+fn volume_step(state: &mut RenderState, delta: f64) {
+    volume::step(delta);
+    state.volume_last_poll = std::time::Instant::now()
+        - std::time::Duration::from_secs(60);
+}
+
+// ── mouse ──────────────────────────────────────────────────────────────
+
 fn handle_mouse(m: MouseEvent, tp: &Arc<Transport>, p: &Project, state: &mut RenderState) {
     let is_down_or_drag = matches!(
         m.kind,
@@ -456,6 +586,26 @@ fn handle_mouse(m: MouseEvent, tp: &Arc<Transport>, p: &Project, state: &mut Ren
         MouseEventKind::Down(b) | MouseEventKind::Drag(b) => b,
         _ => return,
     };
+
+    let has = |r: Rect| {
+        m.column >= r.x && m.column < r.x + r.width && m.row >= r.y && m.row < r.y + r.height
+    };
+    let in_box = state
+        .queue_placed
+        .map_or(false, |q| has(q.notch) && !has(q.spiral));
+    if !in_box && matches!(m.kind, MouseEventKind::Down(_)) {
+        state.queue.focused = false;
+    }
+    if in_box {
+        if let (MouseEventKind::Down(b), Some(q)) = (m.kind, state.queue_placed) {
+            match state.queue.click(&q, m.column, m.row, b == MouseButton::Right) {
+                queue::Click::Rewind => handle_direction(KeyCode::Left, state, tp),
+                queue::Click::Play => handle_direction(KeyCode::Right, state, tp),
+                queue::Click::None => {}
+            }
+        }
+        return;
+    }
 
     let button = if raw_button == MouseButton::Left && state.player.verb_mode {
         MouseButton::Right
@@ -480,7 +630,6 @@ fn handle_mouse(m: MouseEvent, tp: &Arc<Transport>, p: &Project, state: &mut Ren
         state.player.last_left_click = Some((now, m.column, m.row));
     }
 
-    // 1. Spiral.
     if let Some(spiral) = state.spiral.as_ref() {
         let rect = spiral.rect;
         if rect.width > 0
@@ -505,9 +654,6 @@ fn handle_mouse(m: MouseEvent, tp: &Arc<Transport>, p: &Project, state: &mut Ren
                         if !state.player.loop_measures.remove(&measure) {
                             state.player.loop_measures.insert(measure);
                         }
-                        // Adding a measure to the loop set turns on
-                        // loop playback.  Users shouldn't have to know
-                        // about the `L` key just to loop one measure.
                         if !state.player.loop_measures.is_empty() {
                             state.player.loop_enabled = true;
                         }
@@ -520,7 +666,6 @@ fn handle_mouse(m: MouseEvent, tp: &Arc<Transport>, p: &Project, state: &mut Ren
         }
     }
 
-    // 2. Tracker.
     if let Some(hit) = state.tracker_hit.as_ref() {
         let inner = hit.inner;
         if m.column >= inner.x

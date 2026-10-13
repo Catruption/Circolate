@@ -181,40 +181,48 @@ pub const CONTEXTS: &[Context] = &[
         doc: "A note-on inside a part body. Fields describe this one note.",
         status: Done,
     },
-Context {
-    name: "definition",
-    syntax: "ƒName(<|N/D, ƒsource, %vol, ¶pan, ~dur>)[ events ];",
-    doc: "Defines a part. The argument list is a note-shaped default: \
+    Context {
+        name: "definition",
+        syntax: "ƒName(<|N/D, ƒsource, %vol, ¶pan, ~dur>)[ events ];",
+        doc: "Defines a part. The argument list is a note-shaped default: \
 `|N/D` sets the section frame, `ƒ'path'` names the sample, \
-`%`/`¶`/`~` supply defaults notes may override.",
-status: Done,
-},
-Context {
-    name: "composite",
-    syntax: "ƒName(ƒA, ƒB, ...);",
-    doc: "Defines a block as a list of calls. No body; the arguments are the body. \
-Distinguished from a part by the args not starting with `<`.",
-status: Done,
-},
-Context {
-    name: "call",
-    syntax: "ƒName(<§offset, %vol, ¶pan, ~dur, ƒsource>);",
-    doc: "Calls a definition. Always parenthesized; empty parens are `ƒName();`. \
-Arguments override the definition's defaults for this call. \
-`§offset` starts the call partway into the parent measure. \
-`~dur` sets how long the call plays: shorter cuts voices off at the call end, \
-longer repeats the definition until the time is filled.",
-status: Plan,
-},
-Context {
-    name: "shim",
-    syntax: "@<§pos, %expr, ƒTarget>;",
-    doc: "Mix automation on a BlockList line. `§pos` is where the curve starts \
+`%`/`¶`/`~` supply defaults notes may override.  A definition's body \
+may contain multiple `|N/D[...]` sections; each section is one measure, \
+and they accumulate left-to-right in the part's timeline.",
+        status: Done,
+    },
+    Context {
+        name: "composite",
+        syntax: "ƒName(ƒA, ƒB, ...);",
+        doc: "Defines a block as a list of calls. No body; the arguments are the body. \
+Distinguished from a part by the args not starting with `<`.  A composite's \
+measure timeline is the concatenation of its calls' timelines.",
+        status: Done,
+    },
+    Context {
+        name: "call",
+        syntax: "ƒName();  ƒName(1,2,3);  ƒName(1<%50>, 2<%75>);",
+        doc: "Calls a definition from a BlockList line.  An empty argument list \
+plays every measure of the definition in its natural order.  Bare integers \
+select specific measures and set the order they play in — `ƒName(3,1,2)` \
+plays measure 3, then 1, then 2.  A `<...>` override block after a measure \
+number applies to just that measure; the override fields are `%vol`, `¶pan`, \
+`~dur`, and `ƒsource`, matching the field shapes used on a note.  A call's \
+duration is the sum of the durations of its selected measures; the BlockList \
+cursor advances by that amount.  Some fields with a note-shaped meaning \
+(position, pitch) have no place in a call's override block and are ignored \
+if present.",
+        status: Plan,
+    },
+    Context {
+        name: "shim",
+        syntax: "@<§pos, %expr, ƒTarget>;",
+        doc: "Mix automation on a BlockList line. `§pos` is where the curve starts \
 (local to the line's measure). The value field carries a starting \
 value and an operator expression. The trailing `ƒName` must be one \
 of the reserved shim targets listed below.",
-status: Plan,
-},
+        status: Plan,
+    },
 ];
 
 pub struct FieldContextUse {
@@ -231,44 +239,44 @@ pub const FIELD_CONTEXTS: &[FieldContextUse] = &[
         glyph: FIELD_POSITION, name: "position",
         note: "start row of this note",
         definition: "ignored",
-        call: "offset within the measure",
+        call: "ignored (measure selection replaces it)",
         shim: "start row of the curve",
     },
-FieldContextUse {
-    glyph: FIELD_PITCH, name: "pitch",
-    note: "this note's pitch",
-    definition: "default pitch",
-    call: "pitch override",
-    shim: "the value being ramped (for pitch-shaped targets)",
-},
-FieldContextUse {
-    glyph: FIELD_DURATION, name: "duration",
-    note: "this note's length, in beats",
-    definition: "default length",
-    call: "how long this call plays: <1 truncates, >1 repeats",
-    shim: "ignored (the operator's rate carries it)",
-},
-FieldContextUse {
-    glyph: FIELD_VOLUME, name: "volume",
-    note: "this note's volume",
-    definition: "default volume",
-    call: "volume override",
-    shim: "the value being ramped (for percent-shaped targets)",
-},
-FieldContextUse {
-    glyph: FIELD_PAN, name: "pan",
-    note: "this note's pan",
-    definition: "default pan",
-    call: "pan override",
-    shim: "the value being ramped (for pan-shaped targets)",
-},
-FieldContextUse {
-    glyph: FIELD_SOURCE, name: "source / call",
-    note: "sample override for this note",
-    definition: "the part's sample (required)",
-    call: "sample override, or a call target",
-    shim: "target shim name (required)",
-},
+    FieldContextUse {
+        glyph: FIELD_PITCH, name: "pitch",
+        note: "this note's pitch",
+        definition: "default pitch",
+        call: "ignored",
+        shim: "the value being ramped (for pitch-shaped targets)",
+    },
+    FieldContextUse {
+        glyph: FIELD_DURATION, name: "duration",
+        note: "this note's length, in beats",
+        definition: "default length",
+        call: "how long the selected measures play",
+        shim: "ignored (the operator's rate carries it)",
+    },
+    FieldContextUse {
+        glyph: FIELD_VOLUME, name: "volume",
+        note: "this note's volume",
+        definition: "default volume",
+        call: "volume override, per selected measure",
+        shim: "the value being ramped (for percent-shaped targets)",
+    },
+    FieldContextUse {
+        glyph: FIELD_PAN, name: "pan",
+        note: "this note's pan",
+        definition: "default pan",
+        call: "pan override, per selected measure",
+        shim: "the value being ramped (for pan-shaped targets)",
+    },
+    FieldContextUse {
+        glyph: FIELD_SOURCE, name: "source / call",
+        note: "sample override for this note",
+        definition: "the part's sample (required)",
+        call: "sample override, per selected measure",
+        shim: "target shim name (required)",
+    },
 ];
 
 pub const DEFAULTS_NOTE: &str =
@@ -276,10 +284,14 @@ pub const DEFAULTS_NOTE: &str =
 A field omitted from a definition falls back to the engine default: 100% volume, \
 0 pan, 1-beat duration.";
 
-    pub const CALL_LENGTH_SEMANTICS: &str =
-    "Call length: shorter than the definition cuts voices off at the call \
-end; equal plays once; longer repeats the definition until the time is \
-filled, truncating the final iteration.  Omitted means play once.";
+pub const CALL_LENGTH_SEMANTICS: &str =
+"A call's duration is the sum of the durations of the measures it selects.  \
+With no arguments, that is the definition's full length.  With measure selection \
+(`ƒName(1,2,3)`), it is the sum of the chosen measures in the order listed.  \
+The BlockList cursor advances by a call's duration, so calls stack vertically \
+in a BlockList line the way notes stack horizontally in a measure.  \
+An empty BlockList line (`;`) advances by one measure of the song's time \
+signature.";
 
 pub const SHIM_SEMANTICS: &str =
 "A shim is a global call.  It carries a starting value and an operator \
@@ -308,13 +320,13 @@ pub struct ConfigKey {
 
 pub const CONFIG_KEYS: &[ConfigKey] = &[
     ConfigKey { key: "TrackscriptVersion", ty: "number", default: "-", doc: "Format version the file was written for.", parsed: false },
-ConfigKey { key: "BeatsPerMinute", ty: "number", default: "120", doc: "Starting tempo. Time-varying tempo is the `ƒTempo` shim.", parsed: true },
-ConfigKey { key: "TimeSignature", ty: "a/b", default: "4/4", doc: "Time signature.", parsed: true },
-ConfigKey { key: "Subdivisions", ty: "integer", default: "4", doc: "Rows per beat.", parsed: true },
-ConfigKey { key: "SongVolume", ty: "percent", default: "100%", doc: "Static master volume.", parsed: true },
-ConfigKey { key: "PanningLaw", ty: "linear | equal_power", default: "equal_power", doc: "How pan maps to left/right gain.", parsed: true },
-ConfigKey { key: "Overlap", ty: "word", default: "-", doc: "Written by the converter (`stack`); not read by the parser.", parsed: false },
-ConfigKey { key: "PitchDefault", ty: "word", default: "-", doc: "Written by the converter (`hz`); not read by the parser.", parsed: false },
+    ConfigKey { key: "BeatsPerMinute", ty: "number", default: "120", doc: "Starting tempo. Time-varying tempo is the `ƒTempo` shim.", parsed: true },
+    ConfigKey { key: "TimeSignature", ty: "a/b", default: "4/4", doc: "Time signature.", parsed: true },
+    ConfigKey { key: "Subdivisions", ty: "integer", default: "4", doc: "Rows per beat.", parsed: true },
+    ConfigKey { key: "SongVolume", ty: "percent", default: "100%", doc: "Static master volume.", parsed: true },
+    ConfigKey { key: "PanningLaw", ty: "linear | equal_power", default: "equal_power", doc: "How pan maps to left/right gain.", parsed: true },
+    ConfigKey { key: "Overlap", ty: "word", default: "-", doc: "Written by the converter (`stack`); not read by the parser.", parsed: false },
+    ConfigKey { key: "PitchDefault", ty: "word", default: "-", doc: "Written by the converter (`hz`); not read by the parser.", parsed: false },
 ];
 
 pub struct Section {
@@ -327,15 +339,22 @@ pub const SECTIONS: &[Section] = &[
         name: "Config { ... }",
         doc: "`Key: value;` entries. Static project header.",
     },
-Section {
-    name: "BlockList { ... }",
-    doc: "One line per measure. Each line is a sequence of `ƒName(...);` calls and `@<...>;` shim events. \
-A call's `~dur` argument may truncate or repeat the definition it calls.",
-},
-Section {
-    name: "BlockArray { ... }",
-    doc: "Definitions. `ƒName(<|N/D, ƒsource, ...>)[ events ];` for a part, `ƒName(ƒA, ƒB);` for a composite block.",
-},
+    Section {
+        name: "BlockList { ... }",
+        doc: "A cursor over song time.  Each line places its calls starting at the \
+current cursor position; a call occupies as many measures as its selections \
+sum to, and the cursor advances past it.  A line's duration is the maximum \
+duration of its calls, so parallel calls line up on the same measure.  \
+An empty line (`;`) advances the cursor by one measure.  Calls may select \
+specific measures from a definition (`ƒName(1,2,3)`) and may apply per-measure \
+overrides (`ƒName(1<%50>, 2<%75>)`); see the `call` context below.",
+    },
+    Section {
+        name: "BlockArray { ... }",
+        doc: "Definitions. `ƒName(<|N/D, ƒsource, ...>)[ events ];` for a part, \
+`ƒName(ƒA, ƒB);` for a composite block.  A part's body may contain multiple \
+`|N/D[...]` sections; each section is one measure, laid end to end.",
+    },
 ];
 
 pub struct Builtin {
@@ -352,23 +371,23 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin {
         name: "Tempo", scope: "song", property: FIELD_PITCH,
         default: "120", unit: "bpm",
-            doc: "Song tempo.", status: Done,
+        doc: "Song tempo.", status: Done,
     },
-Builtin {
-    name: "GlobalVolume", scope: "song", property: FIELD_VOLUME,
+    Builtin {
+        name: "GlobalVolume", scope: "song", property: FIELD_VOLUME,
         default: "100%", unit: "percent",
-            doc: "Song-wide volume multiplier over time.", status: Plan,
-},
-Builtin {
-    name: "GlobalPan", scope: "song", property: FIELD_PAN,
+        doc: "Song-wide volume multiplier over time.", status: Plan,
+    },
+    Builtin {
+        name: "GlobalPan", scope: "song", property: FIELD_PAN,
         default: "0", unit: "pan",
-            doc: "Song-wide stereo pan.", status: Plan,
-},
-Builtin {
-    name: "GlobalTuning", scope: "song", property: FIELD_PITCH,
+        doc: "Song-wide stereo pan.", status: Plan,
+    },
+    Builtin {
+        name: "GlobalTuning", scope: "song", property: FIELD_PITCH,
         default: "0", unit: "cents",
-            doc: "Song-wide fine tuning.", status: Plan,
-},
+        doc: "Song-wide fine tuning.", status: Plan,
+    },
 ];
 
 pub fn is_reserved(name: &str) -> bool {
@@ -398,16 +417,20 @@ pub const CHANGELOG: &[Change] = &[
         summary: "Unified `ƒName(<|N/D, args>)[ events ];` syntax for definitions and calls. \
 Section opener becomes `|`, freeing `@` for shim events. \
 The definition's argument list is a note-shaped default wrapped in `<...>`. \
-Call `~dur` truncates or repeats the called definition. \
+Multi-section part bodies: a part may declare `|N/D[...]` sections end to end, \
+one per measure. \
+Measure selection in calls: `ƒName(1,2,3)` plays just those measures, in that \
+order; `ƒName(1<%50>, 2<%75>)` applies per-measure overrides.  A call's \
+duration is the sum of its selected measures and advances the BlockList cursor. \
 Shim events (`@<...>`) apply mix automation to reserved global targets. \
 Sections accumulate row offsets, so a waypoint chain crosses them. \
 Inline operators (`+ - * ±`, `^`, `:count`). \
 The 1.10 `Tempo { ... }` section becomes the `ƒTempo` shim.",
     },
-Change {
-    version: "1.10",
-    summary: "Current format: `@4/4[` headers, `ƒ'path'(offset)` sources, waypoints with `&`.",
-},
+    Change {
+        version: "1.10",
+        summary: "Current format: `@4/4[` headers, `ƒ'path'(offset)` sources, waypoints with `&`.",
+    },
 ];
 
 pub struct Example {
@@ -418,25 +441,26 @@ pub struct Example {
 
 pub const EXAMPLES: &[Example] = &[
     Example { title: "A note", status: Done, src: "<§1/1,#D5,~4,%50>" },
-Example { title: "A note with a waypoint", status: Done, src: "<§1/1,#D5,~4,%50>&<§1/2,%43,~0.33>" },
-Example { title: "Pan and a per-note sample", status: Done, src: "<§1/1,#C6,~2,¶-1,ƒ'samples/other.wav'>" },
-Example { title: "Operator: volume rises 4 times", status: Plan, src: "<§1/1,#D5,~4,%15+0.1^0/1:4>" },
-Example { title: "Operator: pitch oscillates", status: Plan, src: "<§1/1,#C5,~4,#C5±0.25^0/2:4>" },
-Example { title: "Shim: end fade-out", status: Plan, src: "@<§1/1,%100-0.78125^0/2:8, ƒGlobalVolume>" },
-Example { title: "Shim: tempo", status: Done, src: "@<§1/1,#110, ƒTempo>" },
-Example { title: "Definition with defaults", status: Done, src: "ƒHARP(<|4/4, ƒ'samples/harp.wav', %80, ¶0.5>)[\n    <§1/1,#D5>\n    <§1/2,#E5,%100>\n];" },
-Example { title: "Composite call", status: Done, src: "ƒLAYER(ƒKICK, ƒHARP);" },
-Example { title: "Call with overrides", status: Plan, src: "ƒHARP(<%60, §1/3>);" },
-Example { title: "Call with offset and length", status: Plan, src: "ƒDRUMS(<§1/3, ~2>);" },
-Example { title: "Call that repeats a two-beat part four times", status: Plan, src: "ƒHIT(<~8>);   // definition is |2/4, so ~8 plays it four times" },
-Example { title: "Sample tempo: stretch a 135 bpm loop to the song tempo", status: Plan, src: "<§1/1,#C5,~2,|135>" },
-Example { title: "Bare call", status: Done, src: "ƒKICK();" },
+    Example { title: "A note with a waypoint", status: Done, src: "<§1/1,#D5,~4,%50>&<§1/2,%43,~0.33>" },
+    Example { title: "Pan and a per-note sample", status: Done, src: "<§1/1,#C6,~2,¶-1,ƒ'samples/other.wav'>" },
+    Example { title: "Operator: volume rises 4 times", status: Plan, src: "<§1/1,#D5,~4,%15+0.1^0/1:4>" },
+    Example { title: "Operator: pitch oscillates", status: Plan, src: "<§1/1,#C5,~4,#C5±0.25^0/2:4>" },
+    Example { title: "Shim: end fade-out", status: Plan, src: "@<§1/1,%100-0.78125^0/2:8, ƒGlobalVolume>" },
+    Example { title: "Shim: tempo", status: Done, src: "@<§1/1,#110, ƒTempo>" },
+    Example { title: "Definition with defaults", status: Done, src: "ƒHARP(<|4/4, ƒ'samples/harp.wav', %80, ¶0.5>)[\n    <§1/1,#D5>\n    <§1/2,#E5,%100>\n];" },
+    Example { title: "Multi-measure definition (two sections)", status: Done, src: "ƒMELODY(<|4/4, ƒ'samples/harp.wav'>)[\n    <§1/1,#D5,~2>\n]\n|4/4[\n    <§1/1,#E5,~2>\n];" },
+    Example { title: "Composite call", status: Done, src: "ƒLAYER(ƒKICK, ƒHARP);" },
+    Example { title: "Bare call", status: Done, src: "ƒKICK();" },
+    Example { title: "Measure selection: play measure 2 only", status: Plan, src: "ƒMELODY(2);" },
+    Example { title: "Measure selection: reorder", status: Plan, src: "ƒMELODY(3,1,2);" },
+    Example { title: "Measure selection: per-measure volume overrides", status: Plan, src: "ƒMELODY(1<%50>, 2<%75>);" },
+    Example { title: "Measure selection: some measures overridden, some not", status: Plan, src: "ƒMELODY(1<%50>, 2, 3<%75>);" },
 ];
 
 pub fn wrap_example(src: &str) -> String {
     format!(
         "BlockList()\n{{\n    ƒExample();\n}}\n\nBlockArray()\n{{\n    {}\n}}\n",
-            part_definition("Example", &source_arg("samples/example.wav", None), 4, 4, src)
+        part_definition("Example", &source_arg("samples/example.wav", None), 4, 4, src)
     )
 }
 
@@ -482,7 +506,7 @@ fn field_context_table(out: &mut String) {
         let _ = writeln!(
             out, "| `{}` | {} | {} | {} | {} | {} |",
             cell(r.glyph), cell(r.name), cell(r.note),
-                         cell(r.definition), cell(r.call), cell(r.shim)
+            cell(r.definition), cell(r.call), cell(r.shim)
         );
     }
     out.push('\n');
@@ -497,7 +521,7 @@ fn shim_table(out: &mut String) {
         let _ = writeln!(
             out, "| `ƒ{}`{} | {} | `{}` | {} | {} | {} |",
             b.name, b.status.label(), b.scope, cell(b.property),
-                         cell(b.default), cell(b.unit), cell(b.doc)
+            cell(b.default), cell(b.unit), cell(b.doc)
         );
     }
     out.push('\n');
@@ -533,7 +557,7 @@ pub fn render_markdown() -> String {
         let _ = writeln!(
             out, "| `{}` | {} | {} | {} | {} |",
             k.key, cell(k.ty), cell(k.default), cell(k.doc),
-                         if k.parsed { "reads" } else { "stores only" }
+            if k.parsed { "reads" } else { "stores only" }
         );
     }
     out.push('\n');
@@ -626,7 +650,7 @@ mod tests {
     #[test]
     fn call_semantics_documented() {
         let md = render_markdown();
-        assert!(md.contains("repeats the definition"));
+        assert!(md.contains("repeats the definition") || md.contains("sum of the durations"));
     }
 
     #[test]
@@ -635,6 +659,13 @@ mod tests {
         assert!(md.contains("global call"));
         assert!(md.contains("GlobalVolume"));
         assert!(md.contains("overrides"));
+    }
+
+    #[test]
+    fn measure_selection_documented() {
+        let md = render_markdown();
+        assert!(md.contains("measure selection") || md.contains("Measure selection"));
+        assert!(md.contains("BlockList cursor"));
     }
 
     #[test]

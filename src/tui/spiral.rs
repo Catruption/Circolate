@@ -66,6 +66,25 @@ pub struct SpiralLayout {
     pub map: Vec<Option<usize>>,
 }
 
+impl SpiralLayout {
+    /// True if `(gx, gy)` is the innermost cell of the spiral — the
+    /// measure-0 cell the path starts from.  The renderer consults this
+    /// to add a phantom "down" edge, turning what would be a bare
+    /// horizontal segment into a `╔` corner so the centre reads as a
+    /// closed curl instead of an open line.
+    ///
+    /// The check is against measure index, not path position, so it
+    /// still fires when `measures_per_cell > 1` — measure 0 is always
+    /// the innermost cell.
+    pub fn is_center(&self, gx: usize, gy: usize) -> bool {
+        self.map
+            .get(gy * self.grid_w as usize + gx)
+            .copied()
+            .flatten()
+            .map_or(false, |m| m == 0)
+    }
+}
+
 pub fn build_spiral(total_measures: usize, max_grid_h: usize) -> SpiralLayout {
     let total = total_measures.max(1);
     let mut mpcell = 1usize;
