@@ -13,4 +13,9 @@ pub(crate) struct Transport {
     pub(crate) stop: AtomicBool,
     pub(crate) active_voices: AtomicI64,
     pub(crate) loaded_lines: AtomicI64,
+    /// Incremented by the loader worker each time a file reload is
+    /// swapped in.  The TUI polls this and flashes a "reloaded"
+    /// indicator for a second.  Never printed — stderr writes during
+    /// playback scramble the terminal.
+    pub(crate) reload_count: AtomicI64,
 }

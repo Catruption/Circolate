@@ -111,7 +111,7 @@ pub const ENV_PITCH: usize = 4;
 pub struct Levels {
     /// 0..12800, 6400 = center (see `Channel::pan_norm`).
     pub pan: i32,
-    /// 0..12800, 10000 = unity (0 dB).
+    /// 0..12800; 12800 = 100%, 10000 = FL's default (78%).
     pub volume: u32,
     /// -4800..4800 cents.
     pub pitch_shift: i32,
@@ -305,48 +305,37 @@ impl Channel {
         self.envelopes.get(slot)
     }
 
-    /// Normalised pan in -1.0..1.0.
-    ///
-    /// FL has two independent pan stages: `Levels.pan` (channel rack,
-    /// 0..12800 with 6400 = centre) and `LevelAdjusts.pan` (mixer strip
-    /// adjustment, signed with 0 = centre).  Both are offsets from
-    /// centre and combine additively.
+    /// Normalised pan in -1.0..1.0.  Prefers `Levels`, falls back to
+    /// `LevelAdjusts`, then to 0.0.
     pub fn pan_norm(&self) -> f64 {
-        let rack = self
-        .levels
-        .as_ref()
-        .map(|l| (l.pan as f64 - 6400.0) / 6400.0)
-        .unwrap_or(0.0);
-        let adj = self
-        .level_adjusts
-        .as_ref()
-        .map(|l| l.pan as f64 / 12800.0)
-        .unwrap_or(0.0);
-        (rack + adj).clamp(-1.0, 1.0)
+        // `Levels.pan` is stored 0..12800 with 6400 = centre (every sample
+        // channel in the test project reads exactly 6400, which the old
+        // `pan / 12800` turned into +0.5, i.e. everything panned right).
+        if let Some(l) = &self.levels {
+            return ((l.pan as f64 - 6400.0) / 6400.0).clamp(-1.0, 1.0);
+        }
+        if let Some(l) = &self.level_adjusts {
+            return (l.pan as f64 / 12800.0).clamp(-1.0, 1.0);
+        }
+        0.0
     }
 
-    /// Linear volume scalar combining both gain stages.
-    ///
-    /// `Levels.volume` (channel rack, 10000 = unity) and
-    /// `LevelAdjusts.volume` (mixer strip, 10000 = unity) are
-    /// independent multiplicative gains in FL.  The old code applied
-    /// only `Levels`, which dropped the mixer-strip adjustment on
-    /// every channel that had one — a real, if small, gain loss.
+    /// Linear volume scalar.  `Levels.volume` is 0..12800, 12800 = 100%.
+    /// Prefers `Levels`, falls back to `LevelAdjusts`, then to 1.0.
     pub fn volume_scale(&self) -> f64 {
-        let rack = self
-        .levels
-        .as_ref()
-        .map(|l| l.volume as f64 / 10000.0)
-        .unwrap_or(1.0);
-        let adj = self
-        .level_adjusts
-        .as_ref()
-        .map(|l| l.volume as f64 / 10000.0)
-        .unwrap_or(1.0);
-        if rack <= 0.0 || adj <= 0.0 {
-            return 0.0;
+        if let Some(l) = &self.levels {
+            if l.volume == 0 {
+                return 0.0;
+            }
+            return (l.volume as f64 / 12800.0).clamp(0.0, 2.0);
         }
-        (rack * adj).clamp(0.0, 4.0)
+        if let Some(l) = &self.level_adjusts {
+            if l.volume == 0 {
+                return 0.0;
+            }
+            return (l.volume as f64 / 12800.0).clamp(0.0, 2.0);
+        }
+        1.0
     }
 }
 

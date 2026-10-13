@@ -23,6 +23,7 @@ pub(super) struct EmbeddedSample {
     pub(super) root_key: Option<u8>,
     pub(super) files_found: usize,
     pub(super) raw_len: usize,
+    /// Every zone found: (wav bytes, root key).  Zone 0 is the primary.
     pub(super) all_zones: Vec<(Vec<u8>, Option<u8>)>,
 }
 
@@ -61,48 +62,35 @@ fn pan_norm(p: u8) -> f64 {
     ((p as f64 - 64.0) / 64.0).clamp(-1.0, 1.0)
 }
 
-/// True if this audio clip is a plain one-shot: placed at the start of
-/// the sample (offset 0), playing to the sample's natural end (no trim
-/// on the end either).  These clips play the whole sample; the visual
-/// playlist length is only where the user dragged the boundary.
-///
-/// FL tags one-shot sampler channels with `sampler_flags: 2` (LoadRegions)
-/// and often places a short visual clip that has no relation to the
-/// sample's actual playback length.  A 30-tick clip on a 2.88-second
-/// sample is a marker, not a truncation.
-fn is_untrimmed_audio_clip(p: &Placed) -> bool {
-    let start_is_zero = p.clip_offset_ms.map_or(false, |o| o <= 0.0);
-    let end_is_open = match p.clip_end_ms {
-        None => true,
-        Some(e) => e < 0.0,
-    };
-    start_is_zero && end_is_open
-}
-
 /// The sample's native tempo for an audio clip that FL has time-stretched,
 /// or `None` if the clip plays at its natural speed.
 ///
-/// Only fires when *both* ends of the clip are trimmed.  An untrimmed
-/// clip plays natural-length: the sample rings out for its own duration
-/// and the visual clip length is just where the user dragged it.
+/// FL stores the part of the file a clip shows (`start..end`, in ms) and
+/// the clip's own length on the playlist.  If the window is not as long as
+/// the clip, the audio was stretched: `speed = window / clip` is how many
+/// source seconds play per output second.  The sample's own tempo is then
+/// `project bpm / speed`; Trackscript writes that as `|bpm` and the player
+/// stretches to the song tempo.
 fn source_bpm(p: &Placed, ppq: u32, style: &NoteStyle) -> Option<f64> {
     let start_ms = p.clip_offset_ms? as f64;
     let ticks = p.note.length;
     if ticks == 0 || ppq == 0 || style.bpm <= 0.0 {
         return None;
     }
-
-    let start_trimmed = start_ms > 0.0;
-    let end_trimmed = matches!(p.clip_end_ms, Some(e) if e >= 0.0);
-    if !(start_trimmed && end_trimmed) {
-        return None;
-    }
-    let end_ms = p.clip_end_ms? as f64;
-
     let clip_ms = ticks as f64 / ppq as f64 * 60_000.0 / style.bpm;
+
+    // `end < 0` means "untrimmed": the window runs to the end of the file.
+    let end_ms = match p.clip_end_ms {
+        Some(e) if e >= 0.0 => e as f64,
+        _ => style.full_secs? * 1000.0,
+    };
+
     let speed = (end_ms - start_ms) / clip_ms;
-    let tolerance: f64 = (1.0 / ticks as f64).max(0.005);
-    if speed > 0.0 && (speed - 1.0).abs() > tolerance {
+    // One tick of rounding in the clip length is not a stretch.
+    let tolerance = (1.0 / ticks as f64).max(0.005);
+    // Ratios far outside normal stretching mean the end offset is not a
+    // window (e.g. a one-shot trimmed by length); do not stretch those.
+    if (0.25..=4.0).contains(&speed) && (speed - 1.0).abs() > tolerance {
         Some(style.bpm / speed)
     } else {
         None
@@ -134,18 +122,10 @@ fn render_part(
             let key = n.key as i32 + style.transpose;
             let mut dur_beats = (n.length as f64 / ppq as f64).max(0.05);
 
-            // Untrimmed audio clips play the sample's natural length,
-            // not the visual clip length.  Without this, a 2.9-second
-            // sample in a 0.18-second clip slot is cut off after the
-            // first 6% of its audio.
-            if is_untrimmed_audio_clip(p) {
-                if let Some(secs) = style.full_secs {
-                    let full_beats = secs * style.bpm / 60.0;
-                    if full_beats > dur_beats {
-                        dur_beats = full_beats;
-                    }
-                }
-            } else if let (false, Some(secs), None) =
+            // NOTE: this branch only runs when PLAY_FULL_SAMPLE is false
+            // (the `false` in the pattern), and never for audio clips
+            // (`clip_offset_ms` must be None).  Left as it was.
+            if let (false, Some(secs), None) =
                 (PLAY_FULL_SAMPLE, style.full_secs, p.clip_offset_ms)
             {
                 let ratio = 2f64.powf((key as f64 - 60.0) / 12.0);
@@ -159,7 +139,13 @@ fn render_part(
                 format!("~{}", fmt(dur_beats, 2)),
             ];
 
-            let vol = (vel_to_pct(n.velocity) * style.vol_scale).clamp(0.0, 100.0);
+            // Audio clips carry their own gain, which can exceed unity.
+            let (gain, vol_max) = if p.clip_offset_ms.is_some() {
+                (p.clip_gain as f64, 400.0)
+            } else {
+                (1.0, 100.0)
+            };
+            let vol = (vel_to_pct(n.velocity) * style.vol_scale * gain).clamp(0.0, vol_max);
             if (vol - 100.0).abs() > 0.5 {
                 fields.push(format!("%{}", fmt(vol, 1)));
             }

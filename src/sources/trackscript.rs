@@ -652,7 +652,19 @@ fn parse_part_events(
                     .or_else(|| c.get(3))
                     .map(|m| m.as_str())
                     .unwrap_or("");
-                    ev.offset = Some(if raw.is_empty() { 0 } else { raw.parse().unwrap_or(0) });
+                    // No offset specified → inherit the part default rather
+                    // than resetting to zero.
+                    ev.offset = if raw.is_empty() {
+                        None
+                    } else {
+                        raw.parse().ok()
+                    };
+                    if std::env::var_os("TS_OFFSET_DEBUG").is_some() {
+                        eprintln!(
+                            "ts-offset: field={:?} path={:?} raw={:?} -> offset={:?}",
+                            f, &c[1], raw, ev.offset,
+                        );
+                    }
                 }
             }
         }

@@ -7,6 +7,7 @@ use std::sync::{Arc, OnceLock};
 use crate::effects::EffectChain;
 use crate::sources::trackscript::C5_HZ;
 use crate::timing::AutomationLane;
+use crate::tui::mute;
 use crate::vst_host_ffi::VstHost;
 
 use super::project::{Project, Sample};
@@ -27,6 +28,12 @@ pub(crate) struct Scheduled {
     pub(crate) vol_lane: Option<AutomationLane>,
     pub(crate) pan_lane: Option<AutomationLane>,
     pub(crate) const_gain: (f64, f64),
+    /// Identity for mute lookups.  `part_path` is the string
+    /// `Project::part_path(name)` returns; `source_row` is the note's
+    /// row within its own part.  Together with `line` (the block line
+    /// the voice was placed on) these form the key the UI toggles.
+    pub(crate) part_path: String,
+    pub(crate) source_row: f64,
 }
 
 impl Scheduled {
@@ -46,6 +53,9 @@ pub(crate) struct VstNote {
     pub(crate) velocity: u8,
     pub(crate) line: u32,
     pub(crate) seq: u32,
+    /// Same identity scheme as `Scheduled`.
+    pub(crate) part_path: String,
+    pub(crate) source_row: f64,
 }
 
 impl VstNote {
@@ -61,7 +71,11 @@ pub(crate) fn gains(vol_pct: f64, pan: f64, song_volume: f64, linear: bool) -> (
     let v = vol_pct * song_volume / 100.0;
     let pan = pan.clamp(-1.0, 1.0);
     if linear {
-        (v * (1.0 - pan) * 0.5, v * (1.0 + pan) * 0.5)
+        // Balance-style law: unity gain on both sides at centre, the far
+        // side fades to silence as the pan moves out (peaks at 0 dB, no
+        // centre dip).  Centred sources play at full level, in line with
+        // synths, whose output bypasses the pan law.
+        (v * (1.0 - pan).min(1.0), v * (1.0 + pan).min(1.0))
     } else {
         let theta = (pan + 1.0) * FRAC_PI_4;
         (v * theta.cos(), v * theta.sin())
@@ -327,6 +341,16 @@ impl Engine {
                 continue;
             }
             if v.start < self.pos {
+                // Already-sounding voice being re-ingested, typically
+                // after a seek or loop.  Check mute here too: the
+                // activation check in `render` only runs for voices
+                // that come out of `pending`, and these go straight
+                // into `active`.  Without this, a muted note that was
+                // sounding at the seek point gets re-activated and
+                // plays out its remaining duration.
+                if !mute::is_note_active(&v.part_path, v.line as usize, v.source_row as i64) {
+                    continue;
+                }
                 let raw_pos = self.raw_pos_at(&v, self.pos);
                 self.active.push(Active { v, raw_pos });
             } else {
@@ -461,9 +485,17 @@ impl Engine {
         let dir_f = dir as f64;
 
         // ── Voice activation ─────────────────────────────────────────
+        //
+        // A scheduled voice becomes audible here.  Mute is checked at
+        // this point so toggling mute mid-song takes effect on the very
+        // next note event.  Muted voices are dropped silently: they
+        // never enter `active`.
         if speed > 0 {
             while self.pending.front().map_or(false, |v| v.start < block_end) {
                 let v = self.pending.pop_front().unwrap();
+                if !mute::is_note_active(&v.part_path, v.line as usize, v.source_row as i64) {
+                    continue;
+                }
                 let raw_pos = v.offset;
                 self.active.push(Active { v, raw_pos });
             }
@@ -476,6 +508,9 @@ impl Engine {
                 };
                 if activate {
                     let v = self.pending.remove(i).unwrap();
+                    if !mute::is_note_active(&v.part_path, v.line as usize, v.source_row as i64) {
+                        continue;
+                    }
                     let step = v.sample.rate * (v.pitch_hz / C5_HZ) / sr;
                     let note_len = (v.end - v.start).max(0) as f64;
                     let raw_pos = v.offset + (note_len - 1.0).max(0.0) * step;
@@ -491,6 +526,13 @@ impl Engine {
         let linear = self.linear;
 
         self.active.retain_mut(|a| {
+            // Instant mute: drop voices whose key became muted since
+            // the last block.  This is what makes muting a note that's
+            // mid-flight stop the sound on the very next audio buffer
+            // instead of waiting for the note to finish on its own.
+            if !mute::is_note_active(&a.v.part_path, a.v.line as usize, a.v.source_row as i64) {
+                return false;
+            }
             let v = &a.v;
             let smp = &*v.sample;
             let len = smp.len() as f64;
@@ -564,11 +606,6 @@ impl Engine {
         });
 
         // ── VST voices ───────────────────────────────────────────────
-        // Synths follow the timeline at exactly 1x.  At any other
-        // speed they can't be scheduled sensibly, so we play back the
-        // recorded history instead of driving the plugins.  The whole
-        // block gets scaled by 1/|speed| at the end of `render`, so
-        // scrubbing stays audible but doesn't blast the speakers.
         if !self.hosts.is_empty() {
             if speed == 1 {
                 if !self.vst_synced {
@@ -598,12 +635,6 @@ impl Engine {
         }
 
         // ── Monitoring scale ─────────────────────────────────────────
-        // Fast scrubbing is inherently loud because more song content
-        // is packed into the same wall-clock window.  Scale the whole
-        // mix by 1/|speed| so 4x is 6 dB down, 16x is 12 dB down, and
-        // 1x stays at unity.  Applied after master fx so the chain
-        // always sees the true mix level, and so the reverb tail is
-        // scaled along with everything else.
         if speed != 1 {
             let scale = 1.0 / (speed.unsigned_abs() as f32);
             for s in out_l.iter_mut() { *s *= scale; }
@@ -641,15 +672,17 @@ impl Engine {
             let chunk_end = chunk_start + chunk_len as i64;
             events.clear();
 
-            // Note-ons due in this chunk.  If the same key is still held
-            // by an earlier note, that note is cut at the new note's
-            // start: MIDI has no note ids, so a stale note-off arriving
-            // later would otherwise kill the new voice.
+            // Note-ons due in this chunk.
             while vst_pending
                 .front()
                 .map_or(false, |n| n.start < chunk_end)
             {
                 let n = vst_pending.pop_front().unwrap();
+                // Muted: skip the note-on entirely, and don't add it to
+                // `vst_active` so no dangling note-off is generated.
+                if !mute::is_note_active(&n.part_path, n.line as usize, n.source_row as i64) {
+                    continue;
+                }
                 let off = (n.start - chunk_start).max(0) as i32;
                 if let Some(i) = vst_active
                     .iter()
@@ -662,11 +695,7 @@ impl Engine {
                 vst_active.push(n);
             }
 
-            // Note-offs due in this chunk.  Strictly before `chunk_end`:
-            // an event at offset == chunk_len is outside the buffer, so a
-            // note ending exactly on the boundary is released at offset 0
-            // of the next chunk instead.  Notes that start and end inside
-            // this chunk are released here too, not a chunk late.
+            // Note-offs due in this chunk.
             let mut i = 0;
             while i < vst_active.len() {
                 if vst_active[i].end < chunk_end {
@@ -739,14 +768,7 @@ impl Engine {
     }
 
     /// Play back the recorded VST history at whatever rate the transport
-    /// is running.  Used for both reverse and fast-forward: we can't
-    /// drive a plugin at a speed other than 1x, but we can replay what
-    /// it produced when the song was played forward.
-    ///
-    /// Each output sample corresponds to song position
-    /// `block_start + i * speed`.  Positions that fall outside the
-    /// recorded range (beyond `vst_hist_head`, or more than one ring
-    /// length behind it) are silent.
+    /// is running.  Used for both reverse and fast-forward.
     fn render_vsts_history(
         &mut self,
         out_l: &mut [f32],

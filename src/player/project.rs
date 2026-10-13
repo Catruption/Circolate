@@ -349,13 +349,13 @@ fn build_template(
                             dur_rows: dur_beats * subs,
                             pitch_hz,
                             vol: ev.vol.unwrap_or(100.0),
-                                    pan: ev.pan.unwrap_or(0.0),
-                                    sample_id: sid,
-                                    offset: 0,
-                                    src_bpm: None,
-                                    pitch_wp: Vec::new(),
-                                    vol_wp: Vec::new(),
-                                    pan_wp: Vec::new(),
+                            pan: ev.pan.unwrap_or(0.0),
+                            sample_id: sid,
+                            offset: ev.offset.unwrap_or(part.sample_offset),
+                            src_bpm: None,
+                            pitch_wp: Vec::new(),
+                            vol_wp: Vec::new(),
+                            pan_wp: Vec::new(),
                         });
                         last = Some(voices.len() - 1);
                         continue;
@@ -370,14 +370,14 @@ fn build_template(
                         rel_row: ev.row,
                         dur_rows: dur_beats * subs,
                         pitch_hz: ev.pitch_hz.unwrap_or(C5_HZ),
-                                vol: ev.vol.unwrap_or(100.0),
-                                pan: ev.pan.unwrap_or(0.0),
-                                sample_id: sid,
-                                offset: ev.offset.unwrap_or(part.sample_offset),
-                                src_bpm: ev.src_bpm.or(part.src_bpm),
-                                pitch_wp: Vec::new(),
-                                vol_wp: Vec::new(),
-                                pan_wp: Vec::new(),
+                        vol: ev.vol.unwrap_or(100.0),
+                        pan: ev.pan.unwrap_or(0.0),
+                        sample_id: sid,
+                        offset: ev.offset.unwrap_or(part.sample_offset),
+                        src_bpm: ev.src_bpm.or(part.src_bpm),
+                        pitch_wp: Vec::new(),
+                        vol_wp: Vec::new(),
+                        pan_wp: Vec::new(),
                     });
                     last = Some(voices.len() - 1);
                     continue;
@@ -427,13 +427,13 @@ fn build_template(
                             dur_rows: dur_beats * subs,
                             pitch_hz,
                             vol: ev.vol.unwrap_or(100.0),
-                                    pan: ev.pan.unwrap_or(0.0),
-                                    sample_id: sid,
-                                    offset: 0,
-                                    src_bpm: None,
-                                    pitch_wp: Vec::new(),
-                                    vol_wp: Vec::new(),
-                                    pan_wp: Vec::new(),
+                            pan: ev.pan.unwrap_or(0.0),
+                            sample_id: sid,
+                            offset: ev.offset.unwrap_or(part.sample_offset),
+                            src_bpm: None,
+                            pitch_wp: Vec::new(),
+                            vol_wp: Vec::new(),
+                            pan_wp: Vec::new(),
                         });
                         last = Some(voices.len() - 1);
                         continue;
@@ -718,6 +718,29 @@ impl Project {
         self.parts.get(name).map(|p| p.subs_per_beat).unwrap_or(4)
     }
 
+    pub(crate) fn part_sample_offset(&self, name: &str) -> f64 {
+        self.parts
+            .get(name)
+            .map(|p| p.sample_offset as f64)
+            .unwrap_or(0.0)
+    }
+
+    /// Same as `part_sample_offset`, but in the native `u32` type so
+    /// callers that need the raw value for offset arithmetic (the
+    /// tracker's sample playhead, the static synth envelope) don't have
+    /// to round-trip through `f64`.
+    pub(crate) fn part_sample_offset_u32(&self, name: &str) -> u32 {
+        self.parts.get(name).map(|p| p.sample_offset).unwrap_or(0)
+    }
+
+    /// The part hash map, keyed by part name.  `u64` fingerprints of
+    /// each part's full event stream, computed at load time and used
+    /// by the file watcher to tell "the file changed on disk but the
+    /// music didn't" apart from a genuine edit.
+    pub(crate) fn part_hash_map(&self) -> &HashMap<String, u64> {
+        &self.part_hash
+    }
+
     pub(crate) fn line_measure_samples(&self, li: usize) -> i64 {
         let start_row = li as f64 * self.rows_per_measure;
         let end_row = start_row + self.rows_per_measure;
@@ -755,6 +778,7 @@ pub(crate) fn load_project(
     ts_path: &Path,
     sample_rate: u32,
     use_cache: bool,
+    quiet: bool,
 ) -> Result<(Arc<Project>, Cache)> {
     let parsed = parse_file(ts_path)?;
     let base = ts_path.parent().unwrap_or_else(|| Path::new("."));
@@ -779,18 +803,22 @@ pub(crate) fn load_project(
                 .with_context(|| format!("parsing {}", p.display()))
             }) {
                 Ok(f) => {
-                    println!(
-                        "  fidelity: {} channels, {} automation lanes, {} playlist items, {} insert buses, {} multi-sample groups",
-                        f.channels.len(),
-                        f.channel_automation.len(),
-                        f.playlist.len(),
-                        f.inserts.len(),
-                        f.multi_sample.len(),
-                    );
+                    if !quiet {
+                        println!(
+                            "  fidelity: {} channels, {} automation lanes, {} playlist items, {} insert buses, {} multi-sample groups",
+                            f.channels.len(),
+                            f.channel_automation.len(),
+                            f.playlist.len(),
+                            f.inserts.len(),
+                            f.multi_sample.len(),
+                        );
+                    }
                     Some(f)
                 }
                 Err(e) => {
-                    eprintln!("  fidelity: {:#}, ignoring", e);
+                    if !quiet {
+                        eprintln!("  fidelity: {:#}, ignoring", e);
+                    }
                     None
                 }
             }
@@ -833,14 +861,6 @@ pub(crate) fn load_project(
                 rate,
                 loop_pts,
             };
-            if rel.contains("ae2f3f60") {
-                let peak_l = smp.left.iter().fold(0.0f32, |a, b| a.max(b.abs()));
-                let peak_r = smp.right.iter().fold(0.0f32, |a, b| a.max(b.abs()));
-                eprintln!(
-                    "ae2f-check: id={} len_l={} len_r={} rate={} stereo={} peak_l={:.6} peak_r={:.6}",
-                    s.id, smp.left.len(), smp.right.len(), rate, stereo, peak_l, peak_r
-                );
-            }
             fps.insert(s.id, fingerprint(&smp));
             samples.insert(s.id, Arc::new(smp));
             if let Some(stripped) = rel.strip_prefix("./") {
@@ -849,9 +869,13 @@ pub(crate) fn load_project(
             path_to_id.insert(rel, s.id);
         }
     } else {
-        eprintln!("  (no samples.json in {})", base.display());
+        if !quiet {
+            eprintln!("  (no samples.json in {})", base.display());
+        }
     }
-    println!("  loaded {} samples", samples.len());
+    if !quiet {
+        println!("  loaded {} samples", samples.len());
+    }
 
     // Sample id → path mapping.  Useful when chasing "why is this one
     // sample silent": grep the debug output for the file's stem.
@@ -902,7 +926,7 @@ pub(crate) fn load_project(
             multi_sample_instruments.insert(primary, Arc::new(MultiSampleInstrument { zones }));
         }
     }
-    if !multi_sample_instruments.is_empty() {
+    if !quiet && !multi_sample_instruments.is_empty() {
         println!(
             "  multi-sample: {} instrument(s)",
             multi_sample_instruments.len()
@@ -936,28 +960,36 @@ pub(crate) fn load_project(
                         sf2_instruments.insert(rel, Arc::new(obj));
                     }
                     Err(e) => {
-                        eprintln!(
-                            "  (failed to load SF2 {}: {:#})",
-                                  sf2_path.display(),
-                                  e
-                        );
+                        if !quiet {
+                            eprintln!(
+                                "  (failed to load SF2 {}: {:#})",
+                                sf2_path.display(),
+                                e
+                            );
+                        }
                     }
                 }
             } else if inst.is_vst3() {
                 if inst.unresolved {
-                    eprintln!("  (skipping unresolved VST: {})", p.display());
+                    if !quiet {
+                        eprintln!("  (skipping unresolved VST: {})", p.display());
+                    }
                     continue;
                 }
                 if inst.vst_path.is_empty() {
-                    eprintln!("  (VST sidecar has no Path: {})", p.display());
+                    if !quiet {
+                        eprintln!("  (VST sidecar has no Path: {})", p.display());
+                    }
                     continue;
                 }
                 let plugin_path = PathBuf::from(&inst.vst_path);
                 if !plugin_path.exists() {
-                    eprintln!(
-                        "  (VST sidecar points at missing file: {})",
-                              plugin_path.display()
-                    );
+                    if !quiet {
+                        eprintln!(
+                            "  (VST sidecar points at missing file: {})",
+                            plugin_path.display()
+                        );
+                    }
                     continue;
                 }
                 let state_bytes = if inst.state_path.as_os_str().is_empty() {
@@ -980,11 +1012,13 @@ pub(crate) fn load_project(
             }
         }
     }
-    println!(
-        "  loaded {} sf2 instruments, {} vst instruments",
-        sf2_instruments.len(),
-             vst_instruments.len()
-    );
+    if !quiet {
+        println!(
+            "  loaded {} sf2 instruments, {} vst instruments",
+            sf2_instruments.len(),
+            vst_instruments.len()
+        );
+    }
 
     let sr = sample_rate as f64;
     let rows_per_measure = cfg.time_signature.0 as f64 * cfg.subdivisions.max(1) as f64;
@@ -992,7 +1026,9 @@ pub(crate) fn load_project(
     let mut tempo_events = parsed.tempo_events.clone();
     let shim_tempo = tempo_shims_to_events(&parsed.shims, rows_per_measure);
     if !shim_tempo.is_empty() {
-        println!("  tempo shims: {} event(s)", shim_tempo.len());
+        if !quiet {
+            println!("  tempo shims: {} event(s)", shim_tempo.len());
+        }
         tempo_events.extend(shim_tempo);
         tempo_events.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     }
@@ -1016,7 +1052,7 @@ pub(crate) fn load_project(
         let placement_row = li as f64 * rows_per_measure;
         let mut names = Vec::new();
         let (mut min_row, mut max_end_row) = (f64::INFINITY, f64::NEG_INFINITY);
-                for call in line {
+        for call in line {
             if std::env::var_os("TS_DEBUG").is_some() && call.contains("ae2f") {
                 eprintln!(
                     "ts: block call {:?} parts.contains_key={}",
@@ -1073,8 +1109,8 @@ pub(crate) fn load_project(
         let line_end_row = placement_row + rows_per_measure;
         let (min_start, max_end) = (
             (tempo.time_at_row(placement_row) * sr) as i64,
-                                    (tempo.time_at_row(max_end_row.max(line_end_row))
-                                    .min(render_end_sec) * sr) as i64,
+            (tempo.time_at_row(max_end_row.max(line_end_row))
+            .min(render_end_sec) * sr) as i64,
         );
         lines.push(LineInfo {
             parts: names,
@@ -1089,13 +1125,37 @@ pub(crate) fn load_project(
     let mut order: Vec<usize> = (0..lines.len()).collect();
     order.sort_by_key(|&i| (lines[i].min_start, i));
 
-    println!(
-        "  parsed {} parts, {} blocks, {} BlockList lines, {} voices",
-        parsed.parts.len(),
-             parsed.blocks.len(),
-             parsed.block_list.len(),
-             total_voices
-    );
+    if !quiet {
+        println!(
+            "  parsed {} parts, {} blocks, {} BlockList lines, {} voices",
+            parsed.parts.len(),
+            parsed.blocks.len(),
+            parsed.block_list.len(),
+            total_voices
+        );
+    }
+
+    if std::env::var_os("TRACE_OFFSET").is_some() {
+        for name in [
+            "ae2f3f60-10c3-49ec-9131-0edba348a8b8",
+            "pianoer03",
+        ] {
+            if let Some(part) = parsed.parts.get(name) {
+                eprintln!(
+                    "TRACE: part {:?} sample_path={:?} sample_offset={}",
+                    name, part.sample_path, part.sample_offset
+                );
+                for ev in &part.events {
+                    if ev.offset.is_some() || ev.sample_override.is_some() {
+                        eprintln!(
+                            "TRACE:   ev row={:.2} sample_override={:?} offset={:?}",
+                            ev.row, ev.sample_override, ev.offset
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     let title = ts_path
     .file_stem()
@@ -1295,11 +1355,13 @@ fn prepare_line(
                 vol: tv.vol,
                 pan: tv.pan,
                 pitch_lane: mk(&tv.pitch_wp, tv.pitch_hz),
-                         vol_lane: mk(&tv.vol_wp, tv.vol),
-                         pan_lane: mk(&tv.pan_wp, tv.pan),
-                         const_gain: gains(tv.vol, tv.pan, project.song_volume, project.linear_pan),
+                vol_lane: mk(&tv.vol_wp, tv.vol),
+                pan_lane: mk(&tv.pan_wp, tv.pan),
+                const_gain: gains(tv.vol, tv.pan, project.song_volume, project.linear_pan),
+                part_path: part.sample_path.clone(),
+                source_row: tv.rel_row,
             });
-                        if let Ok(target) = std::env::var("VOICE_TRACE_SAMPLE") {
+            if let Ok(target) = std::env::var("VOICE_TRACE_SAMPLE") {
                 if let Ok(tid) = target.parse::<u32>() {
                     if tv.sample_id == tid {
                         eprintln!(
@@ -1335,6 +1397,8 @@ fn prepare_line(
                 velocity: vn.velocity,
                 line: li as u32,
                 seq,
+                part_path: part.sample_path.clone(),
+                source_row: vn.rel_row,
             });
         }
     }

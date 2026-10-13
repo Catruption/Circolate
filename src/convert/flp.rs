@@ -418,7 +418,7 @@ pub(super) fn convert(
     out.push_str("    TimeSignature: 4/4;\n");
     out.push_str(&format!("    Subdivisions: {};\n", subs));
     out.push_str("    SongVolume: 100%;\n");
-    out.push_str("    PanningLaw: linear;\n");
+    out.push_str("    PanningLaw: equal_power;\n");
     out.push_str("    Overlap: stack;\n");
     out.push_str("    PitchDefault: names;\n");
     out.push_str("}\n\n");
