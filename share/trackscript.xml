@@ -1,0 +1,154 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE language SYSTEM "language.dtd">
+<language name="Trackscript" section="Sources" version="2" kateversion="5.0" extensions="*.trackscript" mimetype="" license="MIT" author="">
+  <highlighting>
+
+    <list name="keywords">
+      <item>Config</item>
+      <item>BlockList</item>
+      <item>BlockArray</item>
+    </list>
+    <list name="reserved">
+      <item>Tempo</item>
+      <item>GlobalVolume</item>
+      <item>GlobalPan</item>
+      <item>GlobalTuning</item>
+    </list>
+    <list name="keys">
+      <item>TrackscriptVersion</item>
+      <item>BeatsPerMinute</item>
+      <item>TimeSignature</item>
+      <item>Subdivisions</item>
+      <item>SongVolume</item>
+      <item>PanningLaw</item>
+      <item>Overlap</item>
+      <item>PitchDefault</item>
+    </list>
+    <list name="values">
+      <item>linear</item>
+      <item>equal_power</item>
+      <item>stack</item>
+      <item>hz</item>
+      <item>names</item>
+    </list>
+    <list name="alerts">
+      <item>UNDECIDED</item>
+      <item>TODO</item>
+      <item>FIXME</item>
+    </list>
+
+    <contexts>
+
+      <!-- Top level: Config / BlockList / BlockArray sections, definitions,
+      calls, shim markers. -->
+      <context name="Normal" attribute="Normal Text" lineEndContext="#stay">
+        <Detect2Chars char="/" char1="/" attribute="Comment" context="Comment"/>
+
+        <!-- Definition or call: ƒName( -->
+        <RegExpr String="ƒ[A-Za-z_]\w*(?=\()" attribute="Block Def" context="#stay"/>
+        <!-- Bare name (composite target, shim target) -->
+        <RegExpr String="ƒ[A-Za-z_]\w*" attribute="Block Call" context="#stay"/>
+        <!-- Inline source: ƒ'path' or ƒ'path'(offset) -->
+        <RegExpr String="ƒ'[^']*'(?:\(\d+\))?" attribute="Source Path" context="#stay"/>
+
+        <!-- Waypoint / undocumented prefixes, only meaningful before < -->
+        <RegExpr String="[&amp;=▲♪](?=&lt;)" attribute="Connector" context="#stay"/>
+        <!-- Shim marker -->
+        <RegExpr String="@(?=&lt;)" attribute="Shim" context="#stay"/>
+
+        <!-- Section header, when written standalone -->
+        <RegExpr String="\|\d+/\d+(?=\[)" attribute="Section Header" context="#stay"/>
+
+        <!-- Field list -->
+        <DetectChar char="&lt;" attribute="Normal Text" context="Fields"/>
+
+        <keyword String="keywords" attribute="Keyword" context="#stay"/>
+        <keyword String="keys" attribute="Key" context="#stay"/>
+        <keyword String="values" attribute="Value" context="#stay"/>
+        <IncludeRules context="Numbers"/>
+      </context>
+
+      <!-- Inside <...>: notes, definition arguments, shim fields.  All
+      three use the same grammar, so they share this context. -->
+      <context name="Fields" attribute="Normal Text" lineEndContext="#stay">
+        <DetectChar char="&gt;" attribute="Normal Text" context="#pop"/>
+        <Detect2Chars char="/" char1="/" attribute="Comment" context="Comment"/>
+        <DetectChar char="'" attribute="String" context="String"/>
+
+        <!-- Section frame: |4/4 inside a definition's argument list -->
+        <RegExpr String="\|\d+/\d+(?=[,\]])" attribute="Section Header" context="#stay"/>
+
+        <!-- Inline source: ƒ'path' or ƒ'path'(offset) -->
+        <RegExpr String="ƒ'[^']*'(?:\(\d+\))?" attribute="Source Path" context="#stay"/>
+        <!-- Block/composite call, or a reserved shim target -->
+        <RegExpr String="ƒ[A-Za-z_]\w*" attribute="Block Call" context="#stay"/>
+
+        <!-- Value fields with optional operator tail.
+        %100            plain value
+        %15+0.1         value, operator
+        %15+0.1^0/1     value, operator, rate
+        %15+0.1^0/1:4   value, operator, rate, count
+        -->
+        <RegExpr String="§[\d.]+(?:/[\d.]+)?" attribute="Position" context="#stay"/>
+        <RegExpr String="#(?:[A-Ga-g][#b]?-?\d+|\d+(?:\.\d+)?)(?:[+\-*±][\d.]+(?:[→^][\d.]+(?:/[\d.]+)?)?(?::\d+)?)?" attribute="Pitch" context="#stay"/>
+        <RegExpr String="~[\d.]+(?:[+\-*±][\d.]+(?:[→^][\d.]+(?:/[\d.]+)?)?(?::\d+)?)?" attribute="Length" context="#stay"/>
+        <RegExpr String="%-?[\d.]+(?:[+\-*±][\d.]+(?:[→^][\d.]+(?:/[\d.]+)?)?(?::\d+)?)?" attribute="Volume" context="#stay"/>
+        <RegExpr String="¶-?[\d.]+(?:[+\-*±][\d.]+(?:[→^][\d.]+(?:/[\d.]+)?)?(?::\d+)?)?" attribute="Pan" context="#stay"/>
+
+        <!-- Operator glyphs that appear without a preceding field value -->
+        <AnyChar String="+*±→^" attribute="Operator" context="#stay"/>
+
+        <keyword String="reserved" attribute="Reserved" context="#stay"/>
+        <IncludeRules context="Numbers"/>
+      </context>
+
+      <context name="Numbers" attribute="Normal Text" lineEndContext="#stay">
+        <RegExpr String="\d+(?:\.\d+)?%" attribute="Float" context="#stay"/>
+        <RegExpr String="\d+(?:\.\d+)?/\d+(?:\.\d+)?" attribute="Number" context="#stay"/>
+        <RegExpr String="\d+\.\d+" attribute="Float" context="#stay"/>
+        <RegExpr String="\d+" attribute="Number" context="#stay"/>
+      </context>
+
+      <context name="String" attribute="String" lineEndContext="#pop">
+        <DetectChar char="'" attribute="String" context="#pop"/>
+      </context>
+
+      <context name="Comment" attribute="Comment" lineEndContext="#pop">
+        <keyword String="alerts" attribute="Alert" context="#stay"/>
+      </context>
+
+    </contexts>
+
+    <itemDatas>
+      <itemData name="Normal Text" defStyleNum="dsNormal" spellChecking="false"/>
+      <itemData name="Comment" defStyleNum="dsComment"/>
+      <itemData name="Alert" defStyleNum="dsAlert" spellChecking="false"/>
+      <itemData name="Keyword" defStyleNum="dsKeyword" spellChecking="false"/>
+      <itemData name="Key" defStyleNum="dsAttribute" spellChecking="false"/>
+      <itemData name="Value" defStyleNum="dsOthers" spellChecking="false"/>
+      <itemData name="String" defStyleNum="dsString" spellChecking="false"/>
+      <itemData name="Source Path" defStyleNum="dsSpecialString" spellChecking="false"/>
+      <itemData name="Block Call" defStyleNum="dsFunction" spellChecking="false"/>
+      <itemData name="Block Def" defStyleNum="dsDataType" spellChecking="false"/>
+      <itemData name="Section Header" defStyleNum="dsRegionMarker" spellChecking="false"/>
+      <itemData name="Position" defStyleNum="dsDecVal" spellChecking="false"/>
+      <itemData name="Pitch" defStyleNum="dsConstant" spellChecking="false"/>
+      <itemData name="Length" defStyleNum="dsFloat" spellChecking="false"/>
+      <itemData name="Volume" defStyleNum="dsBaseN" spellChecking="false"/>
+      <itemData name="Pan" defStyleNum="dsChar" spellChecking="false"/>
+      <itemData name="Number" defStyleNum="dsDecVal" spellChecking="false"/>
+      <itemData name="Float" defStyleNum="dsFloat" spellChecking="false"/>
+      <itemData name="Operator" defStyleNum="dsOperator" spellChecking="false"/>
+      <itemData name="Connector" defStyleNum="dsControlFlow" spellChecking="false"/>
+      <itemData name="Shim" defStyleNum="dsPreprocessor" spellChecking="false"/>
+      <itemData name="Reserved" defStyleNum="dsBuiltIn" spellChecking="false"/>
+    </itemDatas>
+
+  </highlighting>
+  <general>
+    <comments>
+      <comment name="singleLine" start="//"/>
+    </comments>
+    <keywords casesensitive="1"/>
+  </general>
+</language>

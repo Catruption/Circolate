@@ -12,6 +12,9 @@
 !/share/
 !/share/**
 
+!/trackscripts/
+!/trackscripts/**
+
 !/acquire.sh
 !/fallbacks.json
 !/master_fx.json
