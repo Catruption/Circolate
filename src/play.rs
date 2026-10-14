@@ -1,10 +1,7 @@
-//! `trackscript-player play` — play a song, or convert it.
+//! `trackscript-player play` — play a song, or render it to WAV offline.
 //!
 //! Live playback owns the terminal for the entire session: the TUI comes
 //! up once, stays up across song changes, and only tears down on quit.
-//! Every write that would corrupt the display is either suppressed via
-//! `load_project`'s `quiet` flag or swallowed by a temporary redirect of
-//! stdout/stderr to /dev/null.
 
 use anyhow::{anyhow, bail, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -26,12 +23,6 @@ use crate::tui::queue;
 use crate::vst_host_ffi::VstHost;
 
 // ── silence guard ──────────────────────────────────────────────────────
-//
-// Wraps a block of work in a redirection of stdout/stderr to /dev/null
-// for the duration.  Restores the original fds on drop, panic-safe.
-// Used to swallow anything printed during project load that the `quiet`
-// flag doesn't already suppress — vendor printfs, plugin debug output,
-// stray eprintlns.
 
 #[cfg(unix)]
 mod silence {
@@ -100,6 +91,9 @@ struct Args {
     skip_native: bool,
     no_master_fx: bool,
     no_watch: bool,
+    /// `--sf2 PATH`: override whatever SF2 the sidecars reference.  Used
+    /// by `run.sh` when the user picks a bonus SoundFont.
+    sf2_override: Option<PathBuf>,
 }
 
 fn parse_args(argv: &[String]) -> Result<Args> {
@@ -113,6 +107,7 @@ fn parse_args(argv: &[String]) -> Result<Args> {
     let mut skip_native = false;
     let mut no_master_fx = false;
     let mut no_watch = false;
+    let mut sf2_override: Option<PathBuf> = None;
     while let Some(a) = it.next() {
         match a.as_str() {
             "--render" => {
@@ -137,6 +132,11 @@ fn parse_args(argv: &[String]) -> Result<Args> {
                     it.next().ok_or_else(|| anyhow!("--samples-dir needs a path"))?,
                 ))
             }
+            "--sf2" => {
+                sf2_override = Some(PathBuf::from(
+                    it.next().ok_or_else(|| anyhow!("--sf2 needs a path"))?,
+                ))
+            }
             "--skip-native" => skip_native = true,
             "--no-cache" => no_cache = true,
             "--verify-cache" => verify = true,
@@ -147,16 +147,9 @@ fn parse_args(argv: &[String]) -> Result<Args> {
         }
     }
     Ok(Args {
-        song,
-        render,
-        rate,
-        start,
-        no_cache,
-        verify,
-        samples_dir,
-        skip_native,
-        no_master_fx,
-        no_watch,
+        song, render, rate, start, no_cache, verify,
+        samples_dir, skip_native, no_master_fx, no_watch,
+        sf2_override,
     })
 }
 
@@ -168,10 +161,6 @@ fn is_archive(path: &Path) -> bool {
         .map_or(false, |e| e.eq_ignore_ascii_case(archive::EXTENSION))
 }
 
-/// Look up a queue name in `trackscripts/`.  Accepts a full path, a
-/// bare stem (`winds` → `trackscripts/winds.tsz`), or a filename with
-/// extension.  Falls back to walking up from the running binary's
-/// location so a konsole-launched session from `$HOME` still resolves.
 fn resolve_song(name: &str) -> Result<PathBuf> {
     let name = name.trim();
     if name.is_empty() {
@@ -216,7 +205,7 @@ fn resolve_song(name: &str) -> Result<PathBuf> {
     bail!("no such song: {:?} (looked in trackscripts/)", name)
 }
 
-// ── temporary bundle (for FLP/IT → trackscript conversion) ─────────────
+// ── temporary bundle ───────────────────────────────────────────────────
 
 struct TempBundle {
     dir: PathBuf,
@@ -275,10 +264,11 @@ fn resolve_source(src: &Path, args: &Args) -> Result<(PathBuf, Option<TempBundle
             if let Some(d) = &args.samples_dir {
                 opts.samples_dir = Some(d.clone());
             }
+            if let Some(s) = &args.sf2_override {
+                opts.sf2_path = Some(s.clone());
+            }
             opts.skip_native = args.skip_native;
 
-            // Conversion runs its own prints on the way out.  Swallow
-            // them so nothing leaks into the TUI's alternate screen.
             let conv = {
                 let _s = silence::Silence::new();
                 convert::convert_file(src, &opts)?
@@ -301,7 +291,7 @@ fn resolve_source(src: &Path, args: &Args) -> Result<(PathBuf, Option<TempBundle
     }
 }
 
-// ── audio install helpers ──────────────────────────────────────────────
+// ── install helpers ────────────────────────────────────────────────────
 
 fn install_vst_hosts(engine: &mut Engine, project: &player::Project) {
     for (name, vinst) in &project.vst_instruments {
@@ -314,6 +304,28 @@ fn install_vst_hosts(engine: &mut Engine, project: &player::Project) {
                 let _ = name;
             }
         }
+    }
+}
+
+/// Install a native SF2 engine for every `Sf2EngineSpec` in the project.
+/// `sf2_override` (from `--sf2`) replaces the SF2 each spec references;
+/// the spec's bank/patch/gain are preserved either way.
+fn install_sf2_engines(
+    engine: &mut Engine,
+    project: &player::Project,
+    sf2_override: Option<&Path>,
+) {
+    for (name, spec) in &project.sf2_engine_specs {
+        let path = sf2_override.unwrap_or(&spec.sf2_path);
+
+        let mut sf2 = crate::sf2_engine::Sf2Engine::new(project.sample_rate);
+        if let Err(e) = sf2.load(path) {
+            eprintln!("  sf2 engine failed to load {}: {:#}", name, e);
+            continue;
+        }
+        sf2.set_preset(spec.bank, spec.preset);
+        sf2.set_gain(crate::sf2_engine::DEFAULT_GAIN * spec.gain);
+        engine.install_sf2_engine(spec.iid, sf2);
     }
 }
 
@@ -439,10 +451,10 @@ fn verify_cache(args: &Args, song: &Path) -> Result<()> {
     let rate = args.rate;
     let (path, _guard) = resolve_source(song, args)?;
     let (p1, c1) = player::load_project(&path, rate, true, false)?;
-    let (a_l, a_r, c1) = player::render_offline(&p1, c1, 0, true);
+    let (a_l, a_r, c1) = player::render_offline(&p1, c1, 0, true, None);
     println!("  with cache:    {}", c1.describe());
     let (p2, c2) = player::load_project(&path, rate, false, false)?;
-    let (b_l, b_r, c2) = player::render_offline(&p2, c2, 0, true);
+    let (b_l, b_r, c2) = player::render_offline(&p2, c2, 0, true, None);
     println!("  without cache: {}", c2.describe());
     let diffs = |a: &[f32], b: &[f32]| {
         a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count()
@@ -454,9 +466,7 @@ fn verify_cache(args: &Args, song: &Path) -> Result<()> {
     } else {
         bail!(
             "cache check FAILED: {} differing samples (lengths {} vs {})",
-            n,
-            a_l.len(),
-            b_l.len()
+            n, a_l.len(), b_l.len()
         )
     }
 }
@@ -465,7 +475,11 @@ fn verify_cache(args: &Args, song: &Path) -> Result<()> {
 
 enum Outcome {
     Quit,
-    Next { name: String, queue: queue::QueueState },
+    Next {
+        name: String,
+        queue: queue::QueueState,
+        notes: Vec<String>,
+    },
 }
 
 fn play_one(
@@ -497,10 +511,6 @@ fn play_one(
     let (project, cache, project_path, _guard) = match song {
         Some(p) => {
             let (ts_path, guard) = resolve_source(p, args)?;
-
-            // `quiet: true` suppresses load_project's progress prints.
-            // The silence guard catches anything else — vendor
-            // printfs, plugin debug spew, stray eprintlns.
             let (project, cache) = {
                 let _s = silence::Silence::new();
                 player::load_project(&ts_path, sample_rate, !args.no_cache, true)?
@@ -565,6 +575,7 @@ fn play_one(
 
     let mut engine = Engine::new(&project);
     install_vst_hosts(&mut engine, &project);
+    install_sf2_engines(&mut engine, &project, args.sf2_override.as_deref());
     install_master_fx(&mut engine, &project, args.no_master_fx);
 
     let tp = Arc::clone(&transport);
@@ -594,9 +605,6 @@ fn play_one(
                 data.fill(0.0);
                 return;
             }
-            // Actively producing audio — clear any stale done flag from
-            // a previous completion so the TUI's auto-advance doesn't
-            // re-fire.
             tp.done.store(false, Ordering::Release);
 
             let frames = data.len() / channels;
@@ -629,6 +637,12 @@ fn play_one(
 
     stream.play()?;
 
+    let notes: Vec<String> = project
+        .requires
+        .as_ref()
+        .map(|r| crate::requires::report_lines(r))
+        .unwrap_or_default();
+
     let (request, queue) = tui::run_against(
         term,
         Arc::clone(&transport),
@@ -641,7 +655,7 @@ fn play_one(
 
     match request {
         None => Ok(Outcome::Quit),
-        Some(name) => Ok(Outcome::Next { name, queue }),
+        Some(name) => Ok(Outcome::Next { name, queue, notes }),
     }
 }
 
@@ -668,7 +682,10 @@ pub fn run(argv: &[String]) -> Result<()> {
             player::load_project(&path, args.rate, !args.no_cache, false)?;
         let t0 = std::time::Instant::now();
         let start = (args.start * args.rate as f64) as i64;
-        let (l, r, cache) = player::render_offline(&project, cache, start, args.no_master_fx);
+        let (l, r, cache) = player::render_offline(
+            &project, cache, start, args.no_master_fx,
+            args.sf2_override.as_deref(),
+        );
         player::write_wav(out, &l, &r, args.rate)?;
         println!(
             "  wrote {} ({:.2}s of audio in {:.1}s; {})",
@@ -681,34 +698,35 @@ pub fn run(argv: &[String]) -> Result<()> {
     }
 
     // Live playback: the TUI owns the terminal for the entire loop.
-    // It comes up once, stays up across song changes, and only tears
-    // down on quit.
     let mut term = tui::setup()?;
     let mut song = args.song.clone();
     let mut queue = queue::QueueState::new();
+    let mut pending_notes: Vec<String> = Vec::new();
 
     let result = (|| -> Result<()> {
         loop {
-            // Draw the empty TUI (queue widget included) while the
-            // next project loads.  No console logs leak through — the
-            // load itself is under the silence guard, and `quiet: true`
-            // suppresses load_project's own progress prints.
             let msg = match &song {
                 Some(p) => format!("loading {}...", p.display()),
-                None => {
-                    "no song — queue box is focused; type a name and press enter".into()
-                }
+                None => "no song — queue box is focused; type a name and press enter".into(),
             };
-            tui::show_loading(&mut term, &queue, &msg)?;
+            let notes: Vec<String> = pending_notes.drain(..).collect();
+            tui::show_loading(&mut term, &queue, &msg, &notes)?;
 
-            match play_one(&mut term, &args, song.as_deref(), queue.clone())? {
-                Outcome::Quit => return Ok(()),
-                Outcome::Next { name, queue: q } => {
+            match play_one(&mut term, &args, song.as_deref(), queue.clone()) {
+                Ok(Outcome::Quit) => return Ok(()),
+                Ok(Outcome::Next { name, queue: q, notes: n }) => {
                     queue = q;
+                    pending_notes = n;
                     match resolve_song(&name) {
                         Ok(p) => song = Some(p),
                         Err(_) => song = None,
                     }
+                }
+                Err(e) => {
+                    let msg = format!("load failed: {e:#}");
+                    tui::show_loading(&mut term, &queue, &msg, &[])?;
+                    std::thread::sleep(Duration::from_secs(3));
+                    song = None;
                 }
             }
         }

@@ -10,7 +10,7 @@ use crate::sources::trackscript::TrackscriptPart;
 use super::stretch;
 use super::template::{build_template, PartTemplate};
 use super::types::{
-    MultiSampleInstrument, Sample, Sf2Instrument, VstInstrument,
+    MultiSampleInstrument, Sample, Sf2EngineSpec, Sf2Instrument, VstInstrument,
 };
 
 pub(crate) struct Cache {
@@ -32,6 +32,7 @@ impl Cache {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn template(
         &mut self,
         hash: u64,
@@ -39,6 +40,7 @@ impl Cache {
         path_to_id: &HashMap<String, u32>,
         samples: &HashMap<u32, Arc<Sample>>,
         sf2_instruments: &HashMap<String, Arc<Sf2Instrument>>,
+        sf2_engine_specs: &HashMap<String, Sf2EngineSpec>,
         vst_instruments: &HashMap<String, Arc<VstInstrument>>,
         multi_sample_instruments: &HashMap<String, Arc<MultiSampleInstrument>>,
     ) -> Arc<PartTemplate> {
@@ -54,6 +56,7 @@ impl Cache {
             path_to_id,
             samples,
             sf2_instruments,
+            sf2_engine_specs,
             vst_instruments,
             multi_sample_instruments,
         ));

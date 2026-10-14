@@ -27,6 +27,9 @@ impl Sample {
 
 pub(crate) struct VstInstrument {
     pub(crate) iid: u16,
+    /// Display name as recorded in the sidecar.  Used to look up an
+    /// embedded bundle when loading from an archive.
+    pub(crate) name: String,
     pub(crate) plugin_path: PathBuf,
     pub(crate) state_bytes: Vec<u8>,
     pub(crate) fallback: bool,
@@ -34,6 +37,22 @@ pub(crate) struct VstInstrument {
 }
 
 // ── SF2 instruments ────────────────────────────────────────────────────
+
+/// Everything needed to build an `Sf2Engine` at player startup.
+/// Kept separate from the engine itself because `Project` is behind an
+/// `Arc` and immutable; the engine is stateful and gets installed into
+/// `player::Engine` in `play.rs`.
+pub(crate) struct Sf2EngineSpec {
+    /// On-disk path to the .sf2 file.  Materialized from the source
+    /// into the plugin cache if the sidecar lives in an archive.
+    pub(crate) sf2_path: PathBuf,
+    pub(crate) bank: u8,
+    pub(crate) preset: u8,
+    pub(crate) gain: f32,
+    /// MIDI channel id this engine answers to.  Same iid space as
+    /// `VstInstrument.iid`.
+    pub(crate) iid: u16,
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct Sf2VoiceEnvelope {
@@ -62,6 +81,9 @@ pub(crate) struct Sf2VoiceSpec {
     pub sample_id: u32,
     pub pitch_hz: f64,
     pub env: Sf2VoiceEnvelope,
+    /// Zone pan as -1.0 (left) .. 1.0 (right).  SF2 gen 17 is -500..500;
+    /// stereo samples are a hard-left zone plus a hard-right zone.
+    pub pan: f64,
 }
 
 struct Sf2ZoneEntry {
@@ -72,6 +94,10 @@ struct Sf2ZoneEntry {
     sample_id: u32,
     root_key: u8,
     tune_cents: i16,
+    /// Cents per key (100 = chromatic, 0 = every key at the sample's pitch).
+    scale_tuning: i16,
+    /// SF2 pan, -500..500.
+    pan: i16,
     env: Sf2VoiceEnvelope,
 }
 
@@ -84,56 +110,109 @@ impl Sf2Instrument {
         self.zones.len() as u32
     }
 
-    pub(crate) fn resolve(&self, key: u8, vel: u8) -> Option<Sf2VoiceSpec> {
-        let key_dist = |z: &Sf2ZoneEntry| -> i32 {
-            if key < z.key_lo {
-                (z.key_lo - key) as i32
-            } else if key > z.key_hi {
-                (key - z.key_hi) as i32
-            } else {
-                0
-            }
-        };
+    /// Sample id of the first zone.  Used by the waveform renderer to
+    /// preview *something* representative for an SF2 part — the exact
+    /// zone depends on the note being played, but the first one is a
+    /// reasonable stand-in for the shape of the instrument.
+    pub(crate) fn first_zone_sample_id(&self) -> Option<u32> {
+        self.zones.first().map(|z| z.sample_id)
+    }
 
-        let mut best: Option<(&Sf2ZoneEntry, i32)> = None;
-        for z in self.zones.iter().rev() {
-            if vel < z.vel_lo || vel > z.vel_hi {
-                continue;
-            }
-            let d = key_dist(z);
-            if d == 0 {
-                best = Some((z, 0));
-                break;
-            }
-            if best.map_or(true, |(_, bd)| d < bd) {
-                best = Some((z, d));
+    /// Resolve a note to a single voice (the first layer).  `resolve_all`
+    /// is the real implementation; this stays for callers that want one.
+    #[allow(dead_code)]
+    pub(crate) fn resolve(
+        &self,
+        key: u8,
+        vel: u8,
+        fine_pitch_cents: f64,
+    ) -> Option<Sf2VoiceSpec> {
+        self.resolve_all(key, vel, fine_pitch_cents).into_iter().next()
+    }
+
+    /// Resolve a note to EVERY voice it should sound.  SF2 zones overlap by
+    /// design: a stereo sample is a left zone plus a right zone, and layered
+    /// presets stack zones over the same keys.  All zones whose key and
+    /// velocity ranges contain the note play together.  If none match, the
+    /// nearest zone is used so out-of-range notes still sound.
+    ///
+    /// `fine_pitch_cents` is the per-note detune in cents (0.0 = none).
+    ///
+    /// Velocity only selects zones here.  The note's own volume already
+    /// scales loudness (`TVoice::vol`), so no second velocity attenuation
+    /// is applied; doing both made notes tens of dB too quiet.
+    pub(crate) fn resolve_all(
+        &self,
+        key: u8,
+        vel: u8,
+        fine_pitch_cents: f64,
+    ) -> Vec<Sf2VoiceSpec> {
+        const MAX_LAYERS: usize = 8;
+
+        let mut hits: Vec<&Sf2ZoneEntry> = self
+            .zones
+            .iter()
+            .filter(|z| {
+                key >= z.key_lo && key <= z.key_hi && vel >= z.vel_lo && vel <= z.vel_hi
+            })
+            .collect();
+
+        if hits.is_empty() {
+            if let Some(z) = nearest_zone(&self.zones, key, vel, true)
+                .or_else(|| nearest_zone(&self.zones, key, vel, false))
+            {
+                hits.push(z);
             }
         }
-        if best.is_none() {
-            for z in self.zones.iter().rev() {
-                let d = key_dist(z);
-                if best.map_or(true, |(_, bd)| d < bd) {
-                    best = Some((z, d));
-                }
-            }
+
+        hits.truncate(MAX_LAYERS);
+        hits.into_iter()
+            .map(|z| voice_for_zone(z, key, fine_pitch_cents))
+            .collect()
+    }
+}
+
+fn key_distance(z: &Sf2ZoneEntry, key: u8) -> i32 {
+    if key < z.key_lo {
+        (z.key_lo - key) as i32
+    } else if key > z.key_hi {
+        (key - z.key_hi) as i32
+    } else {
+        0
+    }
+}
+
+/// Closest zone by key distance, optionally requiring the velocity to fit.
+fn nearest_zone<'a>(
+    zones: &'a [Sf2ZoneEntry],
+    key: u8,
+    vel: u8,
+    respect_vel: bool,
+) -> Option<&'a Sf2ZoneEntry> {
+    let mut best: Option<(&'a Sf2ZoneEntry, i32)> = None;
+    for z in zones.iter().rev() {
+        if respect_vel && (vel < z.vel_lo || vel > z.vel_hi) {
+            continue;
         }
-        let (z, _) = best?;
-        let semitones =
-            (key as i32 - z.root_key as i32) as f64 + z.tune_cents as f64 / 100.0;
-        let pitch_hz = C5_HZ * 2f64.powf(semitones / 12.0);
+        let d = key_distance(z, key);
+        if best.map_or(true, |(_, bd)| d < bd) {
+            best = Some((z, d));
+        }
+    }
+    best.map(|(z, _)| z)
+}
 
-        let vel_cb = ((127 - vel) as f32) * 960.0 / 127.0;
-        let vel_gain = (10f32).powf(-vel_cb / 200.0);
-        let peak = (z.env.peak * vel_gain).clamp(0.0, 1.0);
-
-        let mut env = z.env;
-        env.peak = peak;
-
-        Some(Sf2VoiceSpec {
-            sample_id: z.sample_id,
-            pitch_hz,
-            env,
-        })
+fn voice_for_zone(z: &Sf2ZoneEntry, key: u8, fine_pitch_cents: f64) -> Sf2VoiceSpec {
+    // Scale tuning is cents per key: 100 = chromatic, 0 = every key plays
+    // at the sample's own pitch (typical for drum zones).
+    let semitones = (key as i32 - z.root_key as i32) as f64 * (z.scale_tuning as f64 / 100.0)
+        + z.tune_cents as f64 / 100.0
+        + fine_pitch_cents / 100.0;
+    Sf2VoiceSpec {
+        sample_id: z.sample_id,
+        pitch_hz: C5_HZ * 2f64.powf(semitones / 12.0),
+        env: z.env,
+        pan: (z.pan as f64 / 500.0).clamp(-1.0, 1.0),
     }
 }
 
@@ -171,7 +250,7 @@ pub(crate) fn build_sf2_instrument(
             .map(|&s| s as f32 / 32768.0)
             .collect();
 
-        let loop_pts = if sm.loop_mode != 0 && le > ls {
+        let loop_pts = if z.loop_mode != 0 && le > ls {
             Some(((ls - start) as i64, (le - start) as i64))
         } else {
             None
@@ -214,6 +293,8 @@ pub(crate) fn build_sf2_instrument(
             sample_id: sid,
             root_key,
             tune_cents: z.tune_cents,
+            scale_tuning: 100,
+            pan: 0,
             env,
         });
     }
@@ -269,11 +350,19 @@ impl MultiSampleInstrument {
         }
     }
 
-    pub(crate) fn resolve(&self, key: u8) -> Option<(u32, f64)> {
+    /// Resolve a note to (sample_id, pitch_hz).  `fine_pitch_cents` is
+    /// the per-note detune in cents from the FLP `fine_pitch` byte,
+    /// already scaled by the emitter.  0.0 means no offset.
+    pub(crate) fn resolve(
+        &self,
+        key: u8,
+        fine_pitch_cents: f64,
+    ) -> Option<(u32, f64)> {
         let mut best: Option<(&MultiSampleZone, i32)> = None;
         for z in &self.zones {
             if key >= z.key_lo && key <= z.key_hi {
-                let semitones = (key as i32 - z.root_key as i32) as f64;
+                let semitones = (key as i32 - z.root_key as i32) as f64
+                    + fine_pitch_cents / 100.0;
                 let pitch_hz = C5_HZ * 2f64.powf(semitones / 12.0);
                 return Some((z.sample_id, pitch_hz));
             }
@@ -287,7 +376,8 @@ impl MultiSampleInstrument {
             }
         }
         let (z, _) = best?;
-        let semitones = (key as i32 - z.root_key as i32) as f64;
+        let semitones = (key as i32 - z.root_key as i32) as f64
+            + fine_pitch_cents / 100.0;
         let pitch_hz = C5_HZ * 2f64.powf(semitones / 12.0);
         Some((z.sample_id, pitch_hz))
     }

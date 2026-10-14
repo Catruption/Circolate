@@ -1,9 +1,5 @@
 //! Storage abstraction: everything a project load needs, backed by
 //! either a directory tree or a `.tsz` archive.
-//!
-//! The well-known key `"trackscript"` always resolves to the source's
-//! primary trackscript, regardless of the underlying filename.  Every
-//! other path is treated literally relative to the source root.
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
@@ -21,9 +17,21 @@ pub trait AssetSource: Send + Sync {
     }
 
     /// Direct children of `prefix` (no recursion), optionally filtered
-    /// by extension.  Returned paths use '/' separators and are
-    /// relative to the source root.
+    /// by extension.  Paths use '/' separators, relative to the source
+    /// root.
     fn list(&self, prefix: &str, ext: Option<&str>) -> Vec<String>;
+
+    /// Recursive listing under `prefix`.  Default returns direct
+    /// children; directory sources and archives override.
+    fn list_recursive(&self, prefix: &str) -> Vec<String> {
+        self.list(prefix, None)
+    }
+
+    /// Stable identity for caching extracted content.  `None` means the
+    /// source has no natural key (dirs, mainly).
+    fn cache_key(&self) -> Option<String> {
+        None
+    }
 
     fn describe(&self) -> String;
 }
@@ -36,9 +44,6 @@ pub struct DirSource {
 }
 
 impl DirSource {
-    /// `base` is the directory that holds `trackscript`, `samples/`,
-    /// `instruments/`, and `samples.json`.  `trackscript_name` is the
-    /// actual filename of the trackscript inside `base`.
     pub fn new(base: impl Into<PathBuf>, trackscript_name: impl Into<String>) -> Self {
         DirSource {
             base: base.into(),
@@ -100,7 +105,34 @@ impl AssetSource for DirSource {
         out
     }
 
+    fn list_recursive(&self, prefix: &str) -> Vec<String> {
+        let start = if prefix.is_empty() {
+            self.base.clone()
+        } else {
+            self.base.join(prefix)
+        };
+        let mut out = Vec::new();
+        walk_files(&start, &self.base, &mut out);
+        out.sort();
+        out
+    }
+
     fn describe(&self) -> String {
         self.base.display().to_string()
+    }
+}
+
+fn walk_files(dir: &Path, base: &Path, out: &mut Vec<String>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        let Ok(md) = std::fs::symlink_metadata(&p) else { continue };
+        if md.file_type().is_dir() {
+            walk_files(&p, base, out);
+        } else if md.file_type().is_file() {
+            if let Ok(rel) = p.strip_prefix(base) {
+                out.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
     }
 }

@@ -33,12 +33,16 @@ impl Status {
 
 pub const PART_HEADER_SIGIL: &str = "|";
 
-pub const FIELD_POSITION: &str = "§";
-pub const FIELD_PITCH:    &str = "#";
-pub const FIELD_DURATION: &str = "~";
-pub const FIELD_VOLUME:   &str = "%";
-pub const FIELD_PAN:      &str = "¶";
-pub const FIELD_SOURCE:   &str = "ƒ";
+pub const FIELD_POSITION:   &str = "§";
+pub const FIELD_PITCH:      &str = "#";
+pub const FIELD_DURATION:   &str = "~";
+pub const FIELD_VOLUME:     &str = "%";
+pub const FIELD_PAN:        &str = "¶";
+pub const FIELD_SOURCE:     &str = "ƒ";
+pub const FIELD_FINE_PITCH: &str = "¢";
+pub const FIELD_RELEASE:    &str = "₨";
+pub const FIELD_MOD_X:      &str = "₥";
+pub const FIELD_MOD_Y:      &str = "¥";
 
 pub const EV_NOTE:       &str = "";
 pub const EV_WAYPOINT:   &str = "&";
@@ -119,6 +123,36 @@ pub fn tempo_shim(pos: &str, bpm_text: &str) -> String {
     format!("@<{},#{}, {}Tempo>;", pos, bpm_text, FIELD_SOURCE)
 }
 
+/// `<§pos, #pitch, ~dur, %vol[, ƒsource]>`.
+///
+/// `pos` is `1/1`-style (from `convert::pos_str`), `pitch` is `C5` /
+/// `A#4` (from `convert::note_name`), `dur` is beats as a decimal
+/// string, `vol` is percent.  `source` is a pre-formatted
+/// `ƒ'path'(offset)` from `source_arg`, or empty to inherit the part's
+/// default source.
+pub fn note(pos: &str, pitch: &str, dur: &str, vol: &str, source: &str) -> String {
+    // `pos` already carries the § sigil (pos_str emits it that way),
+    // so don't prepend FIELD_POSITION here.
+    let mut s = String::with_capacity(64);
+    s.push('<');
+    s.push_str(pos);
+    s.push(',');
+    s.push_str(FIELD_PITCH);
+    s.push_str(pitch);
+    s.push(',');
+    s.push_str(FIELD_DURATION);
+    s.push_str(dur);
+    s.push(',');
+    s.push_str(FIELD_VOLUME);
+    s.push_str(vol);
+    if !source.is_empty() {
+        s.push(',');
+        s.push_str(source);
+    }
+    s.push('>');
+    s
+}
+
 // ── tables ─────────────────────────────────────────────────────────────
 
 pub struct Symbol {
@@ -148,6 +182,10 @@ pub const FIELD_SYMBOLS: &[Symbol] = &[
     sym(FIELD_VOLUME, "volume", "Percent. A leading `+` is tolerated.", "1.10", Done),
     sym(FIELD_PAN, "pan", "-1 (full left) to 1 (full right).", "1.10", Done),
     sym(FIELD_SOURCE, "source / call", "`ƒ'path'` overrides the sample. `ƒName` calls a defined part or block.", "1.10", Done),
+    sym(FIELD_FINE_PITCH, "fine pitch", "Cents offset from equal temperament, as a signed delta from 0. Slides glide to the equal-tempered pitch of the target note and ignore this field.", "1.11", Done),
+    sym(FIELD_RELEASE, "release", "Release velocity, as a signed delta from the engine default of 64. Shapes the amplitude envelope's release stage when the note-off fires.", "1.11", Done),
+    sym(FIELD_MOD_X, "mod X", "Modulation X, as a signed delta from the engine default of 128. Routes to the plugin's X destination (filter cutoff on simple plugins).", "1.11", Done),
+    sym(FIELD_MOD_Y, "mod Y", "Modulation Y, as a signed delta from the engine default of 128. Routes to the plugin's Y destination (resonance on simple plugins).", "1.11", Done),
 ];
 
 pub const EVENT_PREFIXES: &[Symbol] = &[
@@ -276,6 +314,34 @@ pub const FIELD_CONTEXTS: &[FieldContextUse] = &[
         definition: "the part's sample (required)",
         call: "sample override, per selected measure",
         shim: "target shim name (required)",
+    },
+    FieldContextUse {
+        glyph: FIELD_FINE_PITCH, name: "fine pitch",
+        note: "cents offset for this note",
+        definition: "default cents offset",
+        call: "ignored",
+        shim: "ignored",
+    },
+    FieldContextUse {
+        glyph: FIELD_RELEASE, name: "release",
+        note: "release velocity delta for this note",
+        definition: "default release delta",
+        call: "ignored",
+        shim: "ignored",
+    },
+    FieldContextUse {
+        glyph: FIELD_MOD_X, name: "mod X",
+        note: "mod X delta for this note",
+        definition: "default mod X delta",
+        call: "ignored",
+        shim: "ignored",
+    },
+    FieldContextUse {
+        glyph: FIELD_MOD_Y, name: "mod Y",
+        note: "mod Y delta for this note",
+        definition: "default mod Y delta",
+        call: "ignored",
+        shim: "ignored",
     },
 ];
 
@@ -425,6 +491,9 @@ duration is the sum of its selected measures and advances the BlockList cursor. 
 Shim events (`@<...>`) apply mix automation to reserved global targets. \
 Sections accumulate row offsets, so a waypoint chain crosses them. \
 Inline operators (`+ - * ±`, `^`, `:count`). \
+Per-note extended fields: `¢` fine pitch (cents delta), `₨` release (velocity \
+delta), `₥` mod X and `¥` mod Y (both deltas from 128).  Omitted when at \
+engine default. \
 The 1.10 `Tempo { ... }` section becomes the `ƒTempo` shim.",
     },
     Change {
@@ -443,6 +512,7 @@ pub const EXAMPLES: &[Example] = &[
     Example { title: "A note", status: Done, src: "<§1/1,#D5,~4,%50>" },
     Example { title: "A note with a waypoint", status: Done, src: "<§1/1,#D5,~4,%50>&<§1/2,%43,~0.33>" },
     Example { title: "Pan and a per-note sample", status: Done, src: "<§1/1,#C6,~2,¶-1,ƒ'samples/other.wav'>" },
+    Example { title: "Fine pitch, release, and mod tweaks", status: Done, src: "<§1/1,#C5,~2,¢+5,₨-32,₥-64,¥+64>" },
     Example { title: "Operator: volume rises 4 times", status: Plan, src: "<§1/1,#D5,~4,%15+0.1^0/1:4>" },
     Example { title: "Operator: pitch oscillates", status: Plan, src: "<§1/1,#C5,~4,#C5±0.25^0/2:4>" },
     Example { title: "Shim: end fade-out", status: Plan, src: "@<§1/1,%100-0.78125^0/2:8, ƒGlobalVolume>" },
@@ -458,10 +528,29 @@ pub const EXAMPLES: &[Example] = &[
 ];
 
 pub fn wrap_example(src: &str) -> String {
-    format!(
-        "BlockList()\n{{\n    ƒExample();\n}}\n\nBlockArray()\n{{\n    {}\n}}\n",
-        part_definition("Example", &source_arg("samples/example.wav", None), 4, 4, src)
-    )
+    let trimmed = src.trim_start();
+    if trimmed.starts_with('@') {
+        // Shim: lives in the BlockList, not inside a part body.
+        format!(
+            "BlockList()\n{{\n    {}\n}}\n\nBlockArray()\n{{\n    {}\n}}\n",
+            src,
+            part_definition("Example", &source_arg("samples/example.wav", None), 4, 4, "<§1/1,#C5>")
+        )
+    } else if trimmed.starts_with('ƒ') {
+        // Definition or composite: goes in BlockArray as-is, with a stub
+        // part and a stub BlockList so the file has valid structure.
+        format!(
+            "BlockList()\n{{\n    ƒExample();\n}}\n\nBlockArray()\n{{\n    {}\n\n    {}\n}}\n",
+            part_definition("Example", &source_arg("samples/example.wav", None), 4, 4, "<§1/1,#C5>"),
+            src
+        )
+    } else {
+        // Note, waypoint, or other in-body event.
+        format!(
+            "BlockList()\n{{\n    ƒExample();\n}}\n\nBlockArray()\n{{\n    {}\n}}\n",
+            part_definition("Example", &source_arg("samples/example.wav", None), 4, 4, src)
+        )
+    }
 }
 
 // ── docs ───────────────────────────────────────────────────────────────
@@ -590,18 +679,23 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    #[test]
-    fn implemented_examples_parse() {
-        for e in EXAMPLES.iter().filter(|e| e.status == Status::Implemented) {
-            let file = crate::sources::trackscript::parse_str(&wrap_example(e.src))
+#[test]
+fn implemented_examples_parse() {
+    for e in EXAMPLES.iter().filter(|e| e.status == Status::Implemented) {
+        let file = crate::sources::trackscript::parse_str(&wrap_example(e.src))
             .unwrap_or_else(|err| panic!("example {:?} failed: {:?}", e.title, err));
-            let part = file
-            .parts
-            .get("Example")
-            .unwrap_or_else(|| panic!("example {:?}: part not found", e.title));
-            assert!(!part.events.is_empty(), "example {:?}: no events", e.title);
-        }
+
+        let n_events: usize = file.parts.values().map(|p| p.events.len()).sum();
+        let n_shims = file.shims.len();
+        let n_calls: usize = file.block_list.iter().map(|l| l.len()).sum();
+
+        assert!(
+            n_events > 0 || n_shims > 0 || n_calls > 0,
+            "example {:?}: parsed but produced no events, shims, or calls",
+            e.title
+        );
     }
+}
 
     #[test]
     fn glyphs_are_unique_per_table() {

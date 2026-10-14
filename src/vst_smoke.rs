@@ -2,6 +2,7 @@
 //! note, render two seconds, report peak level.  Smoke test for the shim.
 
 use anyhow::{bail, Result};
+use std::path::PathBuf;
 
 use crate::vst_host_ffi::VstHost;
 
@@ -13,10 +14,23 @@ pub fn run(argv: &[String]) -> Result<()> {
     let Some(path) = argv.first() else {
         bail!("usage: trackscript-player vst-smoke <plugin.vst3> [state.file]");
     };
-    let state: Vec<u8> = match argv.get(1) {
+    let state_path: Option<PathBuf> = argv.get(1).map(PathBuf::from);
+    let state: Vec<u8> = match &state_path {
         Some(p) => std::fs::read(p)?,
         None    => Vec::new(),
     };
+
+    // SFLT resolves the SF2 path in its state against the process cwd
+    // at load time.  If the state file lives at <root>/instruments/X.state
+    // and the SF2 at <root>/samples/Y.sf2 (which is the layout the
+    // converter produces), chdir to <root> so `samples/Y.sf2` resolves.
+    if let Some(sp) = &state_path {
+        if let Some(root) = sp.parent().and_then(|p| p.parent()) {
+            if root.is_dir() {
+                std::env::set_current_dir(root)?;
+            }
+        }
+    }
 
     println!("loading {path}");
     let mut host = VstHost::load(path, &state, SR)?;
@@ -37,9 +51,9 @@ pub fn run(argv: &[String]) -> Result<()> {
     }
 
     let peak = l
-    .iter()
-    .chain(r.iter())
-    .fold(0f32, |a, &b| a.max(b.abs()));
+        .iter()
+        .chain(r.iter())
+        .fold(0f32, |a, &b| a.max(b.abs()));
     let rms = (l.iter().chain(r.iter()).map(|&s| s * s).sum::<f32>()
     / (2 * total) as f32)
     .sqrt();

@@ -4,6 +4,7 @@
 //! subcommand modules.
 #![allow(dead_code)]
 
+mod requires;
 mod fidelity;
 mod display;
 mod check;
@@ -18,6 +19,9 @@ mod play;
 mod player;
 mod plugins;
 mod sf2;
+mod sf2_engine;
+mod sf2_smoke;
+mod sfl2;
 mod sources;
 mod test;
 mod timing;
@@ -53,6 +57,7 @@ fn main() -> Result<()> {
         Some("plugins")   => plugins::run(rest),
         Some("fetch")     => fetch::run(rest),
         Some("vst-smoke") => vst_smoke::run(rest),
+        Some("sf2-smoke") => sf2_smoke::run(rest),
         Some("-h") | Some("--help") | None => {
             print_help();
             Ok(())
@@ -82,6 +87,7 @@ fn print_help() {
     println!("  fetch     [--dry] [--only NAME]");
     println!("                              download missing fallback plugins");
     println!("  vst-smoke <plugin.vst3>     load a VST3, play a note, report peak");
+    println!("  sf2-smoke <file.sf2>        play a note through the native SF2 engine");
     println!();
     println!("  --pause                     hold the terminal open on exit (.desktop use)");
 }

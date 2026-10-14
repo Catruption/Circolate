@@ -1,10 +1,10 @@
 [package]
 name = "trackscript-player"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 cpal = "0.15"
@@ -19,6 +19,8 @@ claxon = "0.4"
 symphonia = { version = "0.5", default-features = false, features = ["mp3", "ogg", "vorbis", "wav", "pcm", "flac", "adpcm"] }
 zip = "2.2"
 sha2 = "0.10"
+midly = "0.5"
+lewton = "0.10"
 
 [build-dependencies]
 cc = "1"

@@ -23,7 +23,33 @@ impl Cover {
         if cols == 0 || rows == 0 {
             return None;
         }
-        let img = image::open(path).ok()?;
+
+        // Read the file and let the image crate sniff the format from
+        // its magic bytes, instead of relying on the file extension.
+        // `image::open` picks a decoder from the path suffix; if the
+        // path lost its extension somewhere (cache round-trip, manual
+        // rename), the decoder lookup fails silently.
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("cover: read {} failed: {:#}", path.display(), e);
+                return None;
+            }
+        };
+
+        let img = match image::load_from_memory(&bytes) {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!(
+                    "cover: decode {} failed: {:#} ({})",
+                    path.display(),
+                    e,
+                    guess_format(&bytes)
+                );
+                return None;
+            }
+        };
+
         let (w, h) = img.dimensions();
         if w == 0 || h == 0 {
             return None;
@@ -66,4 +92,14 @@ impl Cover {
         }
         Some(self.cells[row * self.cols + col])
     }
+}
+
+/// Best-effort format tag from the magic bytes, used only for the error
+/// message above so a failing cover says *what* it failed on.
+fn guess_format(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") { "png" }
+    else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) { "jpeg" }
+    else if bytes.starts_with(b"RIFF") && bytes.len() > 12 && &bytes[8..12] == b"WEBP" { "webp" }
+    else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") { "gif" }
+    else { "unknown" }
 }

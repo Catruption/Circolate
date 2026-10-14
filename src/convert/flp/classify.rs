@@ -52,6 +52,10 @@ pub(super) fn classify_channels<'a>(
     let mut sf2_copied: HashMap<PathBuf, String> = HashMap::new();
     let mut sidecar_path: HashMap<u16, String> = HashMap::new();
 
+    // SF2 channels always route through the native engine now.  The
+    // engine is picked up at load time from the SF2 sidecar's `File:`
+    // field, so nothing SFLT-specific is needed here.
+
     for chan in &prj.channels {
         if !chan.enabled.unwrap_or(true) {
             skipped.push((chan, "disabled in FL".into()));
@@ -59,10 +63,10 @@ pub(super) fn classify_channels<'a>(
         }
 
         let active_envs = chan
-        .envelopes
-        .iter()
-        .filter(|e| e.env_enabled != 0)
-        .count();
+            .envelopes
+            .iter()
+            .filter(|e| e.env_enabled != 0)
+            .count();
         if active_envs > 0 {
             let label = if chan.name.is_empty() {
                 chan.channel_type.clone()
@@ -75,19 +79,19 @@ pub(super) fn classify_channels<'a>(
         let has_notes = placed.get(&chan.iid).map_or(false, |v| !v.is_empty());
         if !has_notes {
             let has_content = !chan.sample_path.is_empty()
-            || chan
-            .plugin
-            .as_ref()
-            .map_or(false, |p| !p.state.is_empty());
+                || chan
+                    .plugin
+                    .as_ref()
+                    .map_or(false, |p| !p.state.is_empty());
             if has_content
                 && matches!(
                     chan.channel_type.as_str(),
-                            "sampler" | "instrument" | "native"
+                    "sampler" | "instrument" | "native"
                 )
-                {
-                    skipped.push((chan, "no notes".into()));
-                }
-                continue;
+            {
+                skipped.push((chan, "no notes".into()));
+            }
+            continue;
         }
 
         match chan.channel_type.as_str() {
@@ -96,14 +100,18 @@ pub(super) fn classify_channels<'a>(
                     skipped.push((chan, "no sample path".into()));
                     continue;
                 }
-                match find_sample(&chan.sample_path, opts.samples_dir.as_deref(), Some(flp_dir)) {
+                match find_sample(
+                    &chan.sample_path,
+                    opts.samples_dir.as_deref(),
+                    Some(flp_dir),
+                ) {
                     Some(p) => usable_samples.push((chan, p)),
                     None => {
                         let basename = Path::new(&chan.sample_path.replace('\\', "/"))
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("?")
-                        .to_string();
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("?")
+                            .to_string();
                         skipped.push((chan, format!("sample not found: {}", basename)));
                     }
                 }
@@ -120,7 +128,9 @@ pub(super) fn classify_channels<'a>(
                 if let Some(plugin) = chan.plugin.as_ref() {
                     if plugin.vst_path.is_empty() && plugin.state.len() < SF2_STATE_MAX {
                         if debug_on()
-                            && !plugin.state.windows(4)
+                            && !plugin
+                                .state
+                                .windows(4)
                                 .any(|w| w.eq_ignore_ascii_case(b".sf2"))
                         {
                             let n = plugin.state.len();
@@ -159,8 +169,10 @@ pub(super) fn classify_channels<'a>(
                 }
 
                 // 3. VST — resolve to installed plugin, fallback, or warn.
-                let has_state =
-                chan.plugin.as_ref().map_or(false, |p| !p.state.is_empty());
+                let has_state = chan
+                    .plugin
+                    .as_ref()
+                    .map_or(false, |p| !p.state.is_empty());
                 if !has_state {
                     skipped.push((chan, "native channel without saved state".into()));
                     continue;
@@ -169,7 +181,11 @@ pub(super) fn classify_channels<'a>(
                     let p = chan.plugin.as_ref().unwrap();
                     eprintln!(
                         "flp: chan {} native -> VST branch: display={:?} internal={:?} vst_path={:?} state_len={}",
-                        chan.iid, p.display_name, p.internal_name, p.vst_path, p.state.len()
+                        chan.iid,
+                        p.display_name,
+                        p.internal_name,
+                        p.vst_path,
+                        p.state.len()
                     );
                 }
                 let plugin = chan.plugin.as_ref().unwrap();
@@ -186,12 +202,12 @@ pub(super) fn classify_channels<'a>(
                     }
                     Resolved::Fallback { name, path, replaces, .. } => {
                         let path_str = path
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "<not found>".into());
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "<not found>".into());
                         warnings.push(format!(
                             "[{:2}] {}: not installed, falling back to {} ({})",
-                                              chan.iid, replaces, name, path_str
+                            chan.iid, replaces, name, path_str
                         ));
                     }
                     Resolved::Unresolved { name } => {
@@ -230,8 +246,8 @@ pub(super) fn classify_channels<'a>(
                 format!("{}{:02}", base, count)
             };
             let resolved = resolved_map
-            .get(&chan.iid)
-            .expect("every usable native has a resolution");
+                .get(&chan.iid)
+                .expect("every usable native has a resolution");
             match vst_sidecar(&sidecar_name, chan, resolved) {
                 Ok(files) => {
                     aux_files.extend(files);
@@ -265,11 +281,13 @@ pub(super) fn classify_channels<'a>(
 
 // ── SF2 handling ───────────────────────────────────────────────────────
 
-/// Try to resolve an SF2-state channel.  On success writes the SF2 copy
-/// and the .instrument sidecar to `aux_files`, and returns the relative
-/// path of the .instrument sidecar.  On failure pushes the reason into
-/// `skipped` (not found / unreadable) or `warnings` (read errors) and
-/// returns None.
+/// Resolve an SF2-state channel to a bundle-relative `.instrument`
+/// sidecar.  The SF2 file itself is copied into the bundle under
+/// `samples/`, and the sidecar's `File:` field points at that copy.
+/// The player builds a native `Sf2Engine` from it at load time.
+///
+/// Returns the relative path of the `.instrument` sidecar, or `None`
+/// if the SF2 couldn't be found on disk.
 fn handle_sf2<'a>(
     chan: &'a Channel,
     sf: &SfState,
@@ -281,20 +299,33 @@ fn handle_sf2<'a>(
     skipped: &mut Vec<(&'a Channel, String)>,
 ) -> Option<String> {
     let want = sf
-    .path
-    .rsplit(|c| c == '\\' || c == '/')
-    .next()
-    .unwrap_or("?")
-    .to_string();
-    let dirs: Vec<&Path> = [opts.samples_dir.as_deref(), Some(flp_dir)]
-    .into_iter()
-    .flatten()
-    .collect();
+        .path
+        .rsplit(|c| c == '\\' || c == '/')
+        .next()
+        .unwrap_or("?")
+        .to_string();
+
+    let soundfonts_dir: Option<PathBuf> = crate::fallbacks::repo_root()
+        .map(|r| r.join("soundfonts"))
+        .filter(|p| p.is_dir());
+
+    let mut dirs: Vec<&Path> = Vec::with_capacity(3);
+    if let Some(d) = opts.samples_dir.as_deref() {
+        dirs.push(d);
+    }
+    dirs.push(flp_dir);
+    if let Some(d) = soundfonts_dir.as_deref() {
+        dirs.push(d);
+    }
 
     if debug_on() {
         eprintln!(
-            "flp: chan {} sf2 state: path={:?} bank={} patch={}",
-            chan.iid, want, sf.bank, sf.preset
+            "flp: chan {} sf2 state: path={:?} bank={} patch={} dirs={}",
+            chan.iid,
+            want,
+            sf.bank,
+            sf.preset,
+            dirs.len()
         );
     }
 
@@ -307,45 +338,10 @@ fn handle_sf2<'a>(
             "flp: chan {} sf2 {} bank {} patch {}",
             chan.iid,
             src.display(),
-                  sf.bank,
-                  sf.preset
+            sf.bank,
+            sf.preset
         );
     }
-
-    let rel: Option<String> = match sf2_copied.get(&src) {
-        Some(r) => Some(r.clone()),
-        None => match std::fs::read(&src) {
-            Ok(bytes) => {
-                let stem = src
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("sf2");
-                let mut rel = format!("samples/{}.sf2", safe_name(stem));
-                if sf2_copied.values().any(|v| *v == rel) {
-                    rel = format!("samples/{:02}_{}.sf2", chan.iid, safe_name(stem));
-                }
-                aux_files.push(AuxFile {
-                    rel_path: rel.clone(),
-                               bytes,
-                });
-                sf2_copied.insert(src.clone(), rel.clone());
-                Some(rel)
-            }
-            Err(e) => {
-                warnings.push(format!(
-                    "[{:2}] SF2 {} read failed: {:#}",
-                    chan.iid,
-                    src.display(),
-                                      e
-                ));
-                None
-            }
-        },
-    };
-    let Some(rel) = rel else {
-        skipped.push((chan, format!("SF2 unreadable: {}", want)));
-        return None;
-    };
 
     let base_raw = if chan.name.is_empty() {
         format!("Ch{:02}", chan.iid)
@@ -353,22 +349,77 @@ fn handle_sf2<'a>(
         chan.name.clone()
     };
     let base = identifier(&base_raw);
+
+    write_sf2_sidecar(
+        chan,
+        &base,
+        &src,
+        sf2_copied,
+        aux_files,
+        warnings,
+        sf.bank,
+        sf.preset,
+    )
+}
+
+/// Copy the `.sf2` into the output bundle and write an `.instrument`
+/// sidecar with `Kind: sf2`.  The `File:` field references the bundle-
+/// relative copy so the resulting trackscript is self-contained.
+fn write_sf2_sidecar<'a>(
+    chan: &'a Channel,
+    base: &str,
+    src: &Path,
+    sf2_copied: &mut HashMap<PathBuf, String>,
+    aux_files: &mut Vec<AuxFile>,
+    warnings: &mut Vec<String>,
+    bank: u32,
+    preset: u32,
+) -> Option<String> {
+    let rel: Option<String> = match sf2_copied.get(src) {
+        Some(r) => Some(r.clone()),
+        None => match std::fs::read(src) {
+            Ok(bytes) => {
+                let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("sf2");
+                let mut rel = format!("samples/{}.sf2", safe_name(stem));
+                if sf2_copied.values().any(|v| *v == rel) {
+                    rel = format!("samples/{:02}_{}.sf2", chan.iid, safe_name(stem));
+                }
+                aux_files.push(AuxFile {
+                    rel_path: rel.clone(),
+                    bytes,
+                });
+                sf2_copied.insert(src.to_path_buf(), rel.clone());
+                Some(rel)
+            }
+            Err(e) => {
+                warnings.push(format!(
+                    "[{:2}] SF2 {} read failed: {:#}",
+                    chan.iid,
+                    src.display(),
+                    e
+                ));
+                None
+            }
+        },
+    };
+    let rel = rel?;
+
     let inst_text = format!(
         "Instrument {base}\n{{\n    Kind: sf2;\n    File: '{rel}';\n    Bank: {};\n    Preset: {};\n    SourceChannel: {};\n}}\n",
-        sf.bank, sf.preset, chan.iid
+        bank, preset, chan.iid
     );
     let inst_rel = format!("instruments/{}.instrument", base);
     aux_files.push(AuxFile {
         rel_path: inst_rel.clone(),
-                   bytes: inst_text.into_bytes(),
+        bytes: inst_text.into_bytes(),
     });
     warnings.push(format!(
         "[{:2}] {}: SF2 {} bank {} patch {}",
         chan.iid,
         chan.name,
         src.display(),
-                          sf.bank,
-                          sf.preset,
+        bank,
+        preset,
     ));
     Some(inst_rel)
 }
@@ -393,7 +444,7 @@ fn extract_embedded(
                 i,
                 a.extension,
                 a.data.len(),
-                      flp_audio::wav_root_key(&a.data)
+                flp_audio::wav_root_key(&a.data)
             );
         }
     }
@@ -435,7 +486,7 @@ fn extract_embedded(
     if files_found >= 2 {
         warnings.push(format!(
             "[{:2}] {} zone(s) found; all written to samples.json and {}",
-                              chan.iid, files_found, FIDELITY_FILENAME
+            chan.iid, files_found, FIDELITY_FILENAME
         ));
     }
     Some(EmbeddedSample {

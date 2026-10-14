@@ -8,6 +8,7 @@
 
 mod flp;
 mod it;
+mod midi;
 mod song;
 pub use flp::{DepKind, ProbeReport};
 
@@ -38,6 +39,7 @@ pub struct ConvertOptions {
     pub subdivisions: u32,
     pub skip_native: bool,
     pub samples_dir: Option<PathBuf>,
+    pub sf2_path: Option<PathBuf>,   // ← new
     pub with_message: bool,
 }
 
@@ -48,6 +50,7 @@ impl Default for ConvertOptions {
             subdivisions: 4,
             skip_native: false,
             samples_dir: None,
+            sf2_path: None,
             with_message: true,
         }
     }
@@ -79,6 +82,10 @@ pub fn convert_file(src: &Path, opts: &ConvertOptions) -> Result<Converted> {
         SourceKind::It => {
             let module = sources::it::parse_file(src)?;
             it::convert(&module, src, opts)
+        }
+        SourceKind::Midi => {                         // ← new
+            let mf = sources::midi::parse_file(src)?;
+            midi::convert(&mf, src, opts)
         }
         SourceKind::Trackscript => {
             let text = std::fs::read_to_string(src)?;

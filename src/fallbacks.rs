@@ -1,13 +1,4 @@
 //! Fallback plugin mappings — read from `fallbacks.json` at the repo root.
-//!
-//! When the converter hits a channel whose plugin isn't installed, this
-//! table says what to substitute.  Lookup is by VST basename first, then
-//! by display name.
-//!
-//! Each mapping may also carry an `acquire` block describing how to fetch
-//! the fallback plugin if it's missing.  Two forms: a declarative
-//! `{ url, archive, extract_to }` for the common download-and-extract
-//! case, or a `{ script }` escape hatch for plugins that need real logic.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -47,23 +38,28 @@ pub struct FallbackTarget {
     pub path: String,
     #[serde(default)]
     pub acquire: Option<Acquire>,
-    /// Linear gain multiplier applied to notes routed through this
-    /// fallback.  A replacement synth's default patch is often much
-    /// louder (or quieter) than the plugin it stands in for; this
-    /// trims its channel volume at conversion time so the emitted `%`
-    /// values already account for the difference.  Defaults to 1.0.
     #[serde(default = "default_gain")]
     pub gain: f32,
+
+    // ── new: distribution metadata ─────────────────────────────────
+    /// SPDX-ish identifier or a free-form tag.  "GPL-3.0", "MIT",
+    /// "proprietary-free", "commercial" are the ones the report
+    /// understands; anything else is passed through verbatim.
+    #[serde(default)]
+    pub license: String,
+    #[serde(default)]
+    pub homepage: Option<String>,
+    #[serde(default)]
+    pub download: Option<String>,
+    /// True when the plugin's license permits redistribution and the
+    /// binary travels cleanly (no online activation).  Only plugins
+    /// marked true are eligible for `--include-plugins=free`.
+    #[serde(default)]
+    pub redistributable: bool,
 }
 
 fn default_gain() -> f32 { 1.0 }
 
-/// How to fetch a missing fallback plugin.
-///
-/// Tagged as `untagged` so the JSON can be either form without an
-/// explicit discriminator.  Serde tries variants in declaration order;
-/// putting `Script` first means a download block (which has no `script`
-/// field) falls through to `Download` cleanly.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(untagged)]
 pub enum Acquire {
@@ -73,7 +69,6 @@ pub enum Acquire {
     },
     Download {
         url: String,
-        /// One of: tar.gz, tar.xz, tar.bz2, tgz, zip, 7z
         archive: String,
         extract_to: String,
         provides: String,
@@ -83,9 +78,6 @@ pub enum Acquire {
 }
 
 impl Acquire {
-    /// The path that must exist after a successful fetch.  Used both as
-    /// the idempotence check ("already present?") and the post-run
-    /// verification ("did the script actually put something there?").
     pub fn provides(&self) -> &str {
         match self {
             Acquire::Script { provides, .. } => provides,
@@ -114,9 +106,9 @@ pub struct FallbackTable {
 impl FallbackTable {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+            .with_context(|| format!("reading {}", path.display()))?;
         let file: FallbackFile = serde_json::from_str(&text)
-        .with_context(|| format!("parsing {}", path.display()))?;
+            .with_context(|| format!("parsing {}", path.display()))?;
 
         let mut by_basename = HashMap::new();
         let mut by_display = HashMap::new();
@@ -133,12 +125,10 @@ impl FallbackTable {
             by_basename,
             by_display,
             entries: file.mappings,
-    default: file.default,
+            default: file.default,
         })
     }
 
-    /// Look for `fallbacks.json` in the usual places.  Called once at
-    /// converter start, not per channel.
     pub fn load_default() -> Result<Self> {
         for p in candidate_paths() {
             if p.exists() {
@@ -152,31 +142,26 @@ impl FallbackTable {
     -> Option<(&Mapping, &FallbackTarget)>
     {
         if !vst_path.is_empty() {
-            // FLP stores Windows paths; backslashes aren't separators on
-            // Linux, so Path::new would return the whole string as one
-            // component.  Normalize first.
             let normalized = vst_path.replace('\\', "/");
             let base = Path::new(&normalized)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
 
             if let Some(&i) = self.by_basename.get(&base) {
                 return Some((&self.entries[i], &self.entries[i].fallback));
             }
 
-            // Also try stripping the extension, so matchers can be keyed
-            // either as "ZENOLOGY.vst" or "ZENOLOGY".
             if let Some(stem) = base
                 .strip_suffix(".vst")
                 .or_else(|| base.strip_suffix(".vst3"))
                 .or_else(|| base.strip_suffix(".dll"))
-                {
-                    if let Some(&i) = self.by_basename.get(stem) {
-                        return Some((&self.entries[i], &self.entries[i].fallback));
-                    }
+            {
+                if let Some(&i) = self.by_basename.get(stem) {
+                    return Some((&self.entries[i], &self.entries[i].fallback));
                 }
+            }
         }
         if !display_name.is_empty() {
             let d = display_name.to_ascii_lowercase();
@@ -187,10 +172,57 @@ impl FallbackTable {
         None
     }
 
+    /// Match against any of the three identifying fields: matcher
+    /// basename (with or without extension), matcher display name,
+    /// or fallback target name.  Used by the requires builder, where
+    /// we know a plugin's display name but not its path.
+    pub fn lookup_any(&self, name: &str) -> Option<(&Mapping, &FallbackTarget)> {
+        let lower = name.to_ascii_lowercase();
+        for m in &self.entries {
+            let disp = m.matcher.display_name.to_ascii_lowercase();
+            let base = m.matcher.vst_basename.to_ascii_lowercase();
+            let base_stem = base
+                .strip_suffix(".vst")
+                .or_else(|| base.strip_suffix(".vst3"))
+                .or_else(|| base.strip_suffix(".dll"))
+                .unwrap_or(&base);
+            let fb = m.fallback.name.to_ascii_lowercase();
+            if disp == lower || base == lower || base_stem == lower || fb == lower {
+                return Some((m, &m.fallback));
+            }
+        }
+        None
+    }
+
     pub fn default_rule(&self) -> &DefaultRule { &self.default }
 
-    /// All mappings, in file order.  Used by the `fetch` subcommand.
     pub fn entries(&self) -> &[Mapping] { &self.entries }
+}
+
+/// Repo root, discovered by walking up from the current executable
+/// looking for a directory containing both `Cargo.toml` and
+/// `fallbacks.json`.  Falls back to the current working directory when
+/// running from a source checkout.
+/// Repo root, discovered by walking up from the current executable
+/// looking for a directory containing `Cargo.toml`.  The presence of
+/// `Cargo.toml` alone identifies the root; `fallbacks.json` may live at
+/// the root or under `share/` depending on how the tree is laid out.
+/// Repo root, discovered by walking up from the current executable
+/// looking for a directory containing `Cargo.toml`.
+pub fn repo_root() -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        let mut d = exe.parent().map(Path::to_path_buf);
+        while let Some(p) = d {
+            if p.join("Cargo.toml").is_file() {
+                return Some(p);
+            }
+            d = p.parent().map(Path::to_path_buf);
+        }
+    }
+    if Path::new("Cargo.toml").is_file() {
+        return std::env::current_dir().ok();
+    }
+    None
 }
 
 fn candidate_paths() -> Vec<PathBuf> {
@@ -200,6 +232,13 @@ fn candidate_paths() -> Vec<PathBuf> {
             v.push(dir.join("fallbacks.json"));
             v.push(dir.join("../../fallbacks.json"));
         }
+    }
+    if let Some(root) = repo_root() {
+        v.push(root.join("fallbacks.json"));
+        v.push(root.join("share/fallbacks.json"));
+    }
+    if Path::new("share/fallbacks.json").is_file() {
+        v.push(PathBuf::from("share/fallbacks.json"));
     }
     v
 }

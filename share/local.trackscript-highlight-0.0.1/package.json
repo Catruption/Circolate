@@ -1,0 +1,22 @@
+{
+  "name": "trackscript-highlight",
+  "displayName": "Trackscript Highlight",
+  "version": "0.0.1",
+  "engines": { "vscode": "^1.0.0" },
+  "contributes": {
+    "languages": [
+      {
+        "id": "trackscript",
+        "aliases": ["Trackscript"],
+        "extensions": [".trackscript"]
+      }
+    ],
+    "grammars": [
+      {
+        "language": "trackscript",
+        "scopeName": "source.trackscript",
+        "path": "./trackscript.tmLanguage.json"
+      }
+    ]
+  }
+}

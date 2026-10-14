@@ -9,13 +9,14 @@ use std::sync::Arc;
 use crate::asset::{AssetSource, DirSource, ENTRY_KEY};
 use crate::audio_decode::decode_audio;
 use crate::fidelity::{Fidelity, FIDELITY_FILENAME};
+use crate::requires::{self, Requires};
 use crate::sources::trackscript::{parse_str, TrackscriptEvent, TrackscriptPart};
 use crate::timing::TempoMap;
 
 use super::cache::{fingerprint, hash_part};
 use super::lines::{resolve_line, tempo_shims_to_events, LineCall, LineInfo};
 use super::types::{
-    build_sf2_instrument, MultiSampleInstrument, Sf2Instrument, VstInstrument,
+    build_sf2_instrument, MultiSampleInstrument, Sf2EngineSpec, Sf2Instrument, VstInstrument,
 };
 
 pub(crate) use super::cache::Cache;
@@ -31,24 +32,14 @@ fn cover_cache_dir() -> PathBuf {
         return PathBuf::from(xdg).join("circolate").join("covers");
     }
     if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home)
-            .join(".cache")
-            .join("circolate")
-            .join("covers");
+        return PathBuf::from(home).join(".cache").join("circolate").join("covers");
     }
     std::env::temp_dir().join("circolate-covers")
 }
 
-/// Find a cover image in the source under any name starting with
-/// "cover." and materialize it to a cache file so callers that expect
-/// a `Path` (the TUI) can use it.  Returns None if no cover is present.
 fn find_cover_path(source: &dyn AssetSource) -> Option<PathBuf> {
     const PREFERRED: &[&str] = &[
-        "cover.jpg",
-        "cover.jpeg",
-        "cover.png",
-        "cover.webp",
-        "cover.gif",
+        "cover.jpg", "cover.jpeg", "cover.png", "cover.webp", "cover.gif",
     ];
 
     let (name, bytes) = 'find: {
@@ -58,14 +49,10 @@ fn find_cover_path(source: &dyn AssetSource) -> Option<PathBuf> {
             }
         }
         for entry in source.list("", None) {
-            if entry.contains('/') {
-                continue;
-            }
+            if entry.contains('/') { continue; }
             let lower = entry.to_ascii_lowercase();
             let stem = lower.rsplit_once('.').map(|(s, _)| s).unwrap_or(&lower);
-            if stem != "cover" {
-                continue;
-            }
+            if stem != "cover" { continue; }
             if let Ok(Some(b)) = source.read_bytes(&entry) {
                 break 'find (entry, b);
             }
@@ -87,6 +74,151 @@ fn find_cover_path(source: &dyn AssetSource) -> Option<PathBuf> {
         std::fs::write(&path, &bytes).ok()?;
     }
     Some(path)
+}
+
+// ── embedded plugin cache ──────────────────────────────────────────────
+
+fn plugins_cache_dir() -> PathBuf {
+    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
+        return PathBuf::from(xdg).join("circolate").join("plugins");
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join(".cache").join("circolate").join("plugins");
+    }
+    std::env::temp_dir().join("circolate-plugins")
+}
+
+fn extract_embedded_plugins(
+    source: &dyn AssetSource,
+) -> Result<HashMap<String, PathBuf>> {
+    let entries = source.list_recursive("plugins");
+    if entries.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let key = source.cache_key().unwrap_or_else(|| "anonymous".into());
+    let cache = plugins_cache_dir().join(&key);
+
+    if !cache.exists() {
+        std::fs::create_dir_all(&cache)?;
+        for rel in &entries {
+            let Some(bytes) = source.read_bytes(rel)? else { continue };
+            let dest = cache.join(rel);
+            if let Some(p) = dest.parent() {
+                std::fs::create_dir_all(p)?;
+            }
+            std::fs::write(&dest, &bytes)
+                .with_context(|| format!("writing {}", dest.display()))?;
+        }
+    }
+
+    let mut map = HashMap::new();
+    let plugins_root = cache.join("plugins");
+    if let Ok(rd) = std::fs::read_dir(&plugins_root) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if !p.exists() { continue; }
+            let Some(name) = p.file_name().and_then(|s| s.to_str()) else { continue };
+            let stem = name.strip_suffix(".vst3").unwrap_or(name).to_string();
+            map.insert(stem, p);
+        }
+    }
+    Ok(map)
+}
+
+// ── SF2 cache ──────────────────────────────────────────────────────────
+
+fn sf2_cache_dir() -> PathBuf {
+    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
+        return PathBuf::from(xdg).join("circolate").join("sf2");
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join(".cache").join("circolate").join("sf2");
+    }
+    std::env::temp_dir().join("circolate-sf2")
+}
+
+/// Materialize an SF2 from the source into the cache and return the
+/// path on disk.  The native engine reads SF2s through the filesystem,
+/// not from memory, so archives need their samples extracted once.
+fn materialize_sf2_file(source: &dyn AssetSource, rel: &str) -> Result<Option<PathBuf>> {
+    let Some(bytes) = source.read_bytes(rel)? else {
+        return Ok(None);
+    };
+    let key = source.cache_key().unwrap_or_else(|| "anonymous".into());
+    let dest = sf2_cache_dir().join(&key).join(rel);
+
+    // Only rewrite when the size differs.  A 148 MB FluidR3 vs an old
+    // 4 MB cached bank: size check catches the "user swapped the
+    // SoundFont" case without hashing 148 MB on every load.  Same-size
+    // different content is unlikely and would need a full content
+    // hash — not worth the cost.
+    let needs_write = match std::fs::metadata(&dest) {
+        Ok(md) => md.len() != bytes.len() as u64,
+        Err(_) => true,
+    };
+    if needs_write {
+        if let Some(p) = dest.parent() {
+            std::fs::create_dir_all(p)?;
+        }
+        std::fs::write(&dest, &bytes)
+            .with_context(|| format!("writing {}", dest.display()))?;
+    }
+    Ok(Some(dest))
+}
+
+/// No longer used by the main path — SFLT is gone, so we don't rewrite
+/// VST3 state blobs for it.  Kept for one release to keep old
+/// trackscripts with SFLT sidecars loadable.
+#[allow(dead_code)]
+fn materialize_sf2_reference(
+    source: &dyn AssetSource,
+    state_bytes: &mut Vec<u8>,
+) -> Result<()> {
+    let mut v: serde_json::Value = match serde_json::from_slice(state_bytes.as_slice()) {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+
+    let Some(fields) = v.get_mut("fields").and_then(|f| f.as_object_mut()) else {
+        return Ok(());
+    };
+    let Some(file_val) = fields.get_mut("file") else { return Ok(()) };
+
+    let outer_owned: String = match file_val.as_str() {
+        Some(s) => s.to_string(),
+        None => return Ok(()),
+    };
+    let inner: String = match serde_json::from_str(&outer_owned) {
+        Ok(s) => s,
+        Err(_) => return Ok(()),
+    };
+
+    if Path::new(&inner).exists() {
+        return Ok(());
+    }
+
+    let rel = inner.trim_start_matches("./");
+    let Some(bytes) = source.read_bytes(rel)? else {
+        return Ok(());
+    };
+
+    let key = source.cache_key().unwrap_or_else(|| "anonymous".into());
+    let dest = sf2_cache_dir().join(&key).join(rel);
+    if !dest.exists() {
+        if let Some(p) = dest.parent() {
+            std::fs::create_dir_all(p)?;
+        }
+        std::fs::write(&dest, &bytes)
+            .with_context(|| format!("writing {}", dest.display()))?;
+    }
+
+    let abs = dest.canonicalize().unwrap_or(dest);
+    let new_inner = abs.to_string_lossy().into_owned();
+
+    *file_val = serde_json::Value::String(serde_json::to_string(&new_inner)?);
+    *state_bytes = serde_json::to_vec(&v)?;
+    Ok(())
 }
 
 // ── samples.json ───────────────────────────────────────────────────────
@@ -129,6 +261,7 @@ pub(crate) struct Project {
     pub(crate) samples: HashMap<u32, Arc<Sample>>,
     pub(crate) path_to_id: HashMap<String, u32>,
     pub(crate) sf2_instruments: HashMap<String, Arc<Sf2Instrument>>,
+    pub(crate) sf2_engine_specs: HashMap<String, Sf2EngineSpec>,
     pub(crate) vst_instruments: HashMap<String, Arc<VstInstrument>>,
     pub(crate) multi_sample_instruments: HashMap<String, Arc<MultiSampleInstrument>>,
     pub(crate) lines: Vec<LineInfo>,
@@ -144,6 +277,7 @@ pub(crate) struct Project {
     pub(crate) initial_bpm: f64,
     pub(crate) time_signature: (u32, u32),
     pub(crate) voice_count: usize,
+    pub(crate) requires: Option<Requires>,
 }
 
 impl Project {
@@ -151,11 +285,6 @@ impl Project {
         self.lines.len()
     }
 
-
-        /// A project with no content.  Used as the placeholder while the
-    /// user hasn't picked a song yet — the queue widget is the entry
-    /// point, and everything downstream (draw, engine, loader) just
-    /// sees an empty arrangement.
     pub(crate) fn empty(sample_rate: u32) -> Self {
         Project {
             source_dir: PathBuf::new(),
@@ -166,6 +295,7 @@ impl Project {
             samples: HashMap::new(),
             path_to_id: HashMap::new(),
             sf2_instruments: HashMap::new(),
+            sf2_engine_specs: HashMap::new(),
             vst_instruments: HashMap::new(),
             multi_sample_instruments: HashMap::new(),
             lines: Vec::new(),
@@ -181,6 +311,7 @@ impl Project {
             initial_bpm: 120.0,
             time_signature: (4, 4),
             voice_count: 0,
+            requires: None,
         }
     }
 
@@ -190,10 +321,33 @@ impl Project {
         self.samples.get(id).cloned()
     }
 
+    pub(crate) fn preview_sample_for_part(&self, part_name: &str) -> Option<Arc<Sample>> {
+        let part = self.parts.get(part_name)?;
+
+        if let Some(id) = self.path_to_id.get(&part.sample_path) {
+            if let Some(s) = self.samples.get(id) {
+                return Some(s.clone());
+            }
+        }
+
+        if let Some(inst) = self.sf2_instruments.get(&part.sample_path) {
+            let sid = inst.first_zone_sample_id()?;
+            return self.samples.get(&sid).cloned();
+        }
+
+        None
+    }
+
     pub(crate) fn iid_for_part(&self, part_name: &str) -> Option<u16> {
         let part = self.parts.get(part_name)?;
-        let inst = self.vst_instruments.get(&part.sample_path)?;
-        Some(inst.iid)
+
+        if let Some(inst) = self.vst_instruments.get(&part.sample_path) {
+            return Some(inst.iid);
+        }
+        if let Some(spec) = self.sf2_engine_specs.get(&part.sample_path) {
+            return Some(spec.iid);
+        }
+        None
     }
 
     pub(crate) fn cover_path(&self) -> Option<&Path> {
@@ -234,15 +388,9 @@ impl Project {
                 hi = mid;
             }
         }
-        if lo == 0 {
-            return None;
-        }
+        if lo == 0 { return None; }
         let li = self.order[lo - 1];
-        if self.lines[li].max_end > pos {
-            Some(li)
-        } else {
-            None
-        }
+        if self.lines[li].max_end > pos { Some(li) } else { None }
     }
 
     pub(crate) fn rows_per_measure(&self) -> f64 {
@@ -258,10 +406,7 @@ impl Project {
     }
 
     pub(crate) fn part_events(&self, name: &str) -> &[TrackscriptEvent] {
-        self.parts
-            .get(name)
-            .map(|p| p.events.as_slice())
-            .unwrap_or(&[])
+        self.parts.get(name).map(|p| p.events.as_slice()).unwrap_or(&[])
     }
 
     pub(crate) fn part_subs_per_beat(&self, name: &str) -> u32 {
@@ -269,10 +414,7 @@ impl Project {
     }
 
     pub(crate) fn part_sample_offset(&self, name: &str) -> f64 {
-        self.parts
-            .get(name)
-            .map(|p| p.sample_offset as f64)
-            .unwrap_or(0.0)
+        self.parts.get(name).map(|p| p.sample_offset as f64).unwrap_or(0.0)
     }
 
     pub(crate) fn part_sample_offset_u32(&self, name: &str) -> u32 {
@@ -291,7 +433,7 @@ impl Project {
     }
 }
 
-// ── load_project (source-generic) ──────────────────────────────────────
+// ── load_project ───────────────────────────────────────────────────────
 
 pub(crate) fn load_project_from_source(
     source: &dyn AssetSource,
@@ -306,44 +448,54 @@ pub(crate) fn load_project_from_source(
         .ok_or_else(|| anyhow::anyhow!("source has no trackscript: {}", source.describe()))?;
     let parsed = parse_str(&ts_text)?;
     let cfg = &parsed.config;
-    let debug = std::env::var_os("FLP_DEBUG").is_some();
 
     let source_dir = PathBuf::new();
     let cover_path = find_cover_path(source);
 
-    // Fidelity sidecar.
     let fidelity: Option<Fidelity> = match source.read_text(FIDELITY_FILENAME)? {
         Some(text) => match Fidelity::from_json(&text) {
             Ok(f) => {
                 if !quiet {
                     println!(
                         "  fidelity: {} channels, {} automation lanes, {} playlist items, {} insert buses, {} multi-sample groups",
-                        f.channels.len(),
-                        f.channel_automation.len(),
-                        f.playlist.len(),
-                        f.inserts.len(),
-                        f.multi_sample.len(),
+                        f.channels.len(), f.channel_automation.len(),
+                        f.playlist.len(), f.inserts.len(), f.multi_sample.len(),
                     );
                 }
                 Some(f)
             }
             Err(e) => {
-                if !quiet {
-                    eprintln!("  fidelity: {:#}, ignoring", e);
-                }
+                if !quiet { eprintln!("  fidelity: {:#}, ignoring", e); }
                 None
             }
         },
         None => None,
     };
 
-    // Samples.
+    // ── embedded plugins ────────────────────────────────────────────
+    let embedded_plugins: HashMap<String, PathBuf> = if quiet {
+        extract_embedded_plugins(source).unwrap_or_default()
+    } else {
+        match extract_embedded_plugins(source) {
+            Ok(m) if !m.is_empty() => {
+                println!("  extracted {} embedded plugin bundle(s)", m.len());
+                m
+            }
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("  embedded plugin extraction failed: {:#}", e);
+                HashMap::new()
+            }
+        }
+    };
+
+    // ── samples ─────────────────────────────────────────────────────
     let mut samples: HashMap<u32, Arc<Sample>> = HashMap::new();
     let mut fps: HashMap<u32, u64> = HashMap::new();
     let mut path_to_id: HashMap<String, u32> = HashMap::new();
 
     match source.read_text("samples.json")? {
-        Some(text) => {
+        Some(text) if !text.trim().is_empty() => {
             let lib: SampleLibrary =
                 serde_json::from_str(&text).context("parsing samples.json")?;
             for s in lib.samples {
@@ -361,24 +513,14 @@ pub(crate) fn load_project_from_source(
                 let rate = decoded.rate;
                 let stereo = decoded.channels_count() == 2;
                 let mut chans = decoded.channels;
-                let right = if stereo {
-                    chans.pop().unwrap()
-                } else {
-                    Vec::new()
-                };
+                let right = if stereo { chans.pop().unwrap() } else { Vec::new() };
                 let left = chans.pop().unwrap_or_default();
                 let loop_pts = s
                     .loops
                     .main
                     .filter(|l| l.end > l.start)
                     .map(|l| (l.start as i64, l.end as i64));
-                let smp = Sample {
-                    left,
-                    right,
-                    stereo,
-                    rate,
-                    loop_pts,
-                };
+                let smp = Sample { left, right, stereo, rate, loop_pts };
                 fps.insert(s.id, fingerprint(&smp));
                 samples.insert(s.id, Arc::new(smp));
                 if let Some(stripped) = rel.strip_prefix("./") {
@@ -387,7 +529,7 @@ pub(crate) fn load_project_from_source(
                 path_to_id.insert(rel, s.id);
             }
         }
-        None => {
+        _ => {
             if !quiet {
                 eprintln!("  (no samples.json in {})", source.describe());
             }
@@ -397,27 +539,12 @@ pub(crate) fn load_project_from_source(
         println!("  loaded {} samples", samples.len());
     }
 
-    if debug {
-        let mut entries: Vec<(u32, String)> = path_to_id
-            .iter()
-            .map(|(k, v)| (*v, k.clone()))
-            .collect();
-        entries.sort();
-        entries.dedup();
-        eprintln!("flp: sample id map ({} entries):", entries.len());
-        for (id, path) in entries.iter().take(500) {
-            eprintln!("flp:   {:>6} <- {}", id, path);
-        }
-    }
-
     // Multi-sample instruments.
     let mut multi_sample_instruments: HashMap<String, Arc<MultiSampleInstrument>> =
         HashMap::new();
     if let Some(fid) = &fidelity {
         for (_iid_str, ms) in &fid.multi_sample {
-            if ms.files.is_empty() {
-                continue;
-            }
+            if ms.files.is_empty() { continue; }
             if let Some(inst) =
                 MultiSampleInstrument::new(&ms.files, &ms.root_keys, &path_to_id)
             {
@@ -427,19 +554,28 @@ pub(crate) fn load_project_from_source(
         }
     }
     if !quiet && !multi_sample_instruments.is_empty() {
-        println!(
-            "  multi-sample: {} instrument(s)",
-            multi_sample_instruments.len()
-        );
+        println!("  multi-sample: {} instrument(s)", multi_sample_instruments.len());
     }
 
     // Instrument sidecars.
     let mut sf2_instruments: HashMap<String, Arc<Sf2Instrument>> = HashMap::new();
+    let mut sf2_engine_specs: HashMap<String, Sf2EngineSpec> = HashMap::new();
     let mut vst_instruments: HashMap<String, Arc<VstInstrument>> = HashMap::new();
     let mut next_sf2_id: u32 = 10_000;
 
-    for rel in source.list("instruments", Some("instrument")) {
-        let Some(text) = source.read_text(&rel)? else { continue };
+    for entry in source.list("instruments", Some("instrument")) {
+        // `list()` may return entries relative to the requested
+        // directory or relative to the source root.  Normalise to the
+        // root-relative form that `read_text` expects.
+        let rel = if entry.starts_with("instruments/") || entry.starts_with("./instruments/") {
+            entry.trim_start_matches("./").to_string()
+        } else {
+            format!("instruments/{}", entry)
+        };
+        let Some(text) = source.read_text(&rel)? else {
+            eprintln!("  (sidecar unreadable: {})", rel);
+            continue;
+        };
         let Ok(inst) = crate::instruments::parse(&text, &rel) else { continue };
         let stem = rel
             .rsplit('/')
@@ -454,34 +590,60 @@ pub(crate) fn load_project_from_source(
                 .to_string_lossy()
                 .trim_start_matches("./")
                 .to_string();
+
+            // Materialize the SF2 to disk for the native engine.
+            // `build_sf2_instrument` below reads from the in-memory
+            // bytes; only the engine needs the on-disk path.
             let Some(sf2_bytes) = source.read_bytes(&sf2_rel)? else {
-                if !quiet {
-                    eprintln!("  (SF2 {} not in source)", sf2_rel);
-                }
+                if !quiet { eprintln!("  (SF2 {} not in source)", sf2_rel); }
                 continue;
             };
-            match build_sf2_instrument(
+            let sf2_on_disk = match materialize_sf2_file(source, &sf2_rel) {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    if !quiet { eprintln!("  (SF2 {} not in source)", sf2_rel); }
+                    continue;
+                }
+                Err(e) => {
+                    if !quiet { eprintln!("  (SF2 {} materialize failed: {:#})", sf2_rel, e); }
+                    continue;
+                }
+            };
+
+            // Old internal renderer: still built for waveform preview
+            // and as a fallback if the engine fails to install.
+            if let Ok(obj) = build_sf2_instrument(
                 &sf2_bytes,
                 inst.sf2_bank as u16,
                 inst.sf2_preset as u16,
                 next_sf2_id,
                 &mut samples,
             ) {
-                Ok(obj) => {
-                    next_sf2_id += obj.zone_count_hint() + 1;
-                    sf2_instruments.insert(sidecar_rel, Arc::new(obj));
-                }
-                Err(e) => {
-                    if !quiet {
-                        eprintln!("  (SF2 {} failed: {:#})", sf2_rel, e);
-                    }
-                }
+                next_sf2_id += obj.zone_count_hint() + 1;
+                sf2_instruments.insert(sidecar_rel.clone(), Arc::new(obj));
             }
+
+            // New engine spec.
+            sf2_engine_specs.insert(
+                sidecar_rel,
+                Sf2EngineSpec {
+                    sf2_path: sf2_on_disk,
+                    bank: inst.sf2_bank as u8,
+                    preset: inst.sf2_preset as u8,
+                    gain: inst.gain,
+                    iid: inst.source_channel,
+                },
+            );
         } else if inst.is_vst3() {
             if inst.unresolved || inst.vst_path.is_empty() {
                 continue;
             }
-            let plugin_path = PathBuf::from(&inst.vst_path);
+
+            let embedded = embedded_plugins.get(&inst.plugin).cloned();
+            let plugin_path = embedded
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(&inst.vst_path));
+
             if !plugin_path.exists() {
                 if !quiet {
                     eprintln!(
@@ -491,7 +653,8 @@ pub(crate) fn load_project_from_source(
                 }
                 continue;
             }
-            let state_bytes = if inst.state_path.as_os_str().is_empty() {
+
+            let mut state_bytes = if inst.state_path.as_os_str().is_empty() {
                 Vec::new()
             } else {
                 let name = inst
@@ -502,10 +665,24 @@ pub(crate) fn load_project_from_source(
                 let state_rel = format!("instruments/{}", name);
                 source.read_bytes(&state_rel)?.unwrap_or_default()
             };
+
+            // Legacy: old trackscripts may still carry SFLT VST3
+            // sidecars with a state blob.  Materialize their referenced
+            // SF2 so at least the plugin can find it — the engine
+            // doesn't see these anymore.
+            if inst.plugin == "SFLT" && !state_bytes.is_empty() {
+                if let Err(e) = materialize_sf2_reference(source, &mut state_bytes) {
+                    if !quiet {
+                        eprintln!("  SF2 materialize failed for {}: {:#}", sidecar_rel, e);
+                    }
+                }
+            }
+
             vst_instruments.insert(
                 sidecar_rel,
                 Arc::new(VstInstrument {
                     iid: inst.source_channel,
+                    name: inst.plugin.clone(),
                     plugin_path,
                     state_bytes,
                     fallback: inst.fallback,
@@ -516,16 +693,30 @@ pub(crate) fn load_project_from_source(
     }
     if !quiet {
         println!(
-            "  loaded {} sf2 instruments, {} vst instruments",
+            "  loaded {} sf2 instruments, {} sf2 engines, {} vst instruments",
             sf2_instruments.len(),
+            sf2_engine_specs.len(),
             vst_instruments.len()
         );
     }
 
+    // Requires sidecar.
+    let requires: Option<Requires> = match source.read_text(requires::FILENAME)? {
+        Some(text) => match requires::parse(&text) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                if !quiet {
+                    eprintln!("  requires: {:#}, ignoring", e);
+                }
+                None
+            }
+        },
+        None => None,
+    };
+
     // ── measure resolution ─────────────────────────────────────────
     let sr = sample_rate as f64;
-    let rows_per_measure =
-        cfg.time_signature.0 as f64 * cfg.subdivisions.max(1) as f64;
+    let rows_per_measure = cfg.time_signature.0 as f64 * cfg.subdivisions.max(1) as f64;
 
     let mut resolved_lines = Vec::with_capacity(parsed.block_list.len());
     let mut total_arrangement_rows: f64 = 0.0;
@@ -574,6 +765,7 @@ pub(crate) fn load_project_from_source(
                 &path_to_id,
                 &samples,
                 &sf2_instruments,
+                &sf2_engine_specs,
                 &vst_instruments,
                 &multi_sample_instruments,
             );
@@ -626,10 +818,8 @@ pub(crate) fn load_project_from_source(
     if !quiet {
         println!(
             "  parsed {} parts, {} blocks, {} BlockList lines, {} voices",
-            parsed.parts.len(),
-            parsed.blocks.len(),
-            parsed.block_list.len(),
-            total_voices
+            parsed.parts.len(), parsed.blocks.len(),
+            parsed.block_list.len(), total_voices
         );
     }
 
@@ -643,6 +833,7 @@ pub(crate) fn load_project_from_source(
         samples,
         path_to_id,
         sf2_instruments,
+        sf2_engine_specs,
         vst_instruments,
         multi_sample_instruments,
         lines,
@@ -661,6 +852,7 @@ pub(crate) fn load_project_from_source(
         source_dir,
         cover_path,
         fidelity,
+        requires,
     };
     Ok((Arc::new(project), cache))
 }
@@ -694,9 +886,6 @@ pub(crate) fn load_project_from_archive(
     load_project_from_source(&reader, sample_rate, use_cache, quiet, Some(&title))
 }
 
-/// Dispatch by extension: `.tsz` → archive, anything else → directory.
-/// This is what `play.rs` calls, and its signature matches the old
-/// path-based `load_project`.
 pub(crate) fn load_project(
     path: &Path,
     sample_rate: u32,

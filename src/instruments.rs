@@ -22,6 +22,10 @@
 //!         SourceChannel: 18;
 //!     }
 //!
+//! Older sidecars from the FLP converter omit `Bank:` and pack bank and
+//! preset into a single u32 in `Preset:` (`bank << 16 | preset << 8 |
+//! channel`).  `parse` detects this and unpacks it, so both layouts work.
+//!
 //! `parse` reads from a string (used by archive sources); `load` reads
 //! from disk and resolves `state_path` relative to the sidecar's dir.
 
@@ -74,6 +78,7 @@ pub fn parse(text: &str, _hint: &str) -> Result<Instrument> {
     let mut sf2 = String::new();
     let mut sf2_bank: u32 = 0;
     let mut sf2_preset: u32 = 0;
+    let mut sf2_bank_set = false;
     let mut fallback = false;
     let mut unresolved = false;
     let mut replaces = String::new();
@@ -102,7 +107,10 @@ pub fn parse(text: &str, _hint: &str) -> Result<Instrument> {
             "Path" => vst_path = value,
             "State" => state = value,
             "File" => sf2 = value,
-            "Bank" => sf2_bank = value.parse().unwrap_or(0),
+            "Bank" => {
+                sf2_bank = value.parse().unwrap_or(0);
+                sf2_bank_set = true;
+            }
             "Preset" => sf2_preset = value.parse().unwrap_or(0),
             "Replaces" => replaces = value,
             "Fallback" => fallback = value.eq_ignore_ascii_case("true"),
@@ -110,6 +118,22 @@ pub fn parse(text: &str, _hint: &str) -> Result<Instrument> {
             "Gain" => gain = value.parse().unwrap_or(1.0),
             "SourceChannel" => source_channel = value.parse().unwrap_or(0),
             _ => {}
+        }
+    }
+
+    // Packed-preset decode.  When the sidecar omits `Bank:` and the
+    // `Preset:` value is larger than a single MIDI preset can be, treat
+    // it as `bank << 16 | preset << 8 | channel` (the layout written by
+    // the FLP converter).  When `Bank:` is explicit, leave Preset alone.
+    if kind == "sf2" && !sf2_bank_set && sf2_preset > 255 {
+        let word = sf2_preset;
+        sf2_bank   = (word >> 16) & 0xFF;
+        sf2_preset = (word >>  8) & 0xFF;
+        if std::env::var_os("SF2_DEBUG").is_some() {
+            eprintln!(
+                "instruments: decoded packed Preset {:#x} -> bank {} preset {}",
+                word, sf2_bank, sf2_preset
+            );
         }
     }
 

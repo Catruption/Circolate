@@ -1,0 +1,74 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Trackscript",
+  "scopeName": "source.trackscript",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#sections" },
+    { "include": "#config-keys" },
+    { "include": "#calls" },
+    { "include": "#fields" },
+    { "include": "#strings" },
+    { "include": "#numbers" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        { "name": "comment.line.double-slash.trackscript",
+          "match": "//.*$" }
+      ]
+    },
+    "sections": {
+      "patterns": [
+        { "name": "keyword.control.section.trackscript",
+          "match": "\\b(Config|BlockList|BlockArray)\\b" }
+      ]
+    },
+    "config-keys": {
+      "patterns": [
+        { "name": "entity.other.attribute-name.trackscript",
+          "match": "\\b(TrackscriptVersion|BeatsPerMinute|TimeSignature|Subdivisions|SongVolume|PanningLaw|Overlap|PitchDefault|Tempo|GlobalVolume|GlobalPan|GlobalTuning)\\b" },
+        { "name": "constant.language.trackscript",
+          "match": "\\b(linear|equal_power|stack|hz|names)\\b" }
+      ]
+    },
+    "calls": {
+      "patterns": [
+        { "name": "entity.name.function.trackscript",
+          "match": "ƒ[A-Za-z_]\\w*(?=\\()" },
+        { "name": "variable.other.trackscript",
+          "match": "ƒ[A-Za-z_]\\w*" },
+        { "name": "string.other.path.trackscript",
+          "match": "ƒ'[^']*'(?:\\(\\d+\\))?" }
+      ]
+    },
+    "fields": {
+      "patterns": [
+        { "name": "constant.numeric.position.trackscript",
+          "match": "§[\\d.]+(?:/[\\d.]+)?" },
+        { "name": "constant.numeric.pitch.trackscript",
+          "match": "#(?:[A-Ga-g][#b]?-?\\d+|\\d+(?:\\.\\d+)?)(?:[+\\-*±][\\d.]+(?:[→^][\\d.]+(?:/[\\d.]+)?)?(?::\\d+)?)?" },
+        { "name": "constant.numeric.length.trackscript",
+          "match": "~[\\d.]+(?:[+\\-*±][\\d.]+(?:[→^][\\d.]+(?:/[\\d.]+)?)?(?::\\d+)?)?" },
+        { "name": "constant.numeric.volume.trackscript",
+          "match": "%-?[\\d.]+(?:[+\\-*±][\\d.]+(?:[→^][\\d.]+(?:/[\\d.]+)?)?(?::\\d+)?)?" },
+        { "name": "constant.numeric.pan.trackscript",
+          "match": "¶-?[\\d.]+(?:[+\\-*±][\\d.]+(?:[→^][\\d.]+(?:/[\\d.]+)?)?(?::\\d+)?)?" },
+        { "name": "keyword.operator.trackscript",
+          "match": "[+*±→^]" }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        { "name": "string.quoted.single.trackscript",
+          "begin": "'", "end": "'" }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        { "name": "constant.numeric.float.trackscript",
+          "match": "\\d+(?:\\.\\d+)?" }
+      ]
+    }
+  }
+}

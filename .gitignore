@@ -1,21 +1,36 @@
-/*
-!/.gitignore
-!/.gitattributes
-!/Cargo.toml
-!/Cargo.lock
-!/build.rs
-!/README.md
+# ── Rust build output ──────────────────────────────────────────
+/target/
 
-!/src/
-!/src/**
+# ── Large SoundFonts ───────────────────────────────────────────
+# Users install their own (FluidR3 lives at /usr/share/soundfonts/
+# on most distros).  Do not ship 148 MB banks in the repo.
+/soundfonts/
+/plugins/
+/music/
+/share/plugins/
+# ── Trackscript extractions ────────────────────────────────────
+# The .tsz is the canonical artifact; extracted directories are
+# working copies.  Town/ is committed deliberately, so this stays
+# commented.  Uncomment to ignore all of them:
+# /trackscripts/*/
 
-!/share/
-!/share/**
+# ── Editor / OS cruft ──────────────────────────────────────────
+desktop.ini
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+*.orig
+*.rej
 
-!/trackscripts/
-!/trackscripts/**
+# ── Stray flag-parse artifacts ─────────────────────────────────
+# `run.sh --some-flag` (with the flag's value missing) writes a file
+# named after the flag at cwd.  Anything starting with a dash is an
+# accident.
+/-*
 
-!/acquire.sh
-!/fallbacks.json
-!/master_fx.json
-!/trackscript.xml
+# ── Local scratch ──────────────────────────────────────────────
+*.tmp
+*.bak
+/trackscripts/*.tsz

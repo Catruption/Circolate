@@ -66,8 +66,6 @@ pub fn draw(
     }
 
     let total_measures = project.line_count();
-    // The spiral now lives inside the queue box (bottom-right of the
-    // tracker), so its height is capped by the box.
     let spiral_layout = build_spiral(total_measures, queue::VISIBLE_LINES.min(SPIRAL_MAX_H));
 
     let chunks = Layout::default()
@@ -75,7 +73,7 @@ pub fn draw(
         .constraints([Constraint::Length(3), Constraint::Min(6)])
         .split(area);
 
-        draw_header(f, chunks[0], project, tp, sample_rate, state.loading.as_deref());
+    draw_header(f, chunks[0], project, tp, sample_rate, state.loading.as_deref());
     if area.height as f32 * 2.0 > area.width as f32 {
         crate::tui::draw_vertical::draw_tracker_vertical(
             f, chunks[1], tp, project, state,
@@ -84,8 +82,7 @@ pub fn draw(
         draw_tracker(f, chunks[1], tp, project, state);
     }
 
-
-        // ── Mosaic background pass ──────────────────────────────────────
+    // ── Mosaic background pass ──────────────────────────────────────
     if let Some(cover) = &state.cover {
         let buf = f.buffer_mut();
         let w = buf.area.width;
@@ -103,9 +100,6 @@ pub fn draw(
     }
 
     // ── Queue box + spiral ──────────────────────────────────────────
-    // Notched into the tracker's bottom-right corner: the box carves its
-    // own space out of the tracker frame and hosts the spiral.  Runs
-    // after the mosaic pass because it paints its own background.
     let spd = tp.speed.load(Ordering::Relaxed);
     state.queue.direction = match spd.signum() {
         1 => '▶',
@@ -193,14 +187,6 @@ fn draw_tracker(
     let rpmeasure = p.rows_per_measure();
     let lookback = LOOKBACK_LINES.min(li);
 
-    // Sources for this column, keyed by sample path.  The value is a
-    // list of (part name, offset_rows, measure_start, measure_len):
-    //   * `offset_rows` is how far the selected measure's start is from
-    //     the current line's start.  0 for the current line's calls;
-    //     k*rpmeasure for sources carried back k lines.
-    //   * `measure_start` / `measure_len` locate the selected measure
-    //     inside the part's multi-section timeline.  Events outside
-    //     that range belong to other sections and must not render here.
     let mut by_path: HashMap<String, Vec<(String, f64, f64, f64)>> = HashMap::new();
     let mut discovery: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -329,16 +315,10 @@ fn draw_tracker(
                 subs,
                 p.part_sample_offset_u32(name),
             ) {
-                // Only notes that START in the selected measure.  A note
-                // whose start falls in another section belongs to that
-                // section's call, not this one.
                 if note.start_row < *measure_start || note.start_row >= measure_end {
                     continue;
                 }
 
-                // Rebase everything to measure-local coordinates so the
-                // rest of the renderer (which assumes a single measure)
-                // works unchanged.
                 let ms = *measure_start;
                 note.start_row -= ms;
                 note.end_row -= ms;
@@ -374,7 +354,6 @@ fn draw_tracker(
             }
         }
 
-        // Sort notes and their block-line tags together.
         let mut idx: Vec<usize> = (0..notes.len()).collect();
         idx.sort_by(|&a, &b| {
             notes[a]
@@ -414,7 +393,10 @@ fn draw_tracker(
         column_rows_hit.push(entries_bl);
     }
 
-    // Envelopes.
+    // Envelopes.  Preview lookup uses `preview_sample_for_part`, which
+    // resolves WAV samplers through `path_to_id` and SF2 instruments
+    // through the first zone's PCM slice.  VST and other kinds fall
+    // through to the live-scope / static-synth branches below.
     if state.last_synth_env.len() < visible_cols {
         state.last_synth_env.resize_with(visible_cols, Vec::new);
     }
@@ -425,7 +407,7 @@ fn draw_tracker(
             envelopes.push(vec![(0.0, 0.0); pixel_rows]);
             continue;
         };
-        if let Some(sample) = p.sample_for_part(name) {
+        if let Some(sample) = p.preview_sample_for_part(name) {
             let key = (path.clone(), pixel_rows);
             let env = state
                 .sample_env_cache
@@ -472,7 +454,7 @@ fn draw_tracker(
             playhead_pys.push(None);
             continue;
         };
-        let Some(sample) = p.sample_for_part(name) else {
+        let Some(sample) = p.preview_sample_for_part(name) else {
             playhead_pys.push(None);
             continue;
         };
@@ -754,9 +736,6 @@ fn spiral_dirs(layout: &SpiralLayout, gx: usize, gy: usize) -> theme::PathDirs {
         down: gy + 1 < gh && check(gx, gy + 1),
     };
 
-    // Innermost cell of the spiral: close it into a corner so the
-    // centre reads as a curl rather than an open line.  The phantom
-    // edge is a render-time decision — see `SpiralLayout::is_center`.
     if layout.is_center(gx, gy) && !dirs.down {
         dirs.down = true;
     }

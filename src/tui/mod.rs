@@ -135,6 +135,7 @@ pub struct RenderState {
     pub queue_placed: Option<queue::Placed>,
     pub play_request: Option<String>,
     pub loading: Option<String>,
+    pub loading_notes: Vec<String>,
     /// Set when an in-place rewind is initiated.  Suppresses the next
     /// `tp.done` sighting so the loop counter doesn't double-decrement
     /// while the seek is in flight.
@@ -162,6 +163,7 @@ impl RenderState {
             queue_placed: None,
             play_request: None,
             loading: None,
+            loading_notes: Vec::new(),
             rewind_cooldown_until: None,
         }
     }
@@ -225,6 +227,7 @@ pub fn show_loading(
     term: &mut Terminal<CrosstermBackend<Stdout>>,
     queue: &queue::QueueState,
     msg: &str,
+    notes: &[String],
 ) -> Result<()> {
     use std::sync::atomic::{AtomicBool, AtomicI64};
 
@@ -241,6 +244,7 @@ pub fn show_loading(
     let project = Arc::new(Project::empty(44100));
     let mut state = RenderState::new(queue.clone());
     state.loading = Some(msg.to_string());
+    state.loading_notes = notes.to_vec();
     term.draw(|f| draw(f, &tp, &project, 44100, &mut state))?;
     Ok(())
 }
@@ -254,6 +258,8 @@ pub fn run_against(
 ) -> Result<(Option<String>, queue::QueueState)> {
     let mut state = RenderState::new(queue);
 
+    // An empty project means the queue widget is the entry point:
+    // focus it so keystrokes land there without an extra click.
     if project.voice_count == 0 {
         state.queue.focused = true;
     }
@@ -284,6 +290,8 @@ fn event_loop(
                 Event::Key(k) => {
                     let is_ctrl_c = k.code == KeyCode::Char('c')
                         && k.modifiers.contains(KeyModifiers::CONTROL);
+                    // Typing in the queue box: it gets every key except
+                    // Ctrl-C (Esc just leaves the box).
                     let typing =
                         state.queue.focused && !state.player.show_help && !is_ctrl_c;
                     if !typing
@@ -330,10 +338,6 @@ fn event_loop(
         //     exhausted, or no queue involvement at all) — replay in
         //     place by seeking to zero.  No disk reload, no stream
         //     teardown, no loading flicker.
-        //
-        // After an in-place seek, `done` stays true until the seek
-        // lands and the audio callback notices it's producing again.
-        // A short cooldown suppresses re-advancing during that window.
         let speed = tp.speed.load(Ordering::Relaxed);
         let done = tp.done.load(Ordering::Acquire);
         let cooling = state
@@ -341,9 +345,6 @@ fn event_loop(
             .map_or(false, |t| t > std::time::Instant::now());
 
         if !done {
-            // Audio is flowing.  Any in-flight rewind has landed;
-            // drop the cooldown so the next end-of-song is handled
-            // promptly.
             state.rewind_cooldown_until = None;
         } else if speed > 0 && !cooling {
             state.rewind_cooldown_until = Some(
@@ -355,26 +356,30 @@ fn event_loop(
                 let prev = state.queue.now_playing.clone();
                 match state.queue.advance() {
                     Some(next_name) if Some(&next_name) == prev.as_ref() => {
-                        // Same song on loop — replay in place.
                         tp.seek_to.store(0, Ordering::Release);
                     }
                     Some(next_name) => {
-                        // Different song — hand back to the caller.
                         state.play_request = Some(next_name);
                         break;
                     }
                     None => {
-                        // Queue exhausted — rewind and stay open.
-                        tp.seek_to.store(0, Ordering::Release);
+                        stop_at_start(tp);
                     }
                 }
             } else {
-                // No queue involvement — rewind and stay open.
-                tp.seek_to.store(0, Ordering::Release);
+                stop_at_start(tp);
             }
         }
     }
     Ok(())
+}
+
+/// Park the transport at 0:00 with playback off.  Called when the queue
+/// is exhausted or a lone track finishes.
+fn stop_at_start(tp: &Arc<Transport>) {
+    tp.speed.store(0, Ordering::Release);
+    tp.seek_to.store(0, Ordering::Release);
+    tp.done.store(false, Ordering::Release);
 }
 
 // ── loop enforcement ───────────────────────────────────────────────────
@@ -522,13 +527,19 @@ fn handle_key(
     }
 }
 
+/// A key press while the queue box has focus.
 fn handle_queue_key(code: KeyCode, modifiers: KeyModifiers, state: &mut RenderState) {
     let plain = !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
     match code {
         KeyCode::Esc => state.queue.focused = false,
         KeyCode::Enter => {
+            // Submit the selected line.  Hand focus back to the player
+            // so the arrow keys, mute, and seek bindings work on the
+            // song that's about to load.  Click the queue again to add
+            // another entry.
             if let Some(name) = state.queue.play_current() {
                 state.play_request = Some(name);
+                state.queue.focused = false;
             }
         }
         KeyCode::Char(c) if plain => state.queue.insert_char(c),

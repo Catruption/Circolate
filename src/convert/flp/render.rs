@@ -132,6 +132,27 @@ pub(super) fn render_part(
                 fields.push(format!("¶{}", fmt(pan, 2)));
             }
 
+            // Extended per-note fields, emitted only when off default.
+            // Defaults from the FLP format: fine_pitch 120 (centred),
+            // release 64, mod_x 128, mod_y 128.  The trackscript form
+            // stores the signed delta from each default.
+            let fp_delta = n.fine_pitch as i16 - 120;
+            if fp_delta != 0 {
+                fields.push(format!("¢{:+}", fp_delta));
+            }
+            let rel_delta = n.release as i16 - 64;
+            if rel_delta != 0 {
+                fields.push(format!("₨{:+}", rel_delta));
+            }
+            let mx_delta = n.mod_x as i16 - 128;
+            if mx_delta != 0 {
+                fields.push(format!("₥{:+}", mx_delta));
+            }
+            let my_delta = n.mod_y as i16 - 128;
+            if my_delta != 0 {
+                fields.push(format!("¥{:+}", my_delta));
+            }
+
             if let Some(ms) = p.clip_offset_ms {
                 if ms > 0.0 && style.sample_rate > 0 && !source_path.is_empty() {
                     let samples =

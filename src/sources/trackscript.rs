@@ -40,8 +40,9 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use crate::spec::{
-    active_event_prefix_glyphs, FIELD_DURATION, FIELD_PAN, FIELD_PITCH, FIELD_POSITION,
-    FIELD_SOURCE, FIELD_VOLUME, PART_HEADER_SIGIL,
+    active_event_prefix_glyphs, FIELD_DURATION, FIELD_FINE_PITCH, FIELD_MOD_X, FIELD_MOD_Y,
+    FIELD_PAN, FIELD_PITCH, FIELD_POSITION, FIELD_RELEASE, FIELD_SOURCE, FIELD_VOLUME,
+    PART_HEADER_SIGIL,
 };
 
 pub const C5_HZ: f64 = 523.2511306;
@@ -66,6 +67,14 @@ pub struct TrackscriptEvent {
     /// Native tempo of the sample, from a `|bpm` field.  The player
     /// stretches the sample by song tempo / `src_bpm`.
     pub src_bpm: Option<f64>,
+    /// Fine pitch offset in cents, as a signed delta from 0.
+    pub fine_pitch: Option<i16>,
+    /// Release velocity, as a signed delta from the engine default of 64.
+    pub release: Option<i16>,
+    /// Mod X, as a signed delta from the engine default of 128.
+    pub mod_x: Option<i16>,
+    /// Mod Y, as a signed delta from the engine default of 128.
+    pub mod_y: Option<i16>,
     pub raw: String,
 }
 
@@ -758,6 +767,10 @@ fn parse_part_events(
             sample_override: None,
             offset: None,
             src_bpm: None,
+            fine_pitch: None,
+            release: None,
+            mod_x: None,
+            mod_y: None,
             raw: format!("<{}>", inner),
         };
 
@@ -793,6 +806,14 @@ fn parse_part_events(
                 if let Some(v) = parse_f(rest) {
                     ev.pan = Some(v);
                 }
+            } else if let Some(rest) = f.strip_prefix(FIELD_FINE_PITCH) {
+                ev.fine_pitch = rest.trim().parse::<i16>().ok();
+            } else if let Some(rest) = f.strip_prefix(FIELD_RELEASE) {
+                ev.release = rest.trim().parse::<i16>().ok();
+            } else if let Some(rest) = f.strip_prefix(FIELD_MOD_X) {
+                ev.mod_x = rest.trim().parse::<i16>().ok();
+            } else if let Some(rest) = f.strip_prefix(FIELD_MOD_Y) {
+                ev.mod_y = rest.trim().parse::<i16>().ok();
             } else if f.starts_with(FIELD_SOURCE) {
                 if let Some(c) = src_rx.captures(&f) {
                     ev.sample_override = Some(c[1].to_string());

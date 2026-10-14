@@ -85,11 +85,12 @@ pub(crate) fn prepare_line(
     for call in project.line_calls(li) {
         let Some(part) = project.parts.get(&call.name) else { continue };
         let tpl = cache.template(
-            project.part_hash[&call.name],
+            project.part_hash_map()[&call.name],
             part,
             &project.path_to_id,
             &project.samples,
             &project.sf2_instruments,
+            &project.sf2_engine_specs,
             &project.vst_instruments,
             &project.multi_sample_instruments,
         );

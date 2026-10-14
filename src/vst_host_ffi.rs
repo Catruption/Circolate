@@ -4,15 +4,24 @@
 //! entry point to use: `process()` for synths (writes output, ignores
 //! input), `process_inplace()` for effects (reads and writes the same
 //! buffer).
+//!
+//! Lifecycle: `VstHost::load` creates the plugin with an empty state and
+//! then immediately applies the state it was given, then activates.
+//! That ordering matters — a sampler sizes its internal playback buffers
+//! at activation based on the state it sees.  Loading state after
+//! activation leaves those buffers sized for "nothing", and the plugin
+//! crashes when it tries to write into them.  See the comment in
+//! `vst_shim.cpp` for the full story.
 
 use anyhow::Result;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_float, c_int, c_void};
 
-extern "C" {
+unsafe extern "C" {
     fn vst_shim_create(plugin_path: *const c_char, sample_rate: c_int,
                        block_size: c_int) -> *mut c_void;
                        fn vst_shim_destroy(handle: *mut c_void);
+                       fn vst_shim_activate(handle: *mut c_void);
                        fn vst_shim_set_state(handle: *mut c_void,
                                              data: *const u8, len: usize) -> c_int;
                                              fn vst_shim_note_on(handle: *mut c_void,
@@ -36,17 +45,32 @@ pub struct VstHost {
 impl VstHost {
     pub fn load(plugin_path: &str, state_bytes: &[u8], sr: u32) -> Result<Self> {
         let cpath = CString::new(plugin_path)?;
+
+        // Create — the plugin is configured but not yet active.
         let handle = unsafe { vst_shim_create(cpath.as_ptr(), sr as c_int, 512) };
         if handle.is_null() {
             return Err(anyhow::anyhow!("vst_shim_create failed for {}", plugin_path));
         }
-        let ok = unsafe {
-            vst_shim_set_state(handle, state_bytes.as_ptr(), state_bytes.len())
-        };
-        if ok != 1 {
-            unsafe { vst_shim_destroy(handle) };
-            return Err(anyhow::anyhow!("setStateInformation failed"));
+
+        // Apply state while inactive.  The plugin sizes its buffers
+        // against this state at activation, so this has to happen
+        // before vst_shim_activate.
+        if !state_bytes.is_empty() {
+            let ok = unsafe {
+                vst_shim_set_state(handle, state_bytes.as_ptr(), state_bytes.len())
+            };
+            if ok != 1 {
+                unsafe { vst_shim_destroy(handle) };
+                return Err(anyhow::anyhow!(
+                    "setStateInformation failed for {}",
+                    plugin_path
+                ));
+            }
         }
+
+        // Now bring it online.
+        unsafe { vst_shim_activate(handle) };
+
         Ok(VstHost { handle })
     }
 

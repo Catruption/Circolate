@@ -7,6 +7,7 @@ use std::sync::Arc;
 use super::engine::Engine;
 use super::project::{Cache, Loader, Project};
 use crate::effects::EffectChain;
+use crate::sf2_engine::Sf2Engine;
 use crate::vst_host_ffi::VstHost;
 
 const BLOCK: usize = 4096;
@@ -16,6 +17,7 @@ pub(crate) fn render_offline(
     cache: Cache,
     start: i64,
     no_master_fx: bool,
+    sf2_override: Option<&Path>,
 ) -> (Vec<f32>, Vec<f32>, Cache) {
     let lookahead = project.sample_rate as i64;
     let start = start.clamp(0, project.total_samples);
@@ -37,12 +39,12 @@ pub(crate) fn render_offline(
                 let tag = if vinst.fallback { "fallback" } else { "exact" };
                 println!(
                     "  loaded VST [{}] {} ({})",
-                         vinst.iid,
-                         vinst.plugin_path
-                         .file_stem()
-                         .and_then(|s| s.to_str())
-                         .unwrap_or("?"),
-                         tag
+                    vinst.iid,
+                    vinst.plugin_path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("?"),
+                    tag
                 );
                 engine.install_host_with_gain(vinst.iid, host, vinst.gain);
             }
@@ -52,6 +54,22 @@ pub(crate) fn render_offline(
         }
     }
     println!("  installed {} VST host(s)", engine.host_count());
+
+    // Native SF2 engines.  Same setup as `install_sf2_engines` in the live
+    // path (play.rs); without this, every SF2 note in an offline render is
+    // dropped and the WAV comes out silent.
+    for (name, spec) in &project.sf2_engine_specs {
+        let path = sf2_override.unwrap_or(&spec.sf2_path);
+        let mut sf2 = Sf2Engine::new(project.sample_rate);
+        if let Err(e) = sf2.load(path) {
+            eprintln!("  sf2 engine failed to load {}: {:#}", name, e);
+            continue;
+        }
+        sf2.set_preset(spec.bank, spec.preset);
+        sf2.set_gain(crate::sf2_engine::DEFAULT_GAIN * spec.gain);
+        engine.install_sf2_engine(spec.iid, sf2);
+    }
+    println!("  installed {} SF2 engine(s)", engine.sf2_engine_count());
 
     // Master bus effects.  Silent if master_fx.json is missing or empty.
     if !no_master_fx {
@@ -81,7 +99,7 @@ pub(crate) fn render_offline(
         let batch = loader.load_due(engine.pos + lookahead);
         engine.ingest(batch.samples);
         engine.ingest_vst(batch.vsts);
-                engine.render(&mut l[i..i + n], &mut r[i..i + n], 1);
+        engine.render(&mut l[i..i + n], &mut r[i..i + n], 1);
         i += n;
     }
     (l, r, loader.cache)

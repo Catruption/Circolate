@@ -1,20 +1,17 @@
-//! Trackscript archive format (.tsz): a zip with `manifest.json` as the
-//! first entry.  Read and write are symmetric around that manifest.
+//! Trackscript archive format (.tsz).
 //!
 //! Layout:
 //!   manifest.json
 //!   trackscript
 //!   samples.json
-//!   samples/*.wav       (may contain FLAC bytes — magic sniffed on load)
+//!   samples/*.wav        (may contain FLAC bytes — magic sniffed)
+//!   samples/*.sf2
 //!   instruments/*.instrument
 //!   instruments/*.state
 //!   fidelity.json
-//!   cover.<ext>         (optional)
-//!
-//! The reader tolerates a single wrapping directory: if `manifest.json`
-//! isn't at the root, it looks for `<prefix>/manifest.json` and treats
-//! `<prefix>` as the archive root.  This lets archives written by `zip`
-//! without the `-j`/`.` trick still open.
+//!   cover.<ext>
+//!   requires.json        (optional — plugin pointers)
+//!   plugins/<name>.vst3/... (optional — embedded bundles)
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -76,23 +73,47 @@ pub enum EntryKind {
     Fidelity,
     SampleLibrary,
     Cover,
+    Requires,
+    Plugin {
+        name: String,
+        #[serde(default)]
+        license: String,
+    },
     Other,
 }
 
-// ── write ──────────────────────────────────────────────────────────────
+// ── write options ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncludePlugins {
+    /// Never embed plugin bundles; always write a requires.json entry.
+    None,
+    /// Embed only plugins marked `redistributable: true`.
+    Free,
+    /// Embed every plugin, regardless of licensing metadata.
+    All,
+}
+
+impl Default for IncludePlugins {
+    fn default() -> Self { IncludePlugins::None }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct WriteOptions {
     pub flac_max_ratio: f32,
+    pub include_plugins: IncludePlugins,
 }
 
 impl Default for WriteOptions {
     fn default() -> Self {
         WriteOptions {
             flac_max_ratio: 0.95,
+            include_plugins: IncludePlugins::None,
         }
     }
 }
+
+// ── write ──────────────────────────────────────────────────────────────
 
 pub fn write_archive(
     out: &Path,
@@ -111,19 +132,30 @@ pub fn write_archive(
         false,
     ));
 
-    let mut lib: serde_json::Value = serde_json::from_str(&converted.samples_json)
-        .context("parsing samples.json for archive rewrite")?;
+    // Samples — FLAC when it wins, WAV otherwise.  Entries keep their
+    // original `.wav` names regardless of the bytes inside, so the
+    // trackscript's sample references stay valid.
+        // MIDI-only exports have no samples, and the converter leaves
+    // `samples_json` empty for them.  Seed a valid empty document so
+    // archives always carry a well-formed samples.json.
+    let mut lib: serde_json::Value = if converted.samples_json.trim().is_empty() {
+        serde_json::json!({
+            "format": "trackscript-sample-library",
+            "version": 2,
+            "samples": [],
+            "instruments": []
+        })
+    } else {
+        serde_json::from_str(&converted.samples_json)
+            .context("parsing samples.json")?
+    };
     let mut sample_format = "wav".to_string();
 
     if let Some(arr) = lib.get_mut("samples").and_then(|v| v.as_array_mut()) {
         for s in arr.iter_mut() {
             let Some(obj) = s.as_object_mut() else { continue };
             let id = obj.get("id").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
-            let rel = obj
-                .get("file")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            let rel = obj.get("file").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let Some(src) = converted.samples.iter().find(|x| x.rel_path == rel) else {
                 continue;
             };
@@ -142,6 +174,8 @@ pub fn write_archive(
         false,
     ));
 
+    // Aux files: instruments, SF2s, fidelity.  Skip the source bundle
+    // that directory exports carry, but keep everything else.
     for aux in &converted.aux {
         if aux.rel_path.starts_with("source/") {
             continue;
@@ -150,8 +184,52 @@ pub fn write_archive(
         staged.push((aux.rel_path.clone(), aux.bytes.clone(), kind, store));
     }
 
+    // Cover image.
     if let Some((name, bytes)) = cover {
         staged.push((name.to_string(), bytes.to_vec(), EntryKind::Cover, false));
+    }
+
+    // ── requires.json ────────────────────────────────────────────────
+    let requires = crate::requires::build_from_aux(&converted.aux);
+    let need_requires_entry = !requires.plugins.is_empty() || !requires.fallbacks.is_empty();
+    if need_requires_entry {
+        let bytes = serde_json::to_string_pretty(&requires)?.into_bytes();
+        staged.push((
+            crate::requires::FILENAME.into(),
+            bytes,
+            EntryKind::Requires,
+            false,
+        ));
+    }
+
+    // ── embedded plugin bundles ──────────────────────────────────────
+    if opts.include_plugins != IncludePlugins::None {
+        for bundle in crate::requires::bundles_from_aux(&converted.aux) {
+            if opts.include_plugins == IncludePlugins::Free && !bundle.redistributable {
+                continue;
+            }
+            let Some(path) = bundle.path.as_ref() else { continue };
+            if !path.exists() {
+                continue;
+            }
+            let dir_name = if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                format!("{}.vst3", stem)
+            } else {
+                continue;
+            };
+            for (rel, bytes) in walk_plugin(path) {
+                let entry = format!("plugins/{}/{}", dir_name, rel);
+                staged.push((
+                    entry,
+                    bytes,
+                    EntryKind::Plugin {
+                        name: bundle.name.clone(),
+                        license: bundle.license.clone(),
+                    },
+                    false,
+                ));
+            }
+        }
     }
 
     let entries: Vec<Entry> = staged
@@ -194,6 +272,46 @@ pub fn write_archive(
     }
     zip.finish()?;
     Ok(manifest)
+}
+
+/// Recursively read every regular file under `root`, returning
+/// (relative path from root, file bytes).  Handles both bundle
+/// directories and single-file `.vst3`.
+fn walk_plugin(root: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+    let Ok(md) = std::fs::symlink_metadata(root) else { return out };
+    if md.file_type().is_file() {
+        if let Ok(bytes) = std::fs::read(root) {
+            let name = root
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("plugin.vst3")
+                .to_string();
+            out.push((name, bytes));
+        }
+        return out;
+    }
+    walk_plugin_dir(root, root, &mut out);
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+fn walk_plugin_dir(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        let Ok(md) = std::fs::symlink_metadata(&p) else { continue };
+        if md.file_type().is_dir() {
+            walk_plugin_dir(root, &p, out);
+        } else if md.file_type().is_file() {
+            if let Ok(rel) = p.strip_prefix(root) {
+                let rel = rel.to_string_lossy().replace('\\', "/");
+                if let Ok(bytes) = std::fs::read(&p) {
+                    out.push((rel, bytes));
+                }
+            }
+        }
+    }
 }
 
 struct EncodedSample {
@@ -254,9 +372,7 @@ fn encode_flac(audio: &DecodedAudio) -> Result<Vec<u8>> {
         for c in 0..n_ch {
             let s = audio.channels[c][i].clamp(-1.0, 1.0);
             let v = (s * scale) as i64;
-            let v = v
-                .max(-(1i64 << (bits - 1)))
-                .min((1i64 << (bits - 1)) - 1);
+            let v = v.max(-(1i64 << (bits - 1))).min((1i64 << (bits - 1)) - 1);
             match bytes_per_sample {
                 2 => pcm.extend_from_slice(&(v as i16).to_le_bytes()),
                 3 => pcm.extend_from_slice(&(v as i32).to_le_bytes()[0..3]),
@@ -293,11 +409,7 @@ fn encode_flac(audio: &DecodedAudio) -> Result<Vec<u8>> {
     if fmt_extra {
         wav.extend_from_slice(&22u16.to_le_bytes());
         wav.extend_from_slice(&bits_u16.to_le_bytes());
-        let channel_mask: u32 = match n_ch {
-            1 => 0x4,
-            2 => 0x3,
-            _ => 0,
-        };
+        let channel_mask: u32 = match n_ch { 1 => 0x4, 2 => 0x3, _ => 0 };
         wav.extend_from_slice(&channel_mask.to_le_bytes());
         wav.extend_from_slice(&[
             0x01, 0x00, 0x00, 0x00,
@@ -379,26 +491,15 @@ fn now_iso8601() -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let mo = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if mo <= 2 { y + 1 } else { y };
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        y, mo, d, h, m, s
-    )
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, m, s)
 }
 
 // ── read ───────────────────────────────────────────────────────────────
 
-/// Find where `manifest.json` lives inside the zip.  Returns the
-/// prefix (empty for a root manifest, or e.g. `"winds/"` for a wrapped
-/// archive).
 fn detect_prefix(zip: &mut zip::ZipArchive<File>) -> Option<String> {
-    // Fast path: root manifest.
     if zip.by_name(MANIFEST_PATH).is_ok() {
         return Some(String::new());
     }
-    // Otherwise look for the shallowest */manifest.json.  Only the
-    // last path component matters — a name like
-    // "a/b/manifest.json" would still wrap, but a name like
-    // "notes/manifest.json.bak" would not match.
     let mut best: Option<String> = None;
     for i in 0..zip.len() {
         let Ok(entry) = zip.by_index(i) else { continue };
@@ -494,6 +595,37 @@ impl AssetSource for ArchiveReader {
         out
     }
 
+    fn list_recursive(&self, prefix: &str) -> Vec<String> {
+        let prefix = if prefix.is_empty() || prefix.ends_with('/') {
+            prefix.to_string()
+        } else {
+            format!("{}/", prefix)
+        };
+        let mut out: Vec<String> = self
+            .index
+            .keys()
+            .filter(|k| k.starts_with(&prefix))
+            .cloned()
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn cache_key(&self) -> Option<String> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.path.hash(&mut h);
+        if let Ok(md) = std::fs::metadata(&self.path) {
+            md.len().hash(&mut h);
+            if let Ok(t) = md.modified() {
+                if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
+                    d.as_nanos().hash(&mut h);
+                }
+            }
+        }
+        Some(format!("{:016x}", h.finish()))
+    }
+
     fn describe(&self) -> String {
         format!(
             "{} ({} entries{})",
@@ -508,8 +640,6 @@ impl AssetSource for ArchiveReader {
     }
 }
 
-/// Read just the manifest, tolerating a single wrapping directory.
-/// Returns `(prefix, manifest)`.
 pub fn read_manifest_at(path: &Path) -> Result<(String, Manifest)> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut zip = zip::ZipArchive::new(file).context("not a zip archive")?;
@@ -521,16 +651,14 @@ pub fn read_manifest_at(path: &Path) -> Result<(String, Manifest)> {
         .with_context(|| format!("opening {} inside archive", zip_path))?;
     let mut text = String::new();
     entry.read_to_string(&mut text)?;
-    let manifest: Manifest =
-        serde_json::from_str(&text).context("parsing manifest.json")?;
+    let manifest: Manifest = serde_json::from_str(&text).context("parsing manifest.json")?;
     if manifest.format != FORMAT_TAG {
         bail!("unexpected archive format: {}", manifest.format);
     }
     if manifest.version > FORMAT_VERSION {
         bail!(
             "archive version {} is newer than this build supports ({})",
-            manifest.version,
-            FORMAT_VERSION
+            manifest.version, FORMAT_VERSION
         );
     }
     Ok((prefix, manifest))

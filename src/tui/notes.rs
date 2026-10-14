@@ -21,6 +21,14 @@ pub struct NoteRow {
     pub pitch_points: Vec<Point>,
     pub vol_points: Vec<Point>,
     pub pan_points: Vec<Point>,
+    /// Fine pitch offset in cents, as a signed delta from 0.
+    pub fine_pitch_delta: Option<i16>,
+    /// Release velocity, as a signed delta from the engine default of 64.
+    pub release_delta: Option<i16>,
+    /// Mod X, as a signed delta from the engine default of 128.
+    pub mod_x_delta: Option<i16>,
+    /// Mod Y, as a signed delta from the engine default of 128.
+    pub mod_y_delta: Option<i16>,
 }
 
 #[derive(Clone)]
@@ -91,6 +99,10 @@ pub fn split_notes(
                 pitch_points: Vec::new(),
                 vol_points: Vec::new(),
                 pan_points: Vec::new(),
+                fine_pitch_delta: ev.fine_pitch,
+                release_delta: ev.release,
+                mod_x_delta: ev.mod_x,
+                mod_y_delta: ev.mod_y,
             };
             if let Some(hz) = ev.pitch_hz {
                 nr.pitch_points.push(Point { row: ev.row, value: hz, ramp_rows: 0.0 });
@@ -184,6 +196,18 @@ pub fn fmt_note(n: &NoteRow, row: f64, subs: u32, state: NoteState) -> String {
         if p.abs() > 0.01 {
             parts.push(format!("¶{}", fmt_num(p)));
         }
+    }
+    if let Some(d) = n.fine_pitch_delta {
+        parts.push(format!("¢{:+}", d));
+    }
+    if let Some(d) = n.release_delta {
+        parts.push(format!("₨{:+}", d));
+    }
+    if let Some(d) = n.mod_x_delta {
+        parts.push(format!("₥{:+}", d));
+    }
+    if let Some(d) = n.mod_y_delta {
+        parts.push(format!("¥{:+}", d));
     }
     format!("<{}>", parts.join(","))
 }

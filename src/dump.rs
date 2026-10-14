@@ -26,7 +26,7 @@ pub fn run(argv: &[String]) -> Result<()> {
             "--raw" => raw_events = true,
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: trackscript-player dump [--no-states] [--raw] <file.flp|file.it|file.trackscript>"
+                    "usage: trackscript-player dump [--no-states] [--raw] <file.flp|file.it|file.mid|file.trackscript>"
                 );
                 return Ok(());
             }
@@ -80,6 +80,23 @@ pub fn run(argv: &[String]) -> Result<()> {
         SourceKind::Trackscript => {
             let parsed = crate::sources::trackscript::parse_file(path)?;
             println!("{}", serde_json::to_string_pretty(&parsed)?);
+        }
+        SourceKind::Midi => {
+            let mf = sources::midi::parse_file(path)?;
+            let out = serde_json::json!({
+                "ppq": mf.ppq,
+                "time_sig": [mf.time_sig.0, mf.time_sig.1],
+                "initial_bpm": mf.initial_bpm,
+                "channels": mf.channels.iter().map(|c| serde_json::json!({
+                    "channel": c.channel,
+                    "name": c.name,
+                    "program": c.program,
+                    "bank_msb": c.bank_msb,
+                    "bank_lsb": c.bank_lsb,
+                    "notes": c.notes.len(),
+                })).collect::<Vec<_>>(),
+            });
+            println!("{}", serde_json::to_string_pretty(&out)?);
         }
     }
     Ok(())

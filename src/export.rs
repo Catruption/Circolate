@@ -17,6 +17,7 @@ pub fn run(argv: &[String]) -> Result<()> {
     let mut src: Option<PathBuf> = None;
     let mut out_dir: Option<PathBuf> = None;
     let mut archive_mode = false;
+    let mut include_plugins: Option<String> = None;
     let mut opts = ConvertOptions::default();
 
     let mut it = argv.iter();
@@ -48,9 +49,20 @@ pub fn run(argv: &[String]) -> Result<()> {
                     it.next().ok_or_else(|| anyhow!("--samples-dir needs a path"))?,
                 ));
             }
+                        "--sf2" => {
+                opts.sf2_path = Some(PathBuf::from(
+                    it.next().ok_or_else(|| anyhow!("--sf2 needs a path"))?,
+                ));
+            }
             "--skip-native" => opts.skip_native = true,
             "--no-message" => opts.with_message = false,
             "--archive" | "-a" => archive_mode = true,
+            "--include-plugins" => include_plugins = Some("free".into()),
+            other if other.starts_with("--include-plugins=") => {
+                include_plugins = Some(
+                    other.trim_start_matches("--include-plugins=").to_string(),
+                );
+            }
             other if other.starts_with('-') && other.len() > 1 => {
                 bail!("unknown flag: {other}");
             }
@@ -58,9 +70,11 @@ pub fn run(argv: &[String]) -> Result<()> {
             other => bail!("unexpected argument: {other}"),
         }
     }
+
     let src = src.ok_or_else(|| {
         anyhow!(
-            "usage: trackscript-player export <file> [-o DIR] [--archive] [--pitch names|hz]"
+            "usage: trackscript-player export <file> [-o DIR] [--archive] \
+             [--include-plugins[=free|all]] [--pitch names|hz]"
         )
     })?;
 
@@ -68,7 +82,7 @@ pub fn run(argv: &[String]) -> Result<()> {
     let stem = convert::output_stem(&src);
 
     if archive_mode {
-        write_archive_output(&src, &conv, &stem, out_dir.as_deref())?;
+        write_archive_output(&src, &conv, &stem, out_dir.as_deref(), include_plugins.as_deref())?;
     } else {
         write_directory_output(&src, &conv, &stem, out_dir.as_deref())?;
     }
@@ -77,7 +91,7 @@ pub fn run(argv: &[String]) -> Result<()> {
     Ok(())
 }
 
-// ── directory output (legacy) ──────────────────────────────────────────
+// ── directory output ───────────────────────────────────────────────────
 
 fn write_directory_output(
     src: &Path,
@@ -120,9 +134,6 @@ fn write_directory_output(
             .with_context(|| format!("writing {}", sj.display()))?;
     }
 
-    // Cover image, if one was found next to the source.  Written under
-    // its original name so directory consumers see the same file they
-    // would have gotten without conversion.
     if let Some((name, bytes)) = find_cover_for_source(src) {
         let dest = out.join(&name);
         let _ = std::fs::write(&dest, &bytes);
@@ -139,6 +150,7 @@ fn write_archive_output(
     conv: &convert::Converted,
     stem: &str,
     out_dir: Option<&Path>,
+    include_plugins: Option<&str>,
 ) -> Result<()> {
     let out_path = match out_dir {
         Some(p) => {
@@ -158,13 +170,22 @@ fn write_archive_output(
         }
     };
 
-    let title = src
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(stem);
+    let title = src.file_stem().and_then(|s| s.to_str()).unwrap_or(stem);
 
     let cover = find_cover_for_source(src);
     let cover_arg = cover.as_ref().map(|(n, b)| (n.as_str(), b.as_slice()));
+
+    let include = match include_plugins {
+        None | Some("none") => archive::IncludePlugins::None,
+        Some("free") => archive::IncludePlugins::Free,
+        Some("all") => archive::IncludePlugins::All,
+        Some(other) => bail!("unknown --include-plugins value: {other}"),
+    };
+
+    let opts = archive::WriteOptions {
+        flac_max_ratio: 0.95,
+        include_plugins: include,
+    };
 
     let manifest = archive::write_archive(
         &out_path,
@@ -172,23 +193,36 @@ fn write_archive_output(
         title,
         44100,
         cover_arg,
-        archive::WriteOptions::default(),
+        opts,
     )?;
 
-    println!(
-        "wrote {} ({} entries, {} format)",
-        out_path.display(),
-        manifest.entries.len(),
-        manifest.sample_format,
-    );
+    let plugin_entries = manifest
+        .entries
+        .iter()
+        .filter(|e| matches!(e.kind, archive::EntryKind::Plugin { .. }))
+        .count();
+
+    if plugin_entries > 0 {
+        println!(
+            "wrote {} ({} entries, {} format, {} plugin files embedded)",
+            out_path.display(),
+            manifest.entries.len(),
+            manifest.sample_format,
+            plugin_entries,
+        );
+    } else {
+        println!(
+            "wrote {} ({} entries, {} format)",
+            out_path.display(),
+            manifest.entries.len(),
+            manifest.sample_format,
+        );
+    }
     Ok(())
 }
 
 // ── cover lookup ───────────────────────────────────────────────────────
 
-/// Find a cover image next to the source file.  Tries the standard
-/// names first, then falls back to any top-level file whose stem is
-/// "cover" regardless of extension.
 fn find_cover_for_source(src: &Path) -> Option<(String, Vec<u8>)> {
     let parent = src.parent()?;
 
@@ -208,7 +242,7 @@ fn find_cover_for_source(src: &Path) -> Option<(String, Vec<u8>)> {
     }
 
     let rd = std::fs::read_dir(parent).ok()?;
-    let mut matches: Vec<std::path::PathBuf> = rd
+    let mut matches: Vec<PathBuf> = rd
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.is_file())

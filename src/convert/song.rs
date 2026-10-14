@@ -68,6 +68,12 @@ pub(super) struct Song {
     pub(super) measures: Vec<MeasureLine>,
 
     pub(super) post_comments: Vec<String>,
+
+    /// Value for the `SoundFont:` config key.  `None` omits the key.
+    /// `Some("ask".into())` marks this trackscript as "prompt at play
+    /// time"; `run.sh` greps for it.  `Some("'path'")` (with the quotes
+    /// baked in) pins a specific SF2.
+    pub(super) soundfont: Option<String>,
 }
 
 impl Song {
@@ -97,6 +103,7 @@ impl Song {
             part_index: HashMap::new(),
             measures: Vec::new(),
             post_comments: Vec::new(),
+            soundfont: None,
         }
     }
 
@@ -149,6 +156,9 @@ impl Song {
         out.push_str(&format!("    PanningLaw: {};\n", self.panning_law));
         out.push_str("    Overlap: stack;\n");
         out.push_str(&format!("    PitchDefault: {};\n", self.pitch_default));
+        if let Some(sf) = &self.soundfont {
+            out.push_str(&format!("    SoundFont: {};\n", sf));
+        }
         out.push_str("}\n\n");
 
         // ── BlockList ─────────────────────────────────────────────

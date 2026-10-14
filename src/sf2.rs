@@ -87,18 +87,18 @@ pub fn attenuation_cb_to_linear(cb: i16) -> f32 {
 impl Sf2File {
     pub fn load(path: &Path) -> Result<Self> {
         let data =
-            std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
         Self::parse(&data, None)
     }
 
     pub fn load_preset(path: &Path, bank: u16, preset: u16) -> Result<Self> {
         let data =
-            std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
         Self::parse(&data, Some((bank, preset)))
     }
 
     pub fn load_preset_bytes(data: &[u8], bank: u16, preset: u16) -> Result<Self> {
-    Self::parse(data, Some((bank, preset)))
+        Self::parse(data, Some((bank, preset)))
     }
 
     pub fn load_bytes(data: &[u8]) -> Result<Self> {
@@ -187,7 +187,7 @@ impl Sf2File {
             let r = &igen[i * 4..i * 4 + 4];
             igens.push((
                 u16::from_le_bytes([r[0], r[1]]),
-                u16::from_le_bytes([r[2], r[3]]),
+                        u16::from_le_bytes([r[2], r[3]]),
             ));
         }
 
@@ -306,24 +306,24 @@ impl Sf2File {
             eprintln!(
                 "sf2: {} samples, {} zones{}",
                 samples.len(),
-                zones.len(),
-                match want {
-                    Some((b, p)) => format!(" (bank {} preset {})", b, p),
-                    None => String::new(),
-                }
+                      zones.len(),
+                      match want {
+                          Some((b, p)) => format!(" (bank {} preset {})", b, p),
+                      None => String::new(),
+                      }
             );
             for (i, z) in zones.iter().take(30).enumerate() {
                 eprintln!(
                     "  zone {:>3}: key {:>3}..{:<3} vel {:>3}..{:<3} sample {:>4} \
-                     root {:?} tune {} atten {} a={:.3} h={:.3} d={:.3} s={:.3} r={:.3}",
-                    i, z.key_lo, z.key_hi, z.vel_lo, z.vel_hi, z.sample_idx,
-                    z.root_override, z.tune_cents,
-                    z.initial_attenuation_cb,
-                    timecents_to_secs(z.attack_timecents),
-                    timecents_to_secs(z.hold_timecents),
-                    timecents_to_secs(z.decay_timecents),
-                    attenuation_cb_to_linear(z.sustain_level_cb),
-                    timecents_to_secs(z.release_timecents),
+root {:?} tune {} atten {} a={:.3} h={:.3} d={:.3} s={:.3} r={:.3}",
+i, z.key_lo, z.key_hi, z.vel_lo, z.vel_hi, z.sample_idx,
+z.root_override, z.tune_cents,
+z.initial_attenuation_cb,
+timecents_to_secs(z.attack_timecents),
+                          timecents_to_secs(z.hold_timecents),
+                          timecents_to_secs(z.decay_timecents),
+                          attenuation_cb_to_linear(z.sustain_level_cb),
+                          timecents_to_secs(z.release_timecents),
                 );
             }
         }
@@ -334,10 +334,10 @@ impl Sf2File {
 
 fn walk_igens(
     igens: &[(u16, u16)],
-    gen_start: usize,
-    gen_end: usize,
-    samples: &[Sf2Sample],
-    out: &mut Vec<Sf2Zone>,
+              gen_start: usize,
+              gen_end: usize,
+              samples: &[Sf2Sample],
+              out: &mut Vec<Sf2Zone>,
 ) {
     let mut cur = ZoneAccum::default();
     for &(op, val) in &igens[gen_start..gen_end] {
@@ -497,7 +497,7 @@ fn find_list<'a>(data: &'a [u8], want: &[u8; 4]) -> Option<&'a [u8]> {
     while p + 8 <= data.len() {
         let id = &data[p..p + 4];
         let size =
-            u32::from_le_bytes([data[p + 4], data[p + 5], data[p + 6], data[p + 7]]) as usize;
+        u32::from_le_bytes([data[p + 4], data[p + 5], data[p + 6], data[p + 7]]) as usize;
         let body = p + 8;
         if body + size > data.len() {
             break;
@@ -518,7 +518,7 @@ fn find_chunk<'a>(data: &'a [u8], want: &[u8; 4]) -> Option<&'a [u8]> {
     while p + 8 <= data.len() {
         let id = &data[p..p + 4];
         let size =
-            u32::from_le_bytes([data[p + 4], data[p + 5], data[p + 6], data[p + 7]]) as usize;
+        u32::from_le_bytes([data[p + 4], data[p + 5], data[p + 6], data[p + 7]]) as usize;
         let body = p + 8;
         if body + size > data.len() {
             break;
