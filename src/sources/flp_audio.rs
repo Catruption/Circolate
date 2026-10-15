@@ -22,11 +22,11 @@ pub struct EmbeddedAudio {
 /// `fLaC` followed by a STREAMINFO metadata block header (type 0, length 34).
 fn is_flac_header(blob: &[u8], i: usize) -> bool {
     i + 8 <= blob.len()
-        && &blob[i..i + 4] == b"fLaC"
-        && (blob[i + 4] & 0x7F) == 0
-        && blob[i + 5] == 0
-        && blob[i + 6] == 0
-        && blob[i + 7] == 34
+    && &blob[i..i + 4] == b"fLaC"
+    && (blob[i + 4] & 0x7F) == 0
+    && blob[i + 5] == 0
+    && blob[i + 6] == 0
+    && blob[i + 7] == 34
 }
 
 /// `RIFF` .. `WAVE` whose declared size fits in the blob.  Returns total length.
@@ -51,7 +51,7 @@ pub fn extract_all(blob: &[u8]) -> Vec<EmbeddedAudio> {
         if let Some(total) = wav_len_at(blob, i) {
             out.push(EmbeddedAudio {
                 data: blob[i..i + total].to_vec(),
-                extension: "wav",
+                     extension: "wav",
             });
             i += total;
             continue;
@@ -68,7 +68,7 @@ pub fn extract_all(blob: &[u8]) -> Vec<EmbeddedAudio> {
             }
             out.push(EmbeddedAudio {
                 data: blob[i..end].to_vec(),
-                extension: "flac",
+                     extension: "flac",
             });
             i = end;
             continue;
@@ -104,6 +104,46 @@ pub fn wav_root_key(wav: &[u8]) -> Option<u8> {
         p = body.checked_add(size)?.checked_add(size & 1)?;
     }
     None
+}
+
+/// Sample-frame offsets from a WAV's `cue ` chunk, sorted and deduplicated.
+///
+/// Slicex stores its slice markers here.  Empty if the WAV has no cue chunk.
+pub fn wav_cue_points(wav: &[u8]) -> Vec<u32> {
+    let mut out = Vec::new();
+    if wav.len() < 12 || &wav[0..4] != b"RIFF" || &wav[8..12] != b"WAVE" {
+        return out;
+    }
+    let mut p = 12usize;
+    while p + 8 <= wav.len() {
+        let id = &wav[p..p + 4];
+        let size = u32::from_le_bytes([wav[p + 4], wav[p + 5], wav[p + 6], wav[p + 7]]) as usize;
+        let body = p + 8;
+        if id == b"cue " && body + 4 <= wav.len() {
+            let n = u32::from_le_bytes([wav[body], wav[body + 1], wav[body + 2], wav[body + 3]])
+            as usize;
+            for k in 0..n {
+                // CuePoint: id, position, fccChunk, chunkStart, blockStart, sampleOffset
+                let o = body + 4 + k * 24;
+                if o + 24 > wav.len() {
+                    break;
+                }
+                out.push(u32::from_le_bytes([
+                    wav[o + 20],
+                    wav[o + 21],
+                    wav[o + 22],
+                    wav[o + 23],
+                ]));
+            }
+        }
+        p = match body.checked_add(size).and_then(|x| x.checked_add(size & 1)) {
+            Some(x) => x,
+            None => break,
+        };
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// Decode a FLAC stream to a WAV byte buffer.

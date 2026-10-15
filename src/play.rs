@@ -19,7 +19,8 @@ use crate::effects::EffectChain;
 use crate::player::{self, Cache, Engine, Loader, Msg, Project, Transport};
 use crate::sources::SourceKind;
 use crate::tui;
-use crate::tui::queue;
+use crate::tui::config::{Config, Settings};
+use crate::tui::state as queue;
 use crate::vst_host_ffi::VstHost;
 
 // ── silence guard ──────────────────────────────────────────────────────
@@ -319,10 +320,6 @@ fn install_sf2_engines(
         let path = sf2_override.unwrap_or(&spec.sf2_path);
 
         let mut sf2 = crate::sf2_engine::Sf2Engine::new(project.sample_rate);
-        if let Err(e) = sf2.load(path) {
-            eprintln!("  sf2 engine failed to load {}: {:#}", name, e);
-            continue;
-        }
         sf2.set_preset(spec.bank, spec.preset);
         sf2.set_gain(crate::sf2_engine::DEFAULT_GAIN * spec.gain);
         engine.install_sf2_engine(spec.iid, sf2);
@@ -400,12 +397,26 @@ fn worker(
     tp: Arc<Transport>,
     lookahead: i64,
     slot: Option<Arc<ReloadSlot>>,
+    total: i64,
+    wrap_tx: Sender<Msg>,
 ) {
     let mut epoch = 0u64;
+    // True once the start of the song has been pre-built and handed to
+    // the audio callback.  While set, the loader sits at the start of the
+    // song, so normal streaming is paused until the callback wraps.
+    let mut wrap_ready = false;
+    let mut last_wraps = tp.loop_wraps.load(Ordering::Acquire);
+    let tail_margin = lookahead * 8;
     while !tp.stop.load(Ordering::Relaxed) {
+        let wraps = tp.loop_wraps.load(Ordering::Acquire);
+        if wraps != last_wraps {
+            last_wraps = wraps;
+            wrap_ready = false;
+        }
         if let Some(slot) = &slot {
             let pending = slot.pending.lock().ok().and_then(|mut g| g.take());
             if let Some((new_project, new_cache)) = pending {
+                wrap_ready = false;
                 loader = Loader::new(new_project, new_cache);
                 let cur = tp.position.load(Ordering::Relaxed);
                 tp.seek_to.store(cur, Ordering::Release);
@@ -414,6 +425,7 @@ fn worker(
         }
         let req = tp.seek_to.swap(i64::MIN, Ordering::AcqRel);
         if req != i64::MIN {
+            wrap_ready = false;
             epoch += 1;
             let batch = loader.seek(req, req + lookahead);
             let msg = Msg::Seek {
@@ -425,8 +437,9 @@ fn worker(
             if tx.send(msg).is_err() {
                 break;
             }
-        } else {
-            let horizon = tp.position.load(Ordering::Relaxed) + lookahead;
+        } else if !wrap_ready {
+            let pos = tp.position.load(Ordering::Relaxed);
+            let horizon = pos + lookahead;
             let batch = loader.load_due(horizon);
             let empty = batch.samples.is_empty() && batch.vsts.is_empty();
             if !empty {
@@ -440,6 +453,39 @@ fn worker(
                 }
             }
             tp.loaded_lines.store(loader.cursor as i64, Ordering::Relaxed);
+
+            // Near the end of a song that still owes a repeat: load the
+            // rest of the tail, then pre-build the first batch of the
+            // song so the callback can wrap with no gap and no reload.
+            if tp.loop_next.load(Ordering::Acquire)
+                && tp.speed.load(Ordering::Relaxed) == 1
+                && total > 0
+                && pos + tail_margin >= total
+            {
+                let tail = loader.load_due(i64::MAX);
+                if !(tail.samples.is_empty() && tail.vsts.is_empty()) {
+                    let msg = Msg::Batch {
+                        epoch,
+                        samples: tail.samples,
+                        vsts: tail.vsts,
+                    };
+                    if tx.send(msg).is_err() {
+                        break;
+                    }
+                }
+                epoch += 1;
+                let first = loader.seek(0, lookahead);
+                let wrap = Msg::Seek {
+                    epoch,
+                    pos: 0,
+                    samples: first.samples,
+                    vsts: first.vsts,
+                };
+                if wrap_tx.send(wrap).is_err() {
+                    break;
+                }
+                wrap_ready = true;
+            }
         }
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -487,20 +533,47 @@ fn play_one(
     args: &Args,
     song: Option<&Path>,
     queue: queue::QueueState,
+    settings: Settings,
 ) -> Result<Outcome> {
     let host = cpal::default_host();
     let device = host
         .default_output_device()
         .ok_or_else(|| anyhow!("no default output device"))?;
     let device_config = device.default_output_config()?;
+        let device_config = device.default_output_config()?;
     if device_config.sample_format() != cpal::SampleFormat::F32 {
         bail!(
             "default output format is {:?}; this player only drives f32 devices for now",
             device_config.sample_format()
         );
     }
-    let sample_rate = device_config.sample_rate().0;
-    let stream_config: cpal::StreamConfig = device_config.into();
+
+    // Prefer 48000 Hz when the device supports it.  PipeWire's house
+    // clock is 48000 on almost every modern desktop, and every stream
+    // we open at 44100 gets resampled at the graph boundary.  Chiptune
+    // (square waves, high harmonics) is the worst case for that: the
+    // resampler's lowpass aliases content the ear reads as buzz.
+    // cpal's ALSA backend on a pipewire-alsa system reports 44100 from
+    // the default PCM, so we override here rather than trusting the
+    // device default.
+    let mut stream_config: cpal::StreamConfig = device_config.clone().into();
+    let preferred = cpal::SampleRate(48000);
+    let supports_preferred = device
+        .supported_output_configs()
+        .map(|cfgs| {
+            cfgs.into_iter().any(|c| {
+                c.channels() == stream_config.channels
+                    && c.sample_format() == cpal::SampleFormat::F32
+                    && c.min_sample_rate() <= preferred
+                    && preferred <= c.max_sample_rate()
+            })
+        })
+        .unwrap_or(false);
+
+    if supports_preferred && device_config.sample_rate() != preferred {
+        stream_config.sample_rate = preferred;
+    }
+    let sample_rate = stream_config.sample_rate.0;
     let channels = stream_config.channels as usize;
 
     let is_watchable_trackscript = song.map_or(false, |p| {
@@ -524,6 +597,24 @@ fn play_one(
         }
     };
 
+    // A song launched from the command line isn't in the queue, so its
+    // loop count would never apply.  Put it in the cursor line (if that
+    // line is empty) so the [n] counter works for it too.
+    let mut queue = queue;
+    if queue.playing.is_none() {
+        if let Some(name) = song
+            .and_then(|p| p.file_stem())
+            .and_then(|s| s.to_str())
+        {
+            let row = queue.cursor.row.min(queue.lines.len().saturating_sub(1));
+            if queue.lines.get(row).map_or(false, |l| l.is_blank()) {
+                let text: String = name.chars().take(queue::TEXT_W as usize).collect();
+                queue.lines[row].text = text;
+                queue.start_at(row);
+            }
+        }
+    }
+
     let total = project.total_samples;
     let start = ((args.start * sample_rate as f64) as i64).clamp(0, total);
     let initial_speed: i64 = if project.voice_count > 0 { 1 } else { 0 };
@@ -537,6 +628,8 @@ fn play_one(
         active_voices: AtomicI64::new(0),
         loaded_lines: AtomicI64::new(0),
         reload_count: AtomicI64::new(0),
+        loop_next: AtomicBool::new(false),
+        loop_wraps: AtomicI64::new(0),
     });
 
     let reload_slot = if is_watchable_trackscript && !args.no_watch {
@@ -565,12 +658,13 @@ fn play_one(
     };
 
     let (tx, rx): (Sender<Msg>, Receiver<Msg>) = channel();
+    let (wrap_tx, wrap_rx): (Sender<Msg>, Receiver<Msg>) = channel();
     let lookahead = sample_rate as i64 / 4;
     {
         let loader = Loader::new(Arc::clone(&project), cache);
         let tp = Arc::clone(&transport);
         let slot = reload_slot.clone();
-        std::thread::spawn(move || worker(loader, tx, tp, lookahead, slot));
+        std::thread::spawn(move || worker(loader, tx, tp, lookahead, slot, total, wrap_tx));
     }
 
     let mut engine = Engine::new(&project);
@@ -581,21 +675,60 @@ fn play_one(
     let tp = Arc::clone(&transport);
     let mut left = vec![0f32; 4096];
     let mut right = vec![0f32; 4096];
+    let mut pending_wrap: Option<Msg> = None;
+    let mut cur_epoch = 0u64;
 
     let stream = device.build_output_stream(
         &stream_config,
         move |data: &mut [f32], _| {
+            // ── Ingest ─────────────────────────────────────────────
             while let Ok(m) = rx.try_recv() {
+                if let Msg::Seek { epoch, .. } = &m {
+                    cur_epoch = *epoch;
+                    pending_wrap = None;
+                }
                 engine.handle(m);
             }
+            while let Ok(m) = wrap_rx.try_recv() {
+                if let Msg::Seek { epoch, .. } = &m {
+                    if *epoch > cur_epoch {
+                        pending_wrap = Some(m);
+                    }
+                }
+            }
+
+            let speed = tp.speed.load(Ordering::Relaxed);
+            let loop_next = tp.loop_next.load(Ordering::Acquire);
+
+            // ── End-of-song fallback ───────────────────────────────
+            // The loader pre-builds the next pass and ships it via
+            // wrap_rx.  If the tail Batch that came with it didn't
+            // keep `engine.ready` true across the boundary — which
+            // happens whenever the current pass has been fully
+            // rendered and the tail is empty — the engine sits at
+            // `!ready` and we'd otherwise return silence forever.
+            // Apply the wrap here so the loop survives even when the
+            // seamless-buffer path can't be reached.
+            if !engine.ready && speed == 1 && loop_next && pending_wrap.is_some() {
+                if let Some(m) = pending_wrap.take() {
+                    if let Msg::Seek { epoch, .. } = &m {
+                        cur_epoch = *epoch;
+                    }
+                    engine.handle(m);
+                    tp.loop_wraps.fetch_add(1, Ordering::Release);
+                }
+                tp.done.store(false, Ordering::Release);
+            }
+
+            // ── Normal readiness check ─────────────────────────────
             if !engine.ready {
                 data.fill(0.0);
                 return;
             }
             tp.position.store(engine.pos, Ordering::Relaxed);
 
-            let speed = tp.speed.load(Ordering::Relaxed);
-            let reached_end = speed > 0 && engine.finished();
+            let can_wrap = speed == 1 && pending_wrap.is_some() && loop_next;
+            let reached_end = speed > 0 && engine.finished() && !can_wrap;
             if reached_end {
                 data.fill(0.0);
                 tp.done.store(true, Ordering::Release);
@@ -607,13 +740,34 @@ fn play_one(
             }
             tp.done.store(false, Ordering::Release);
 
+            // ── Render ─────────────────────────────────────────────
             let frames = data.len() / channels;
             if left.len() < frames {
                 left.resize(frames, 0.0);
                 right.resize(frames, 0.0);
             }
             let (l, r) = (&mut left[..frames], &mut right[..frames]);
-            engine.render(l, r, speed);
+            // Seamless repeat: render up to the end of the song, jump to
+            // the pre-built start, and render the rest of this buffer
+            // from there.
+            let mut head = 0usize;
+            if can_wrap {
+                let rem = (total - engine.pos).max(0) as usize;
+                if rem < frames {
+                    if rem > 0 {
+                        engine.render(&mut l[..rem], &mut r[..rem], speed);
+                    }
+                    if let Some(m) = pending_wrap.take() {
+                        if let Msg::Seek { epoch, .. } = &m {
+                            cur_epoch = *epoch;
+                        }
+                        engine.handle(m);
+                        tp.loop_wraps.fetch_add(1, Ordering::Release);
+                    }
+                    head = rem;
+                }
+            }
+            engine.render(&mut l[head..], &mut r[head..], speed);
 
             if engine.pos <= 0 && speed < 0 {
                 tp.speed.store(0, Ordering::Release);
@@ -649,6 +803,7 @@ fn play_one(
         Arc::clone(&project),
         sample_rate,
         queue,
+        settings,
     )?;
     transport.stop.store(true, Ordering::Relaxed);
     drop(stream);
@@ -698,6 +853,8 @@ pub fn run(argv: &[String]) -> Result<()> {
     }
 
     // Live playback: the TUI owns the terminal for the entire loop.
+    // Settings are reloaded per song so a `player_settings.json` next
+    // to a `.trackscript` applies when that song comes up in the queue.
     let mut term = tui::setup()?;
     let mut song = args.song.clone();
     let mut queue = queue::QueueState::new();
@@ -705,14 +862,17 @@ pub fn run(argv: &[String]) -> Result<()> {
 
     let result = (|| -> Result<()> {
         loop {
+            let dir = song.as_deref().and_then(|p| p.parent());
+            let settings = Config::load_layered(dir).resolve();
+
             let msg = match &song {
                 Some(p) => format!("loading {}...", p.display()),
                 None => "no song — queue box is focused; type a name and press enter".into(),
             };
             let notes: Vec<String> = pending_notes.drain(..).collect();
-            tui::show_loading(&mut term, &queue, &msg, &notes)?;
+            tui::show_loading(&mut term, &queue, &settings, &msg, &notes)?;
 
-            match play_one(&mut term, &args, song.as_deref(), queue.clone()) {
+            match play_one(&mut term, &args, song.as_deref(), queue.clone(), settings.clone()) {
                 Ok(Outcome::Quit) => return Ok(()),
                 Ok(Outcome::Next { name, queue: q, notes: n }) => {
                     queue = q;
@@ -724,7 +884,7 @@ pub fn run(argv: &[String]) -> Result<()> {
                 }
                 Err(e) => {
                     let msg = format!("load failed: {e:#}");
-                    tui::show_loading(&mut term, &queue, &msg, &[])?;
+                    tui::show_loading(&mut term, &queue, &settings, &msg, &[])?;
                     std::thread::sleep(Duration::from_secs(3));
                     song = None;
                 }

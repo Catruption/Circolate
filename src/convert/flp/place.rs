@@ -33,6 +33,58 @@ pub(super) struct Placed {
     pub(super) clip_gain: f32,
 }
 
+/// FL "slide" notes (flag bit 3) are not voices of their own: they tell the
+/// overlapping note on the same channel to glide to the slide note's key.
+/// Played as ordinary notes they come out as 1-6 tick blips of the wrong
+/// pitch, so fold each one into its carrier instead.
+///
+/// The glide is approximated as a step: the carrier ends where the slide
+/// begins and a continuation note at the slide's key runs to the carrier's
+/// original end.  A slide that starts together with its carrier just
+/// retargets the carrier's key.  Slides with no carrier are dropped.
+///
+/// `FLP_NO_SLIDE=1` restores the old behaviour for comparison.
+fn resolve_slides(notes: &[Note]) -> Vec<Note> {
+    const FLAG_SLIDE: u16 = 0x08;
+    if std::env::var_os("FLP_NO_SLIDE").is_some() {
+        return notes.to_vec();
+    }
+    let mut out: Vec<Note> = notes
+    .iter()
+    .filter(|n| n.flags & FLAG_SLIDE == 0)
+    .cloned()
+    .collect();
+    let mut slides: Vec<&Note> = notes.iter().filter(|n| n.flags & FLAG_SLIDE != 0).collect();
+    slides.sort_by_key(|n| n.position);
+
+    for s in slides {
+        // Carrier: same channel, latest start at or before the slide, still sounding.
+        let mut best: Option<usize> = None;
+        for (i, n) in out.iter().enumerate() {
+            if n.channel == s.channel
+                && n.position <= s.position
+                && s.position < n.position.saturating_add(n.length)
+                && best.map_or(true, |b| n.position > out[b].position)
+                {
+                    best = Some(i);
+                }
+        }
+        let Some(i) = best else { continue };
+        if out[i].position == s.position {
+            out[i].key = s.key;
+        } else {
+            let end = out[i].position.saturating_add(out[i].length);
+            let mut tail = out[i].clone();
+            tail.position = s.position;
+            tail.length = end - s.position;
+            tail.key = s.key;
+            out[i].length = s.position - out[i].position;
+            out.push(tail);
+        }
+    }
+    out
+}
+
 pub(super) fn place_notes(prj: &Project) -> (HashMap<u16, Vec<Placed>>, bool, usize) {
     // FL emits NewPattern twice per pattern.  Both entries are in
     // prj.patterns; one carries the notes, the other carries metadata.
@@ -117,7 +169,8 @@ pub(super) fn place_notes(prj: &Project) -> (HashMap<u16, Vec<Placed>>, bool, us
         };
         let mut kept = 0usize;
 
-        for n in &pat.notes {
+        let notes = resolve_slides(&pat.notes);
+        for n in &notes {
             if disabled.contains(&n.channel) {
                 continue;
             }
@@ -151,8 +204,8 @@ pub(super) fn place_notes(prj: &Project) -> (HashMap<u16, Vec<Placed>>, bool, us
                 abs: item.position.saturating_add(n.position - win_start),
                                                       note,
                                                       clip_offset_ms: None,
-                clip_end_ms: None,
-                clip_gain: 1.0,
+                                                      clip_end_ms: None,
+                                                      clip_gain: 1.0,
             });
         }
         if debug_on() {
@@ -172,7 +225,8 @@ pub(super) fn place_notes(prj: &Project) -> (HashMap<u16, Vec<Placed>>, bool, us
     // 2. Fallback only when the playlist carries zero pattern clips.
     if !used_playlist {
         for pat in &prj.patterns {
-            for n in &pat.notes {
+            let notes = resolve_slides(&pat.notes);
+            for n in &notes {
                 if disabled.contains(&n.channel) {
                     continue;
                 }
@@ -190,8 +244,8 @@ pub(super) fn place_notes(prj: &Project) -> (HashMap<u16, Vec<Placed>>, bool, us
                     abs: n.position,
                     note: n.clone(),
                                                           clip_offset_ms: None,
-                clip_end_ms: None,
-                clip_gain: 1.0,
+                                                          clip_end_ms: None,
+                                                          clip_gain: 1.0,
                 });
             }
         }
@@ -222,11 +276,11 @@ pub(super) fn place_notes(prj: &Project) -> (HashMap<u16, Vec<Placed>>, bool, us
             continue;
         }
         let clip_gain = item
-            .raw
-            .get(52..56)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .filter(|g| g.is_finite() && *g > 0.0 && *g < 16.0)
-            .unwrap_or(1.0);
+        .raw
+        .get(52..56)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .filter(|g| g.is_finite() && *g > 0.0 && *g < 16.0)
+        .unwrap_or(1.0);
         placed.entry(item.ref_id).or_default().push(Placed {
             abs: item.position,
             note: Note {
@@ -245,8 +299,8 @@ pub(super) fn place_notes(prj: &Project) -> (HashMap<u16, Vec<Placed>>, bool, us
             },
             // The file stores -1.0 for "no trim"; clamp it to 0.
             clip_offset_ms: Some(item.start_offset_ms.max(0.0)),
-            clip_end_ms: Some(item.end_offset_ms),
-            clip_gain,
+                                                    clip_end_ms: Some(item.end_offset_ms),
+                                                    clip_gain,
         });
     }
 

@@ -3,8 +3,8 @@
 //! ring buffer (preferred) or a phase-accumulator synth as fallback.
 
 use crate::player::{Project, Sample};
+use crate::player::notes::{split_notes, value_at};
 use crate::sources::trackscript::C5_HZ;
-use crate::tui::notes::{split_notes, value_at};
 
 /// Cap source samples read per pixel row.  Long samples otherwise stall
 /// the renderer at 20 FPS.
@@ -119,12 +119,10 @@ pub fn synth_envelope_static(
 ) -> Vec<(f32, f32)> {
     let subs = p.part_subs_per_beat(part_name);
     let rpmeasure = p.rows_per_measure();
-    // Pass the part's own offset so the fallback synth reads the same
-    // playback window the audio engine does.
     let notes = split_notes(
         p.part_events(part_name),
-        subs,
-        p.part_sample_offset_u32(part_name),
+                            subs,
+                            p.part_sample_offset_u32(part_name),
     );
 
     let mut out = Vec::with_capacity(pixel_rows);
@@ -135,9 +133,9 @@ pub fn synth_envelope_static(
         let row = t * rpmeasure;
 
         let active = notes
-            .iter()
-            .rev()
-            .find(|n| n.start_row <= row && row < n.end_row);
+        .iter()
+        .rev()
+        .find(|n| n.start_row <= row && row < n.end_row);
         let Some(note) = active else {
             out.push((0.0, 0.0));
             continue;

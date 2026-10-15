@@ -1,0 +1,39 @@
+{
+  "preset": "default",
+  "theme": {
+    "preset": "default",
+    "border": "double",
+    "overrides": {
+      "block-instance": "#8ab4d2"
+    }
+  },
+  "view": {
+    "mode": "auto"
+  },
+  "layout": {
+    "cover_dim": 0.4,
+    "min_col_w": 10,
+    "max_col_w": 40,
+    "min_wave_rows": 2,
+    "max_wave_rows": 10,
+    "part_gap": 1,
+    "max_event_lines": 8,
+    "lookback_lines": 128,
+    "playhead_marker": "━",
+    "spiral_aspect_x": 2,
+    "spiral_max_h": 15,
+    "help_glyph": "?"
+  },
+  "labels": {
+    "accent_number": true,
+    "accent_fn": true,
+    "accent_instance": true
+  },
+  "synesthesia": {
+    "enabled": true,
+    "hue_step": 30.0,
+    "saturation_from_volume": true,
+    "saturation_scale": 1.0,
+    "value": 1.0
+  }
+}

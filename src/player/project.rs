@@ -373,6 +373,17 @@ impl Project {
         self.lines.get(i).map(|l| l.parts.as_slice()).unwrap_or(&[])
     }
 
+    /// The BlockList call that replaces a resolved part's original title tag.
+    /// Composite blocks can resolve to several parts, all sharing this title.
+    pub(crate) fn line_block_title(&self, i: usize, part_name: &str) -> Option<&str> {
+        self.lines
+            .get(i)?
+            .parts
+            .iter()
+            .find(|call| call.name == part_name)
+            .map(|call| call.block_title.as_str())
+    }
+
     pub(crate) fn line_start_row(&self, li: usize) -> f64 {
         self.lines.get(li).map(|l| l.start_row).unwrap_or(0.0)
     }

@@ -1,7 +1,11 @@
-//! Cover image resampled to one dimmed RGB color per terminal cell.
+//! Cover image as a background pass.  `Cover::load` reads the image,
+//! cover-fits it to the terminal cell grid, and resamples one dimmed
+//! RGB color per cell.  `paint_background` then writes those colors
+//! into every buffer cell that doesn't already carry its own explicit
+//! background style, so text stays on top of a dimmed image.
 
 use image::GenericImageView;
-use ratatui::style::Color;
+use ratatui::{buffer::Buffer, style::Color};
 use std::path::Path;
 
 /// Brightness multiplier applied to the cover image.  0.5 = "half
@@ -42,9 +46,9 @@ impl Cover {
             Err(e) => {
                 eprintln!(
                     "cover: decode {} failed: {:#} ({})",
-                    path.display(),
-                    e,
-                    guess_format(&bytes)
+                          path.display(),
+                          e,
+                          guess_format(&bytes)
                 );
                 return None;
             }
@@ -91,6 +95,25 @@ impl Cover {
             return None;
         }
         Some(self.cells[row * self.cols + col])
+    }
+}
+
+/// Paint the cover as a background over every cell that doesn't carry
+/// its own explicit background style.  `Color::Reset` is the "unset"
+/// marker ratatui uses; anything else was set by a widget and stays.
+pub fn paint_background(buf: &mut Buffer, cover: Option<&Cover>) {
+    let Some(cover) = cover else { return };
+    let w = buf.area.width;
+    let h = buf.area.height;
+    for y in 0..h {
+        for x in 0..w {
+            let Some(cc) = cover.get(y as usize, x as usize) else { continue };
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                if cell.bg == Color::Reset {
+                    cell.bg = cc;
+                }
+            }
+        }
     }
 }
 

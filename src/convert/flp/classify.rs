@@ -17,6 +17,7 @@ use super::place::Placed;
 use super::render::EmbeddedSample;
 use super::resolve::{resolve_plugin, vst_sidecar, Resolved};
 use super::sf2::{self, SfState};
+use super::slicex;
 use super::wav::find_sample;
 use super::{debug_on, hex, MIN_EMBEDDED_BYTES, SF2_STATE_MAX};
 
@@ -63,10 +64,10 @@ pub(super) fn classify_channels<'a>(
         }
 
         let active_envs = chan
-            .envelopes
-            .iter()
-            .filter(|e| e.env_enabled != 0)
-            .count();
+        .envelopes
+        .iter()
+        .filter(|e| e.env_enabled != 0)
+        .count();
         if active_envs > 0 {
             let label = if chan.name.is_empty() {
                 chan.channel_type.clone()
@@ -79,19 +80,19 @@ pub(super) fn classify_channels<'a>(
         let has_notes = placed.get(&chan.iid).map_or(false, |v| !v.is_empty());
         if !has_notes {
             let has_content = !chan.sample_path.is_empty()
-                || chan
-                    .plugin
-                    .as_ref()
-                    .map_or(false, |p| !p.state.is_empty());
+            || chan
+            .plugin
+            .as_ref()
+            .map_or(false, |p| !p.state.is_empty());
             if has_content
                 && matches!(
                     chan.channel_type.as_str(),
-                    "sampler" | "instrument" | "native"
+                            "sampler" | "instrument" | "native"
                 )
-            {
-                skipped.push((chan, "no notes".into()));
-            }
-            continue;
+                {
+                    skipped.push((chan, "no notes".into()));
+                }
+                continue;
         }
 
         match chan.channel_type.as_str() {
@@ -103,15 +104,15 @@ pub(super) fn classify_channels<'a>(
                 match find_sample(
                     &chan.sample_path,
                     opts.samples_dir.as_deref(),
-                    Some(flp_dir),
+                                  Some(flp_dir),
                 ) {
                     Some(p) => usable_samples.push((chan, p)),
                     None => {
                         let basename = Path::new(&chan.sample_path.replace('\\', "/"))
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("?")
-                            .to_string();
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("?")
+                        .to_string();
                         skipped.push((chan, format!("sample not found: {}", basename)));
                     }
                 }
@@ -122,6 +123,39 @@ pub(super) fn classify_channels<'a>(
                     continue;
                 }
 
+                // 0. Slicex?  Its slices are cue points inside an embedded WAV and
+                //    notes pick slices by key, so build a SoundFont from them and
+                //    route the channel through the normal SF2 sidecar path.
+                if let Some(plugin) = chan.plugin.as_ref() {
+                    if slicex::is_slicex(plugin) {
+                        match slicex::convert(chan, plugin, aux_files, &mut warnings) {
+                            Ok(out) => {
+                                let (lo, hi) = (out.base_key, out.base_key + out.slices as u32);
+                                let stray = placed.get(&chan.iid).map_or(0, |v| {
+                                    v.iter()
+                                    .filter(|p| {
+                                        (p.note.key as u32) < lo || (p.note.key as u32) >= hi
+                                    })
+                                    .count()
+                                });
+                                if stray > 0 {
+                                    warnings.push(format!(
+                                        "[{:2}] Slicex: {} note(s) outside slice keys {}..{} will be silent",
+                                                          chan.iid,
+                                                          stray,
+                                                          lo,
+                                                          hi - 1
+                                    ));
+                                }
+                                sidecar_path.insert(chan.iid, out.instrument_rel);
+                                usable_sf2.push(chan);
+                            }
+                            Err(e) => skipped.push((chan, format!("Slicex: {e}"))),
+                        }
+                        continue;
+                    }
+                }
+
                 // 1. SoundFont player?  Its state carries the SF2 path
                 //    (and bank/patch).  Runs before the embedded-audio
                 //    scan so nothing else claims the channel.
@@ -129,34 +163,34 @@ pub(super) fn classify_channels<'a>(
                     if plugin.vst_path.is_empty() && plugin.state.len() < SF2_STATE_MAX {
                         if debug_on()
                             && !plugin
-                                .state
-                                .windows(4)
-                                .any(|w| w.eq_ignore_ascii_case(b".sf2"))
-                        {
-                            let n = plugin.state.len();
-                            eprintln!(
-                                "flp: chan {} native state {} bytes, no .sf2 marker; first 64: {}",
-                                chan.iid,
-                                n,
-                                hex(&plugin.state[..n.min(64)])
-                            );
-                        }
-                        if let Some(sf) = sf2::parse_sf2_state(&plugin.state) {
-                            if let Some(rel) = handle_sf2(
-                                chan,
-                                &sf,
-                                opts,
-                                flp_dir,
-                                &mut sf2_copied,
-                                aux_files,
-                                &mut warnings,
-                                &mut skipped,
-                            ) {
-                                sidecar_path.insert(chan.iid, rel);
-                                usable_sf2.push(chan);
+                            .state
+                            .windows(4)
+                            .any(|w| w.eq_ignore_ascii_case(b".sf2"))
+                            {
+                                let n = plugin.state.len();
+                                eprintln!(
+                                    "flp: chan {} native state {} bytes, no .sf2 marker; first 64: {}",
+                                    chan.iid,
+                                    n,
+                                    hex(&plugin.state[..n.min(64)])
+                                );
                             }
-                            continue;
-                        }
+                            if let Some(sf) = sf2::parse_sf2_state(&plugin.state) {
+                                if let Some(rel) = handle_sf2(
+                                    chan,
+                                    &sf,
+                                    opts,
+                                    flp_dir,
+                                    &mut sf2_copied,
+                                    aux_files,
+                                    &mut warnings,
+                                    &mut skipped,
+                                ) {
+                                    sidecar_path.insert(chan.iid, rel);
+                                    usable_sf2.push(chan);
+                                }
+                                continue;
+                            }
                     }
                 }
 
@@ -170,9 +204,9 @@ pub(super) fn classify_channels<'a>(
 
                 // 3. VST — resolve to installed plugin, fallback, or warn.
                 let has_state = chan
-                    .plugin
-                    .as_ref()
-                    .map_or(false, |p| !p.state.is_empty());
+                .plugin
+                .as_ref()
+                .map_or(false, |p| !p.state.is_empty());
                 if !has_state {
                     skipped.push((chan, "native channel without saved state".into()));
                     continue;
@@ -202,12 +236,12 @@ pub(super) fn classify_channels<'a>(
                     }
                     Resolved::Fallback { name, path, replaces, .. } => {
                         let path_str = path
-                            .as_ref()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "<not found>".into());
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "<not found>".into());
                         warnings.push(format!(
                             "[{:2}] {}: not installed, falling back to {} ({})",
-                            chan.iid, replaces, name, path_str
+                                              chan.iid, replaces, name, path_str
                         ));
                     }
                     Resolved::Unresolved { name } => {
@@ -246,8 +280,8 @@ pub(super) fn classify_channels<'a>(
                 format!("{}{:02}", base, count)
             };
             let resolved = resolved_map
-                .get(&chan.iid)
-                .expect("every usable native has a resolution");
+            .get(&chan.iid)
+            .expect("every usable native has a resolution");
             match vst_sidecar(&sidecar_name, chan, resolved) {
                 Ok(files) => {
                     aux_files.extend(files);
@@ -299,15 +333,15 @@ fn handle_sf2<'a>(
     skipped: &mut Vec<(&'a Channel, String)>,
 ) -> Option<String> {
     let want = sf
-        .path
-        .rsplit(|c| c == '\\' || c == '/')
-        .next()
-        .unwrap_or("?")
-        .to_string();
+    .path
+    .rsplit(|c| c == '\\' || c == '/')
+    .next()
+    .unwrap_or("?")
+    .to_string();
 
     let soundfonts_dir: Option<PathBuf> = crate::fallbacks::repo_root()
-        .map(|r| r.join("soundfonts"))
-        .filter(|p| p.is_dir());
+    .map(|r| r.join("soundfonts"))
+    .filter(|p| p.is_dir());
 
     let mut dirs: Vec<&Path> = Vec::with_capacity(3);
     if let Some(d) = opts.samples_dir.as_deref() {
@@ -338,8 +372,8 @@ fn handle_sf2<'a>(
             "flp: chan {} sf2 {} bank {} patch {}",
             chan.iid,
             src.display(),
-            sf.bank,
-            sf.preset
+                  sf.bank,
+                  sf.preset
         );
     }
 
@@ -386,7 +420,7 @@ fn write_sf2_sidecar<'a>(
                 }
                 aux_files.push(AuxFile {
                     rel_path: rel.clone(),
-                    bytes,
+                               bytes,
                 });
                 sf2_copied.insert(src.to_path_buf(), rel.clone());
                 Some(rel)
@@ -396,7 +430,7 @@ fn write_sf2_sidecar<'a>(
                     "[{:2}] SF2 {} read failed: {:#}",
                     chan.iid,
                     src.display(),
-                    e
+                                      e
                 ));
                 None
             }
@@ -411,15 +445,15 @@ fn write_sf2_sidecar<'a>(
     let inst_rel = format!("instruments/{}.instrument", base);
     aux_files.push(AuxFile {
         rel_path: inst_rel.clone(),
-        bytes: inst_text.into_bytes(),
+                   bytes: inst_text.into_bytes(),
     });
     warnings.push(format!(
         "[{:2}] {}: SF2 {} bank {} patch {}",
         chan.iid,
         chan.name,
         src.display(),
-        bank,
-        preset,
+                          bank,
+                          preset,
     ));
     Some(inst_rel)
 }
@@ -444,7 +478,7 @@ fn extract_embedded(
                 i,
                 a.extension,
                 a.data.len(),
-                flp_audio::wav_root_key(&a.data)
+                      flp_audio::wav_root_key(&a.data)
             );
         }
     }
@@ -455,10 +489,10 @@ fn extract_embedded(
             if debug_on() {
                 eprintln!(
                     "flp: chan {} embedded #{} skipped ({} bytes < {} byte floor)",
-                    chan.iid,
-                    i,
-                    aud.data.len(),
-                    MIN_EMBEDDED_BYTES
+                          chan.iid,
+                          i,
+                          aud.data.len(),
+                          MIN_EMBEDDED_BYTES
                 );
             }
             continue;
@@ -486,14 +520,14 @@ fn extract_embedded(
     if files_found >= 2 {
         warnings.push(format!(
             "[{:2}] {} zone(s) found; all written to samples.json and {}",
-            chan.iid, files_found, FIDELITY_FILENAME
+                              chan.iid, files_found, FIDELITY_FILENAME
         ));
     }
     Some(EmbeddedSample {
         wav: wav0,
-        root_key: root0,
-        files_found,
-        raw_len: found[0].data.len(),
-        all_zones,
+         root_key: root0,
+         files_found,
+         raw_len: found[0].data.len(),
+         all_zones,
     })
 }

@@ -8,7 +8,7 @@ use crate::effects::EffectChain;
 use crate::sf2_engine::Sf2Engine;
 use crate::sources::trackscript::C5_HZ;
 use crate::timing::AutomationLane;
-use crate::tui::mute;
+use crate::mixer::mute;
 use crate::vst_host_ffi::VstHost;
 
 use super::project::{Project, Sample, Sf2VoiceEnvelope};
@@ -834,7 +834,7 @@ impl Engine {
                     let slot = *iid as usize;
                     for j in 0..chunk_len {
                         let mono = (tl[j] + tr[j]) * 0.5 * gain;
-                        crate::tui::scope_push(slot, mono);
+                        crate::player::scope::scope_push(slot, mono);
                     }
                     for j in 0..chunk_len {
                         vst_scratch_l[j] += tl[j] * gain;

@@ -1,172 +1,51 @@
-//! All rendering.  The main `draw` splits the frame into header /
-//! tracker and dispatches to the individual painters.
+//! Horizontal tracker: one time-aligned column per part, with a braille
+//! waveform behind the note text and the playhead column highlighted.
+//! Reads like a tracker grid; splits parts side by side so they can be
+//! compared beat-by-beat.
 
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    layout::Rect,
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::Paragraph,
     Frame,
 };
 
-use crate::tui::cover::{Cover, COVER_DIM};
-use crate::tui::envelope::{
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::Ordering;
+
+use crate::mixer::mute;
+use crate::player::envelope::{
     synth_envelope_live, synth_envelope_static, whole_sample_envelope, wrapped_pos,
 };
-use crate::tui::mute;
-use crate::tui::notes::{fmt_note, split_notes, value_at, ColumnLine, DisplayNote};
-use crate::tui::queue;
-use crate::tui::scope::scope_snapshot;
-use crate::tui::spiral::{build_spiral, SpiralLayout, SpiralState, SPIRAL_MAX_H};
-use crate::tui::style::{braille_char, dot_bit, note_style, NoteState};
-use crate::tui::{theme, RenderState, TrackerColumnHit, TrackerHit};
+use crate::player::notes::{split_notes, value_at, ColumnLine, DisplayNote};
+use crate::player::scope::scope_snapshot;
 use crate::player::{Project, Transport};
 use crate::sources::trackscript::C5_HZ;
+use crate::tui::shared::braille::{braille_char, dot_bit};
+use crate::tui::shared::label;
+use crate::tui::shared::note_fmt::fmt_note;
+use crate::tui::shared::note_style::{note_style, NoteState};
+use crate::tui::state::{RenderState, TrackerColumnHit, TrackerHit};
+use crate::tui::theme::{Theme, Token};
 
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
-use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
-
-const LOOKBACK_LINES: usize = 128;
-const MIN_COL_W: usize = 10;
-const MAX_COL_W: usize = 40;
 const PLAYHEAD_LOOKAHEAD_SECS: f64 = 0.05;
-/// How long the "reloaded" flash stays on screen after a successful
-/// reload.  Long enough to register, short enough not to linger.
-const RELOAD_FLASH_MS: u64 = 1500;
 
 pub fn draw(
     f: &mut Frame<'_>,
-    tp: &Transport,
-    project: &Project,
-    sample_rate: u32,
-    state: &mut RenderState,
-) {
-    let area = f.area();
-
-    // Poll the reload counter.  When it ticks past the last value we
-    // saw, start the flash timer (RELOAD_FLASH_MS).  Nothing displays
-    // the flash since the footer went away.
-    let rc = tp.reload_count.load(Ordering::Relaxed);
-    if rc > state.player.last_reload_count {
-        state.player.last_reload_count = rc;
-        state.player.reload_flash_until =
-            Some(Instant::now() + Duration::from_millis(RELOAD_FLASH_MS));
-    }
-
-    // ── Cover image ──────────────────────────────────────────────────
-    let cover_dims = (area.width as usize, area.height as usize);
-    if state.cover_source.as_deref() != project.cover_path() || state.cover_dims != cover_dims {
-        state.cover = project
-            .cover_path()
-            .and_then(|path| Cover::load(path, cover_dims.0, cover_dims.1, COVER_DIM));
-        state.cover_source = project.cover_path().map(Path::to_path_buf);
-        state.cover_dims = cover_dims;
-    }
-
-    let total_measures = project.line_count();
-    let spiral_layout = build_spiral(total_measures, queue::VISIBLE_LINES.min(SPIRAL_MAX_H));
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(6)])
-        .split(area);
-
-    draw_header(f, chunks[0], project, tp, sample_rate, state.loading.as_deref());
-    if area.height as f32 * 2.0 > area.width as f32 {
-        crate::tui::draw_vertical::draw_tracker_vertical(
-            f, chunks[1], tp, project, state,
-        );
-    } else {
-        draw_tracker(f, chunks[1], tp, project, state);
-    }
-
-    // ── Mosaic background pass ──────────────────────────────────────
-    if let Some(cover) = &state.cover {
-        let buf = f.buffer_mut();
-        let w = buf.area.width;
-        let h = buf.area.height;
-        for y in 0..h {
-            for x in 0..w {
-                let Some(cc) = cover.get(y as usize, x as usize) else { continue };
-                if let Some(cell) = buf.cell_mut((x, y)) {
-                    if cell.bg == Color::Reset {
-                        cell.bg = cc;
-                    }
-                }
-            }
-        }
-    }
-
-    // ── Queue box + spiral ──────────────────────────────────────────
-    let spd = tp.speed.load(Ordering::Relaxed);
-    state.queue.direction = match spd.signum() {
-        1 => '▶',
-        -1 => '◀',
-        _ => '■',
-    };
-    state.queue.speed_label = format!("{}x", spd.abs().max(1));
-
-    let spiral_size = (spiral_layout.grid_w.max(1), spiral_layout.grid_h);
-    let placed = queue::render(
-        &state.queue,
-        chunks[1],
-        f.buffer_mut(),
-        &queue::Theme::default(),
-        spiral_size,
-    );
-    state.queue_placed = placed;
-    match placed {
-        Some(p) => draw_spiral(f, p.spiral, tp, project, state, spiral_layout),
-        None => state.spiral = None,
-    }
-
-    // ── Help overlay ────────────────────────────────────────────────
-    if state.player.show_help {
-        draw_help(f, area);
-    }
-}
-
-fn draw_header(
-    f: &mut Frame<'_>,
-    area: Rect,
-    p: &Project,
-    tp: &Transport,
-    sr: u32,
-    loading: Option<&str>,
-) {
-    let (num, den) = p.time_signature;
-    let pos = tp.position.load(Ordering::Relaxed).max(0) as f64;
-    let secs = pos / sr as f64;
-    let total = p.total_secs();
-    let speed = tp.speed.load(Ordering::Relaxed);
-    let speed_tag = match speed {
-        0 => "■".to_string(),
-        s if s > 0 => format!("▶{}x", s),
-        s => format!("◀{}x", -s),
-    };
-    let title = loading.unwrap_or(&p.title);
-    let line = Line::from(vec![
-        Span::styled(" 🎵 ", Style::default().fg(Color::Cyan)),
-        Span::styled(title.to_string(), Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(format!(
-            "    {} BPM    {}/{}    {} voices    {} lines    {}  {:>5.1}s / {:.1}s",
-            p.initial_bpm.round() as i64,
-            num, den, p.voice_count, p.line_count(),
-            speed_tag, secs, total
-        )),
-    ]);
-    f.render_widget(Paragraph::new(line).block(theme::block()), area);
-}
-
-fn draw_tracker(
-    f: &mut Frame<'_>,
     area: Rect,
     tp: &Transport,
     p: &Project,
     state: &mut RenderState,
 ) {
+    let theme: Theme = state.settings.theme.clone();
+    let synth = state.settings.synesthesia;
+    let labels_cfg = state.settings.labels;
+    let min_col_w = state.settings.layout.min_col_w;
+    let max_col_w = state.settings.layout.max_col_w;
+    let lookback_lines = state.settings.layout.lookback_lines;
+    let playhead_marker = state.settings.layout.playhead_marker.clone();
+
     let sr_comp = p.sample_rate as f64;
     let lookahead = (PLAYHEAD_LOOKAHEAD_SECS * sr_comp) as i64;
     let pos = (tp.position.load(Ordering::Relaxed) + lookahead).min(p.total_samples);
@@ -176,7 +55,7 @@ fn draw_tracker(
         Some(li) => format!(" BlockList line {} ", li + 1),
         None => " BlockList (idle) ".into(),
     };
-    let outer = theme::block().title(title);
+    let outer = theme.block().title(title);
 
     let Some(li) = current else {
         f.render_widget(Paragraph::new("(silence)").block(outer), area);
@@ -185,7 +64,7 @@ fn draw_tracker(
     };
 
     let rpmeasure = p.rows_per_measure();
-    let lookback = LOOKBACK_LINES.min(li);
+    let lookback = lookback_lines.min(li);
 
     let mut by_path: HashMap<String, Vec<(String, f64, f64, f64)>> = HashMap::new();
     let mut discovery: Vec<String> = Vec::new();
@@ -263,18 +142,18 @@ fn draw_tracker(
     let inner = outer.inner(area);
     let inner_w = inner.width as usize;
     let inner_h = inner.height as usize;
-    if inner_w < MIN_COL_W + 1 || inner_h < 2 {
+    if inner_w < min_col_w + 1 || inner_h < 2 {
         f.render_widget(outer, area);
         state.tracker_hit = None;
         return;
     }
 
     let path_count = path_order.len();
-    let max_visible = (inner_w / (MIN_COL_W + 1)).max(1);
+    let max_visible = (inner_w / (min_col_w + 1)).max(1);
     let visible_cols = path_count.min(max_visible);
     let col_w = (inner_w / visible_cols)
         .saturating_sub(1)
-        .clamp(MIN_COL_W, MAX_COL_W);
+        .clamp(min_col_w, max_col_w);
 
     let char_rows = inner_h.saturating_sub(1);
     let pixel_rows = char_rows * 4;
@@ -291,8 +170,10 @@ fn draw_tracker(
         .map(|path| by_path[path].first().map(|(n, _, _, _)| n.clone()))
         .collect();
 
-    let (muted_parts, soloed_parts, muted_notes) = mute::snapshot();
-    let solo_active = !soloed_parts.is_empty();
+    let snap = mute::snapshot();
+    let muted_parts = &snap.muted_parts;
+    let soloed_part = snap.soloed_part.as_deref();
+    let muted_notes = &snap.muted_notes;
 
     let mut columns: Vec<Vec<ColumnLine>> = Vec::with_capacity(visible_cols);
     let mut column_rows_hit: Vec<Vec<Option<(usize, i64)>>> = Vec::with_capacity(visible_cols);
@@ -393,10 +274,23 @@ fn draw_tracker(
         column_rows_hit.push(entries_bl);
     }
 
-    // Envelopes.  Preview lookup uses `preview_sample_for_part`, which
-    // resolves WAV samplers through `path_to_id` and SF2 instruments
-    // through the first zone's PCM slice.  VST and other kinds fall
-    // through to the live-scope / static-synth branches below.
+    // Which columns have a note currently under the playhead?  Drives
+    // the block-number highlight in the header.
+    let col_playing: Vec<bool> = (0..visible_cols)
+        .map(|col| {
+            columns[col].iter().any(|line| {
+                if let ColumnLine::Note(dn) = line {
+                    dn.display_end > 0.0
+                        && dn.display_start <= current_row
+                        && current_row < dn.display_end
+                } else {
+                    false
+                }
+            })
+        })
+        .collect();
+
+    // Envelopes.
     if state.last_synth_env.len() < visible_cols {
         state.last_synth_env.resize_with(visible_cols, Vec::new);
     }
@@ -441,7 +335,7 @@ fn draw_tracker(
         }
     }
 
-    // ── Sample-position playhead ────────────────────────────────────
+    // Sample-position playhead.
     {
         let present: HashSet<&String> = path_order.iter().collect();
         state.playheads.retain(|k, _| present.contains(k));
@@ -519,42 +413,43 @@ fn draw_tracker(
         playhead_pys.push(Some(row));
     }
 
-    let wave_fg = Color::Rgb(200, 200, 200);
+    let wave_fg = theme.color(Token::Wave);
+    let muted_fg = theme.color(Token::MutedFg);
+    let muted_bg = theme.color(Token::MutedBg);
+    let playhead_fg = theme.color(Token::Playhead);
 
-    // Build header row and hit-test layout together.
+    // Header row + hit-test.
     let mut header: Vec<Span> = Vec::new();
     let mut hit_columns: Vec<TrackerColumnHit> = Vec::with_capacity(visible_cols);
     let mut x_cursor: u16 = 0;
     for col in 0..visible_cols {
         let path = &path_order[col];
-        let label = by_path[path]
+        let label_text = by_path[path]
             .first()
-            .map(|(n, _, _, _)| n.clone())
+            .map(|(name, _, _, _)| {
+                p.line_block_title(li, name).unwrap_or(name).to_string()
+            })
             .unwrap_or_else(|| "(?)".to_string());
-        let mut l = label;
-        if l.len() >= col_w {
+
+        let label_chars = label_text.chars().count();
+        let trimmed = if label_chars > col_w {
             if col_w > 1 {
-                l.truncate(col_w - 1);
-                l.push('…');
+                let mut s: String = label_text.chars().take(col_w - 1).collect();
+                s.push('…');
+                s
             } else {
-                l.truncate(col_w);
+                label_text.chars().take(col_w).collect()
             }
+        } else {
+            label_text
+        };
+
+        let style = label::header_style(path, muted_parts, soloed_part, &theme);
+
+        let padded = format!("{:<width$}", trimmed, width = col_w);
+        for span in label::split(&padded, style, &theme, &labels_cfg, col_playing[col]) {
+            header.push(span);
         }
-
-        let is_focused = state.player.focused_part.as_deref() == Some(path.as_str());
-        let is_soloed = soloed_parts.contains(path);
-        let is_muted = muted_parts.contains(path) || (solo_active && !is_soloed);
-
-        let mut style = Style::default().add_modifier(Modifier::BOLD);
-        if is_soloed {
-            style = style.fg(theme::SOLOED_FG);
-        } else if is_muted {
-            style = style.fg(theme::MUTED_FG);
-        } else if is_focused {
-            style = style.fg(theme::FOCUSED_FG);
-        }
-
-        header.push(Span::styled(format!("{:<width$}", l, width = col_w), style));
         header.push(Span::raw(" "));
 
         hit_columns.push(TrackerColumnHit {
@@ -564,7 +459,6 @@ fn draw_tracker(
             header_y: 0,
             rows: column_rows_hit[col].clone(),
         });
-
         x_cursor += col_w as u16 + 1;
     }
 
@@ -575,9 +469,9 @@ fn draw_tracker(
         let mut spans: Vec<Span> = Vec::new();
         for col in 0..visible_cols {
             let path = &path_order[col];
+
+            let solo_hides_col = soloed_part.map_or(false, |s| s != path.as_str());
             let is_muted_col = muted_parts.contains(path);
-            let is_soloed_col = soloed_parts.contains(path);
-            let solo_hides_col = solo_active && !is_soloed_col;
 
             let playhead_char: Option<usize> = playhead_pys[col].map(|py| py / 4);
 
@@ -644,13 +538,14 @@ fn draw_tracker(
                                 .unwrap_or(440.0);
                             let vol = value_at(&dn.note.vol_points, lookup_row)
                                 .unwrap_or(100.0);
-                            (Some((text, note_style(pitch, vol, state_note))), note_muted)
+                            let sty = note_style(pitch, vol, state_note, &theme, &synth);
+                            (Some((text, sty)), note_muted)
                         }
                         Some(ColumnLine::Divider { label }) => (
                             Some((
                                 label.clone(),
                                 Style::default()
-                                    .fg(Color::DarkGray)
+                                    .fg(ratatui::style::Color::DarkGray)
                                     .add_modifier(Modifier::ITALIC),
                             )),
                             false,
@@ -667,11 +562,9 @@ fn draw_tracker(
 
                 if let Some(ch) = text_char {
                     let style = if off {
-                        Style::default()
-                            .fg(theme::MUTED_FG)
-                            .bg(theme::MUTED_BG)
+                        Style::default().fg(muted_fg).bg(muted_bg)
                     } else if under_playhead {
-                        cell_text.as_ref().unwrap().1.fg(theme::PLAYHEAD_FG)
+                        cell_text.as_ref().unwrap().1.fg(playhead_fg)
                     } else {
                         cell_text.as_ref().unwrap().1
                     };
@@ -679,21 +572,19 @@ fn draw_tracker(
                 } else if bits != 0 {
                     let ch = braille_char(bits);
                     let style = if off {
-                        Style::default()
-                            .fg(theme::MUTED_FG)
-                            .bg(theme::MUTED_BG)
+                        Style::default().fg(muted_fg).bg(muted_bg)
                     } else if under_playhead {
-                        Style::default().fg(theme::PLAYHEAD_FG)
+                        Style::default().fg(playhead_fg)
                     } else {
                         Style::default().fg(wave_fg)
                     };
                     spans.push(Span::styled(ch.to_string(), style));
                 } else if off {
-                    spans.push(Span::styled(" ", Style::default().bg(theme::MUTED_BG)));
+                    spans.push(Span::styled(" ", Style::default().bg(muted_bg)));
                 } else if under_playhead {
                     spans.push(Span::styled(
-                        theme::PLAYHEAD_MARKER,
-                        Style::default().fg(theme::PLAYHEAD_FG),
+                        playhead_marker.clone(),
+                        Style::default().fg(playhead_fg),
                     ));
                 } else {
                     spans.push(Span::raw(" "));
@@ -710,160 +601,4 @@ fn draw_tracker(
         inner,
         columns: hit_columns,
     });
-}
-
-fn spiral_dirs(layout: &SpiralLayout, gx: usize, gy: usize) -> theme::PathDirs {
-    let gw = layout.grid_w as usize;
-    let gh = layout.grid_h as usize;
-    let Some(m) = layout.map.get(gy * gw + gx).copied().flatten() else {
-        return theme::PathDirs::default();
-    };
-    let step = layout.measures_per_cell as i64;
-    let m = m as i64;
-    let check = |nx: usize, ny: usize| -> bool {
-        layout
-            .map
-            .get(ny * gw + nx)
-            .copied()
-            .flatten()
-            .map(|n| (n as i64 - m).abs() == step)
-            .unwrap_or(false)
-    };
-    let mut dirs = theme::PathDirs {
-        left: gx > 0 && check(gx - 1, gy),
-        right: gx + 1 < gw && check(gx + 1, gy),
-        up: gy > 0 && check(gx, gy - 1),
-        down: gy + 1 < gh && check(gx, gy + 1),
-    };
-
-    if layout.is_center(gx, gy) && !dirs.down {
-        dirs.down = true;
-    }
-
-    dirs
-}
-
-fn draw_spiral(
-    f: &mut Frame<'_>,
-    area: Rect,
-    tp: &Transport,
-    p: &Project,
-    state: &mut RenderState,
-    layout: SpiralLayout,
-) {
-    state.spiral = Some(SpiralState { layout: layout.clone(), rect: area });
-
-    let lookahead = (PLAYHEAD_LOOKAHEAD_SECS * p.sample_rate as f64) as i64;
-    let pos = (tp.position.load(Ordering::Relaxed) + lookahead).min(p.total_samples);
-    let current = p.current_line(pos);
-
-    let gw = layout.grid_w as usize;
-    let gh = layout.grid_h as usize;
-    let mpcell = layout.measures_per_cell;
-
-    let mut lines: Vec<Line> = Vec::with_capacity(gh);
-    for gy in 0..gh {
-        let mut spans: Vec<Span> = Vec::with_capacity(gw);
-        for gx in 0..gw {
-            let idx = gy * gw + gx;
-            let measure = layout.map.get(idx).copied().flatten();
-            let (glyph, mut style) = match measure {
-                None => (" ", Style::default()),
-                Some(m) => {
-                    let dirs = spiral_dirs(&layout, gx, gy);
-                    let g = theme::path_glyph(dirs, theme::BORDER_STYLE);
-                    let style = match current {
-                        Some(cur) if cur >= m && cur < m + mpcell => Style::default()
-                            .fg(theme::SPIRAL_CURRENT_FG)
-                            .add_modifier(Modifier::BOLD),
-                        Some(cur) if cur >= m + mpcell => {
-                            Style::default().fg(theme::SPIRAL_PLAYED_FG)
-                        }
-                        _ => Style::default().fg(theme::SPIRAL_FUTURE_FG),
-                    };
-                    (g, style)
-                }
-            };
-
-            if let Some(m) = measure {
-                let in_loop = (m..m + mpcell)
-                    .any(|mm| state.player.loop_measures.contains(&mm));
-                if in_loop {
-                    style = style.bg(theme::SPIRAL_LOOP_BG);
-                }
-            }
-
-            spans.push(Span::styled(glyph.to_string(), style));
-        }
-        lines.push(Line::from(spans));
-    }
-    f.render_widget(Paragraph::new(lines), area);
-}
-
-// ── help overlay ───────────────────────────────────────────────────────
-
-fn draw_help(f: &mut Frame<'_>, area: Rect) {
-    let w = 56u16.min(area.width.saturating_sub(4));
-    let h = 22u16.min(area.height.saturating_sub(4));
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let rect = Rect::new(x, y, w, h);
-
-    f.render_widget(Clear, rect);
-
-    let key = Style::default()
-        .fg(theme::HELP_KEY_FG)
-        .bg(theme::HELP_BG)
-        .add_modifier(Modifier::BOLD);
-    let desc = Style::default().fg(theme::HELP_FG).bg(theme::HELP_BG);
-    let dim = Style::default().fg(theme::HELP_DIM_FG).bg(theme::HELP_BG);
-
-    let row = |k: &str, d: &str| -> Line<'static> {
-        Line::from(vec![
-            Span::styled(format!("  {:<14}", k), key),
-            Span::styled(d.to_string(), desc),
-        ])
-    };
-
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(Span::styled("", desc)));
-    lines.push(row("← →", "play reverse / forward"));
-    lines.push(row("hold ← →", "accelerate through 4x, 16x"));
-    lines.push(row("home", "rewind to start"));
-    lines.push(row("[ ]", "prev / next block"));
-    lines.push(row("h l", "prev / next column focus"));
-    lines.push(row("m / s", "mute / solo focused column"));
-    lines.push(row("c", "clear all mutes and solos"));
-    lines.push(row("L", "toggle loop playback"));
-    lines.push(row("v", "toggle mute mode (clicks = right-click)"));
-    lines.push(row("click queue", "type · enter plays · esc leaves"));
-    lines.push(row("pgup / pgdn", "loop count (or click [n])"));
-    lines.push(row("?", "toggle this help"));
-    lines.push(row("q / esc", "quit"));
-    lines.push(Line::from(Span::styled("", desc)));
-    lines.push(Line::from(Span::styled(
-        "  Mouse:",
-        Style::default().fg(theme::HELP_KEY_FG).bg(theme::HELP_BG),
-    )));
-    lines.push(Line::from(Span::styled(
-        "  Left-click    spiral: seek   note: jump   header: solo",
-        dim,
-    )));
-    lines.push(Line::from(Span::styled(
-        "  In mute mode  spiral: loop   note: mute   header: mute",
-        dim,
-    )));
-    lines.push(Line::from(Span::styled(
-        "  Double-click  clear all mutes and solos",
-        dim,
-    )));
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_set(theme::border_set(theme::BORDER_STYLE))
-        .border_style(Style::default().fg(theme::HELP_KEY_FG))
-        .title(" Help ")
-        .style(Style::default().bg(theme::HELP_BG));
-
-    f.render_widget(Paragraph::new(lines).block(block), rect);
 }

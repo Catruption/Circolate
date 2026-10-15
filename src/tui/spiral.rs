@@ -1,18 +1,21 @@
 //! Square-spiral playbar geometry.  One cell per measure (bundled when
 //! the song would otherwise overflow the available footer height),
 //! walking outward from the centre right, down, left, up.
+//!
+//! Pure math — no ratatui, no `RenderState`.  The renderer is in
+//! `widgets/spiral.rs`; the hit-test record (`SpiralState`) is in
+//! `state.rs`, so both the widget and `shared/hit.rs` can reach it
+//! without depending on each other.
 
-use ratatui::layout::Rect;
-
-/// Maximum spiral grid height, in terminal rows.  Past this we bundle
-/// multiple measures into a single spiral cell so the footer doesn't
-/// swallow the tracker.
+/// Default maximum spiral grid height, in terminal rows, when the
+/// caller doesn't override it via `player_settings.json`.  Past this we
+/// bundle multiple measures into a single spiral cell so the footer
+/// doesn't swallow the tracker.
 pub const SPIRAL_MAX_H: usize = 15;
 
-/// Horizontal stretch of the spiral, in grid cells per vertical cell.
-/// 1 = square spiral (looks tall on a terminal because cells are ~2:1
-/// tall).  2 ≈ visually square.  Higher = wider than tall.  Bump this
-/// up if the spiral is still eating too many rows.
+/// Default horizontal stretch of the spiral, in grid cells per vertical
+/// cell.  1 = square spiral (looks tall on a terminal because cells are
+/// ~2:1 tall).  2 ≈ visually square.  Higher = wider than tall.
 pub const SPIRAL_ASPECT_X: usize = 2;
 
 /// First `n` cells of an outward spiral starting at (0, 0), proceeding
@@ -54,7 +57,7 @@ pub fn spiral_path(n: usize, aspect_x: usize) -> Vec<(i32, i32)> {
 #[derive(Clone)]
 pub struct SpiralLayout {
     /// Measures per cell.  Grows above 1 only when the song can't fit
-    /// at full resolution within `SPIRAL_MAX_H` rows.
+    /// at full resolution within the max grid height.
     pub measures_per_cell: usize,
     /// Bounding box, in spiral coordinates.
     pub min_x: i32,
@@ -85,12 +88,25 @@ impl SpiralLayout {
     }
 }
 
+/// Build a spiral using the default aspect ratio.  Kept for callers
+/// that don't thread config through.
 pub fn build_spiral(total_measures: usize, max_grid_h: usize) -> SpiralLayout {
+    build_spiral_with_aspect(total_measures, max_grid_h, SPIRAL_ASPECT_X)
+}
+
+/// Same as `build_spiral`, but with a caller-chosen horizontal stretch.
+/// Higher `aspect_x` = wider spiral; 1 = square.
+pub fn build_spiral_with_aspect(
+    total_measures: usize,
+    max_grid_h: usize,
+    aspect_x: usize,
+) -> SpiralLayout {
     let total = total_measures.max(1);
+    let aspect_x = aspect_x.max(1);
     let mut mpcell = 1usize;
     let (path, min_x, min_y, grid_w, grid_h) = loop {
         let cells = (total + mpcell - 1) / mpcell;
-        let path = spiral_path(cells, SPIRAL_ASPECT_X);
+        let path = spiral_path(cells, aspect_x);
 
         let (mut min_x, mut max_x) = (i32::MAX, i32::MIN);
         let (mut min_y, mut max_y) = (i32::MAX, i32::MIN);
@@ -120,11 +136,4 @@ pub fn build_spiral(total_measures: usize, max_grid_h: usize) -> SpiralLayout {
     }
 
     SpiralLayout { measures_per_cell: mpcell, min_x, min_y, grid_w, grid_h, map }
-}
-
-pub struct SpiralState {
-    pub layout: SpiralLayout,
-    /// Screen rect occupied by the spiral grid, filled in during draw
-    /// and consumed by the mouse handler.
-    pub rect: Rect,
 }

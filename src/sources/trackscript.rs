@@ -383,7 +383,7 @@ fn call_rx() -> &'static Regex {
     static RX: OnceLock<Regex> = OnceLock::new();
     RX.get_or_init(|| {
         let src = regex::escape(FIELD_SOURCE);
-        Regex::new(&format!(r"{src}([A-Za-z_][A-Za-z0-9_-]*)")).unwrap()
+        Regex::new(&format!(r"{src}([A-Za-z_][A-Za-z0-9_.-]*)")).unwrap()
     })
 }
 
@@ -938,7 +938,7 @@ fn parse_identifier(c: &mut Cursor) -> String {
         _ => return String::new(),
     }
     while let Some(b) = c.peek_byte() {
-        if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' {
+        if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.' {
             c.pos += 1;
         } else {
             break;
@@ -1171,7 +1171,7 @@ fn parse_block_array(body: &str) -> (BlockMap, PartMap) {
         }
         let name_start = pos + FIELD_SOURCE.len();
         let name_end = body[name_start..]
-            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-' && c != '.')
             .map(|i| name_start + i)
             .unwrap_or(body.len());
         let name = body[name_start..name_end].to_string();

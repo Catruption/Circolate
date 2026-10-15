@@ -123,22 +123,22 @@ fn decode_env_lfo(b: &[u8]) -> Option<EnvelopeLfo> {
     }
     Some(EnvelopeLfo {
         flags: i32le(b, 0),
-        env_enabled: i32le(b, 4),
-        env_predelay: i32le(b, 8),
-        env_attack: i32le(b, 12),
-        env_hold: i32le(b, 16),
-        env_decay: i32le(b, 20),
-        env_sustain: i32le(b, 24),
-        env_release: i32le(b, 28),
-        env_amount: i32le(b, 32),
-        lfo_predelay: u32le(b, 36),
-        lfo_attack: u32le(b, 40),
-        lfo_amount: i32le(b, 44),
-        lfo_speed: u32le(b, 48),
-        lfo_shape: i32le(b, 52),
-        env_attack_tension: i32le(b, 56),
-        env_decay_tension: i32le(b, 60),
-        env_release_tension: i32le(b, 64),
+         env_enabled: i32le(b, 4),
+         env_predelay: i32le(b, 8),
+         env_attack: i32le(b, 12),
+         env_hold: i32le(b, 16),
+         env_decay: i32le(b, 20),
+         env_sustain: i32le(b, 24),
+         env_release: i32le(b, 28),
+         env_amount: i32le(b, 32),
+         lfo_predelay: u32le(b, 36),
+         lfo_attack: u32le(b, 40),
+         lfo_amount: i32le(b, 44),
+         lfo_speed: u32le(b, 48),
+         lfo_shape: i32le(b, 52),
+         env_attack_tension: i32le(b, 56),
+         env_decay_tension: i32le(b, 60),
+         env_release_tension: i32le(b, 64),
     })
 }
 
@@ -148,11 +148,11 @@ fn decode_levels(b: &[u8]) -> Option<Levels> {
     }
     Some(Levels {
         pan: i32le(b, 0),
-        volume: u32le(b, 4),
-        pitch_shift: i32le(b, 8),
-        filter_mod_x: u32le(b, 12),
-        filter_mod_y: u32le(b, 16),
-        filter_type: u32le(b, 20),
+         volume: u32le(b, 4),
+         pitch_shift: i32le(b, 8),
+         filter_mod_x: u32le(b, 12),
+         filter_mod_y: u32le(b, 16),
+         filter_type: u32le(b, 20),
     })
 }
 
@@ -162,9 +162,9 @@ fn decode_tracking(b: &[u8]) -> Option<Tracking> {
     }
     Some(Tracking {
         middle_value: u32le(b, 0),
-        pan: i32le(b, 4),
-        mod_x: i32le(b, 8),
-        mod_y: i32le(b, 12),
+         pan: i32le(b, 4),
+         mod_x: i32le(b, 8),
+         mod_y: i32le(b, 12),
     })
 }
 
@@ -174,9 +174,9 @@ fn decode_level_adjusts(b: &[u8]) -> Option<LevelAdjusts> {
     }
     Some(LevelAdjusts {
         pan: i32le(b, 0),
-        volume: u32le(b, 4),
-        mod_x: i32le(b, 12),
-        mod_y: i32le(b, 16),
+         volume: u32le(b, 4),
+         mod_x: i32le(b, 12),
+         mod_y: i32le(b, 16),
     })
 }
 
@@ -365,7 +365,7 @@ fn read_events(data: &[u8]) -> Result<(u16, Vec<(u8, Vec<u8>)>, Vec<String>)> {
         bail!("missing FLdt data chunk");
     }
     let length =
-        u32::from_le_bytes([data[p + 4], data[p + 5], data[p + 6], data[p + 7]]) as usize;
+    u32::from_le_bytes([data[p + 4], data[p + 5], data[p + 6], data[p + 7]]) as usize;
     p += 8;
     let end = (p + length).min(data.len());
 
@@ -414,7 +414,7 @@ fn read_events(data: &[u8]) -> Result<(u16, Vec<(u8, Vec<u8>)>, Vec<String>)> {
             let have = end.saturating_sub(p);
             warnings.push(format!(
                 "truncated event {:#04x} at offset {:#x}: needs {} byte(s), {} available; stopping parse",
-                ev, ev_off, size, have
+                                  ev, ev_off, size, have
             ));
             return Ok((ppq, events, warnings));
         }
@@ -445,9 +445,9 @@ fn text(ev: u8, raw: &[u8]) -> String {
         end += 2;
     }
     let units: Vec<u16> = (0..end)
-        .step_by(2)
-        .map(|i| u16::from_le_bytes([raw[i], raw[i + 1]]))
-        .collect();
+    .step_by(2)
+    .map(|i| u16::from_le_bytes([raw[i], raw[i + 1]]))
+    .collect();
     String::from_utf16_lossy(&units)
 }
 
@@ -640,6 +640,9 @@ pub fn parse(data: &[u8]) -> Result<Project> {
     let mut chan_idx: Option<usize> = None;
     let mut pat_idx: Option<usize> = None;
     let mut plug_ref: Option<PluginRef> = None;
+    // FL writes the default-plugin name (201) *before* NewPlugin (212) for
+    // channels, so hold it until the plugin exists.
+    let mut pending_def_plugin: Option<String> = None;
     let mut pending_fx_names: Vec<String> = Vec::new();
 
     for (ev, raw) in &events {
@@ -675,7 +678,7 @@ pub fn parse(data: &[u8]) -> Result<Project> {
             EV_COLOR if raw.len() == 4 && pat_idx.is_none() => {
                 if let Some(i) = chan_idx {
                     prj.channels[i].color =
-                        Some(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]));
+                    Some(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]));
                 }
             }
             EV_TEXT_CHAN_NAME => {
@@ -746,6 +749,7 @@ pub fn parse(data: &[u8]) -> Result<Project> {
                 };
                 let blank = Plugin {
                     owner,
+                    internal_name: pending_def_plugin.take().unwrap_or_default(),
                     ..Default::default()
                 };
                 if owner == 0 {
@@ -763,7 +767,7 @@ pub fn parse(data: &[u8]) -> Result<Project> {
                     let ins = prj.inserts.entry(owner).or_insert_with(|| Insert {
                         index: owner,
                         name: String::new(),
-                        plugins: Vec::new(),
+                                                                      plugins: Vec::new(),
                     });
                     ins.plugins.push(blank);
                     let j = ins.plugins.len() - 1;
@@ -772,11 +776,22 @@ pub fn parse(data: &[u8]) -> Result<Project> {
             }
             EV_TEXT_DEF_PLUGIN => {
                 let s = text(*ev, raw);
+                // Older ordering (201 after 212): the target plugin is brand
+                // new and still blank, so assign directly.  Otherwise the name
+                // belongs to the plugin the next NewPlugin creates.
+                let mut assigned = false;
                 if let Some(pr) = plug_ref {
                     if let Some(p) = pr.get_mut(&mut prj) {
-                        p.internal_name = s;
+                        if p.internal_name.is_empty()
+                            && p.display_name.is_empty()
+                            && p.state.is_empty()
+                            {
+                                p.internal_name = s.clone();
+                                assigned = true;
+                            }
                     }
                 }
+                pending_def_plugin = if assigned { None } else { Some(s) };
             }
             EV_TEXT_PLUGIN_NAME => {
                 let s = text(*ev, raw);
@@ -809,7 +824,7 @@ pub fn parse(data: &[u8]) -> Result<Project> {
                 prj.patterns.push(Pattern {
                     iid,
                     name: String::new(),
-                    notes: Vec::new(),
+                                  notes: Vec::new(),
                 });
                 pat_idx = Some(prj.patterns.len() - 1);
                 chan_idx = None;

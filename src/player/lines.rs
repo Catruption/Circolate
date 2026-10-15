@@ -7,6 +7,9 @@ use crate::sources::trackscript::{BlockCall, CallOverrides, ShimEvent, Trackscri
 
 #[derive(Clone)]
 pub(crate) struct LineCall {
+    /// Formatted BlockList call, used instead of the block's original title tag.
+    pub block_title: String,
+    /// Resolved part name used for note/event lookup.
     pub name: String,
     pub pattern_measure_start: f64,
     pub pattern_measure_len: f64,
@@ -19,6 +22,40 @@ pub(crate) struct LineInfo {
     pub start_row: f64,
     pub min_start: i64,
     pub max_end: i64,
+}
+
+
+fn format_block_title(call: &BlockCall) -> String {
+    let mut title = format!("ƒ{}(", call.name);
+    for (i, selection) in call.selections.iter().enumerate() {
+        if i > 0 {
+            title.push(',');
+        }
+        title.push_str(&(selection.measure + 1).to_string());
+
+        if let Some(overrides) = &selection.overrides {
+            let mut fields = Vec::new();
+            if let Some(vol) = overrides.vol {
+                fields.push(format!("%{}", vol));
+            }
+            if let Some(pan) = overrides.pan {
+                fields.push(format!("¶{}", pan));
+            }
+            if let Some(dur) = overrides.dur {
+                fields.push(format!("~{}", dur));
+            }
+            if let Some(source) = &overrides.source {
+                fields.push(format!("ƒ'{}'", source));
+            }
+            if !fields.is_empty() {
+                title.push('<');
+                title.push_str(&fields.join(", "));
+                title.push('>');
+            }
+        }
+    }
+    title.push(')');
+    title
 }
 
 pub(crate) struct ResolvedLine {
@@ -110,6 +147,7 @@ fn resolve_call(
             let measure_start: f64 = sections[..m_idx].iter().sum();
             let measure_len = sections[m_idx];
             out.push(LineCall {
+                block_title: format_block_title(call),
                 name: name.clone(),
                 pattern_measure_start: measure_start,
                 pattern_measure_len: measure_len,
@@ -130,6 +168,7 @@ fn resolve_call(
             for (m_idx, measure_len) in sections.iter().enumerate() {
                 let measure_start: f64 = sections[..m_idx].iter().sum();
                 out.push(LineCall {
+                    block_title: format_block_title(call),
                     name: name.clone(),
                     pattern_measure_start: measure_start,
                     pattern_measure_len: *measure_len,

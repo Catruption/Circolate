@@ -44,13 +44,30 @@
 // buffer manager crashes on the first output fill.  The instrument
 // path therefore mirrors the effect path: if the plugin has an input
 // bus, feed it silent scratch.
+//
+// Module loading.  We do NOT use VST3::Hosting::Module::create.  That
+// loader derives the .so name from the bundle stem — "Magical8bitPlug2"
+// → "Magical8bitPlug2.so" — and dlopen's the literal path.  JUCE (and
+// several other frameworks) emit the .so all-lowercase, so the derived
+// path misses on case-sensitive filesystems.  Instead we glob the arch
+// directory for the first *.so and use that, then wrap the plugin's
+// IPluginFactory in the SDK's own PluginFactory type so the rest of
+// the shim is unchanged.
+//
+// Logging.  Every shim diagnostic goes through SHIM_LOG, which is a
+// no-op unless VST_SHIM_DEBUG is set in the environment.
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
+#include <dlfcn.h>
+#include <exception>
 #include <memory>
 #include <string>
+#include <sys/stat.h>
 #include <vector>
 
 #include "public.sdk/source/vst/hosting/module.h"
@@ -67,6 +84,16 @@
 
 using namespace Steinberg;
 using namespace Steinberg::Vst;
+
+// ── debug logging ──────────────────────────────────────────────────────
+
+static bool shim_debug_enabled() {
+    static const bool enabled = std::getenv("VST_SHIM_DEBUG") != nullptr;
+    return enabled;
+}
+
+#define SHIM_LOG(...) \
+    do { if (shim_debug_enabled()) std::fprintf(stderr, __VA_ARGS__); } while (0)
 
 // ── IEventList backed by a std::vector ─────────────────────────────────
 
@@ -124,14 +151,114 @@ struct BusScratch {
     }
 };
 
+// ── manual module loader ───────────────────────────────────────────────
+
+struct LoadedModule {
+    void* lib = nullptr;
+    IPtr<IPluginFactory> factory;
+
+    ~LoadedModule() {
+        factory = nullptr;
+        if (lib) {
+            using ModuleExitFn = bool (PLUGIN_API*)();
+            auto exit_fn = reinterpret_cast<ModuleExitFn>(dlsym(lib, "ModuleExit"));
+            if (exit_fn) exit_fn();
+            dlclose(lib);
+        }
+    }
+};
+
+static std::string find_so_in_bundle(const std::string& bundle) {
+    std::string contents = bundle + "/Contents";
+    DIR* cd = opendir(contents.c_str());
+    if (!cd) return {};
+
+    std::string found;
+    struct dirent* arch_entry;
+    while (found.empty() && (arch_entry = readdir(cd))) {
+        std::string an = arch_entry->d_name;
+        if (an == "." || an == "..") continue;
+
+        std::string arch_dir = contents + "/" + an;
+        DIR* ad = opendir(arch_dir.c_str());
+        if (!ad) continue;
+
+        struct dirent* so_entry;
+        while ((so_entry = readdir(ad))) {
+            std::string n = so_entry->d_name;
+            std::string lower = n;
+            for (auto& c : lower)
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (lower.size() > 3 && lower.compare(lower.size() - 3, 3, ".so") == 0) {
+                found = arch_dir + "/" + n;
+                break;
+            }
+        }
+        closedir(ad);
+    }
+    closedir(cd);
+    return found;
+}
+
+static LoadedModule* load_module(const char* path, std::string& err) {
+    struct stat st{};
+    if (stat(path, &st) != 0) {
+        err = "path does not exist";
+        return nullptr;
+    }
+
+    std::string so_path;
+    if (S_ISDIR(st.st_mode)) {
+        so_path = find_so_in_bundle(path);
+        if (so_path.empty()) {
+            err = "no .so in any Contents/*/ subdirectory";
+            return nullptr;
+        }
+    } else {
+        so_path = path;
+    }
+
+    void* lib = dlopen(so_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!lib) {
+        err = std::string("dlopen failed: ") + dlerror();
+        return nullptr;
+    }
+
+    using ModuleEntryFn = bool (PLUGIN_API*)(void*);
+    using GetFactoryFn  = IPluginFactory* (PLUGIN_API*)();
+
+    auto entry = reinterpret_cast<ModuleEntryFn>(dlsym(lib, "ModuleEntry"));
+    if (entry) entry(lib);
+
+    auto get_factory = reinterpret_cast<GetFactoryFn>(dlsym(lib, "GetPluginFactory"));
+    if (!get_factory) {
+        err = "no GetPluginFactory export in .so";
+        dlclose(lib);
+        return nullptr;
+    }
+
+    IPluginFactory* raw = get_factory();
+    if (!raw) {
+        err = "GetPluginFactory returned nullptr";
+        dlclose(lib);
+        return nullptr;
+    }
+    raw->addRef();
+
+    auto* m = new LoadedModule();
+    m->lib = lib;
+    m->factory = IPtr<IPluginFactory>(raw);
+    return m;
+}
+
 // ── per-instance state ─────────────────────────────────────────────────
 
 struct Shim {
-    VST3::Hosting::Module::Ptr module;
-    IPtr<IHostApplication>     host_app;
-    IPtr<IComponent>           component;
-    IPtr<IEditController>      controller;
-    IPtr<IAudioProcessor>      processor;
+    LoadedModule* module = nullptr;
+    IPtr<IHostApplication> host_app;
+    IPtr<IComponent>       component;
+    IPtr<IEditController>  controller;
+    IPtr<IAudioProcessor>  processor;
 
     int sampleRate = 44100;
     int blockSize  = 512;
@@ -176,37 +303,48 @@ static bool pick_class(const VST3::Hosting::PluginFactory& factory,
 }
 
 static bool configure(Shim* s) {
-    s->component->initialize(s->host_app);
+    tresult r = s->component->initialize(s->host_app);
+    if (r != kResultOk) {
+        SHIM_LOG("vst_shim: component->initialize returned %d\n", (int)r);
+        return false;
+    }
     if (s->controller.get()) {
-        s->controller->initialize(s->host_app);
+        r = s->controller->initialize(s->host_app);
+        if (r != kResultOk) {
+            SHIM_LOG("vst_shim: controller->initialize returned %d (ignoring)\n",
+                     (int)r);
+        }
     }
 
     int32 inCount  = s->component->getBusCount(kAudio, kInput);
     int32 outCount = s->component->getBusCount(kAudio, kOutput);
     s->hasInput    = inCount > 0;
 
+    SHIM_LOG("vst_shim: bus counts in=%d out=%d\n", inCount, outCount);
+
     if (std::getenv("VST_SHIM_DEBUG")) {
         BusInfo bi{};
-        std::fprintf(stderr, "shim: %d input bus(es), %d output bus(es)\n",
-                     inCount, outCount);
         for (int32 b = 0; b < inCount; ++b) {
             s->component->getBusInfo(kAudio, kInput, b, bi);
-            std::fprintf(stderr, "shim: in bus %d channels=%d\n",
-                         b, bi.channelCount);
+            SHIM_LOG("vst_shim:   in bus %d channels=%d\n", b, bi.channelCount);
         }
         for (int32 b = 0; b < outCount; ++b) {
             s->component->getBusInfo(kAudio, kOutput, b, bi);
-            std::fprintf(stderr, "shim: out bus %d channels=%d\n",
-                         b, bi.channelCount);
+            SHIM_LOG("vst_shim:   out bus %d channels=%d\n", b, bi.channelCount);
         }
     }
 
     SpeakerArrangement out_arr = SpeakerArr::kStereo;
+    tresult arr_res;
     if (s->hasInput) {
         SpeakerArrangement in_arr = SpeakerArr::kStereo;
-        s->processor->setBusArrangements(&in_arr, 1, &out_arr, 1);
+        arr_res = s->processor->setBusArrangements(&in_arr, 1, &out_arr, 1);
     } else {
-        s->processor->setBusArrangements(nullptr, 0, &out_arr, 1);
+        arr_res = s->processor->setBusArrangements(nullptr, 0, &out_arr, 1);
+    }
+    if (arr_res != kResultOk) {
+        SHIM_LOG("vst_shim: setBusArrangements returned %d (continuing)\n",
+                 (int)arr_res);
     }
 
     for (int32 b = 0; b < outCount; ++b) {
@@ -221,9 +359,13 @@ static bool configure(Shim* s) {
     setup.symbolicSampleSize = kSample32;
     setup.maxSamplesPerBlock = s->blockSize;
     setup.sampleRate         = s->sampleRate;
-    if (s->processor->setupProcessing(setup) != kResultOk) {
+    tresult sr_res = s->processor->setupProcessing(setup);
+    if (sr_res != kResultOk) {
+        SHIM_LOG("vst_shim: setupProcessing returned %d (sr=%d block=%d)\n",
+                 (int)sr_res, s->sampleRate, s->blockSize);
         return false;
     }
+    SHIM_LOG("vst_shim: setupProcessing ok\n");
 
     return true;
 }
@@ -256,12 +398,6 @@ static void alloc_scratch(Shim* s) {
     }
 }
 
-// Sum every output bus into the host's stereo pair.  SFLT routes dry
-// to bus 0 and its reverb / chorus returns to buses 1 and 2; a real
-// multi-bus host would route those separately, but for stereo playback
-// they all land on the same pair.  Mono buses are duplicated to both
-// sides; stereo buses contribute L→L and R→R.  Anything beyond the
-// first two channels of a bus is dropped.
 static void sum_buses_to_stereo(const std::vector<BusScratch>& buses,
                                 float* outL, float* outR, int frames)
 {
@@ -292,12 +428,30 @@ extern "C" {
     void* vst_shim_create(const char* path, int sr, int block) {
         try {
             std::string err;
-            auto mod = VST3::Hosting::Module::create(path, err);
-            if (!mod) return nullptr;
+            auto* mod = load_module(path, err);
+            if (!mod) {
+                SHIM_LOG("vst_shim: load_module(%s) failed: %s\n",
+                         path, err.c_str());
+                return nullptr;
+            }
+            SHIM_LOG("vst_shim: module loaded from %s\n", path);
 
-            auto factory = mod->getFactory();
+            VST3::Hosting::PluginFactory factory(mod->factory);
+
+            SHIM_LOG("vst_shim: factory has %zu class(es)\n",
+                     factory.classInfos().size());
+            for (const auto& info : factory.classInfos()) {
+                SHIM_LOG("vst_shim:   class=%s cat=%s\n",
+                         info.name().c_str(), info.category().c_str());
+            }
+
             VST3::Hosting::ClassInfo ci;
-            if (!pick_class(factory, ci)) return nullptr;
+            if (!pick_class(factory, ci)) {
+                SHIM_LOG("vst_shim: no audio-effect class\n");
+                delete mod;
+                return nullptr;
+            }
+            SHIM_LOG("vst_shim: picked class %s\n", ci.name().c_str());
 
             auto s = new Shim();
             s->module     = mod;
@@ -308,22 +462,32 @@ extern "C" {
 
             s->component = factory.createInstance<IComponent>(ci.ID());
             if (!s->component.get()) {
+                SHIM_LOG("vst_shim: createInstance<IComponent> failed\n");
+                delete mod;
                 delete s;
                 return nullptr;
             }
             s->controller = factory.createInstance<IEditController>(ci.ID());
+            if (!s->controller.get()) {
+                SHIM_LOG("vst_shim: no IEditController\n");
+            }
 
             if (s->component->queryInterface(IAudioProcessor::iid,
                 reinterpret_cast<void**>(&s->processor)) != kResultOk
                 || !s->processor.get()) {
+                SHIM_LOG("vst_shim: queryInterface(IAudioProcessor) failed\n");
+                delete mod;
                 delete s;
                 return nullptr;
             }
 
             if (!configure(s)) {
+                SHIM_LOG("vst_shim: configure() failed\n");
+                delete mod;
                 delete s;
                 return nullptr;
             }
+            SHIM_LOG("vst_shim: configured\n");
 
             alloc_scratch(s);
 
@@ -336,7 +500,11 @@ extern "C" {
             s->context.timeSigDenominator = 4;
 
             return s;
+        } catch (const std::exception& e) {
+            SHIM_LOG("vst_shim: exception: %s\n", e.what());
+            return nullptr;
         } catch (...) {
+            SHIM_LOG("vst_shim: unknown exception\n");
             return nullptr;
         }
     }
@@ -359,6 +527,13 @@ extern "C" {
         }
         if (s->component.get()) s->component->terminate();
         if (s->controller.get()) s->controller->terminate();
+
+        s->processor = nullptr;
+        s->controller = nullptr;
+        s->component = nullptr;
+        s->host_app = nullptr;
+
+        delete s->module;
         delete s;
     }
 

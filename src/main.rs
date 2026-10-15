@@ -15,6 +15,7 @@ mod export;
 mod fallbacks;
 mod fetch;
 mod instruments;
+mod mixer;
 mod play;
 mod player;
 mod plugins;
