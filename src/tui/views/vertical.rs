@@ -35,7 +35,7 @@ use crate::player::envelope::wrapped_pos;
 use crate::player::notes::{split_notes, value_at, DisplayNote};
 use crate::player::scope::scope_snapshot;
 use crate::player::{Project, Transport};
-use crate::sources::trackscript::C5_HZ;
+use crate::formats::trackscript::C5_HZ;
 use crate::tui::shared::label;
 use crate::tui::shared::note_fmt::{fmt_num, fmt_pitch};
 use crate::tui::shared::note_style::{note_style, NoteState};

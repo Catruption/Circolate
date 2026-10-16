@@ -190,12 +190,12 @@ pub fn write_archive(
     }
 
     // ── requires.json ────────────────────────────────────────────────
-    let requires = crate::requires::build_from_aux(&converted.aux);
+    let requires = crate::deps::requires::build_from_aux(&converted.aux);
     let need_requires_entry = !requires.plugins.is_empty() || !requires.fallbacks.is_empty();
     if need_requires_entry {
         let bytes = serde_json::to_string_pretty(&requires)?.into_bytes();
         staged.push((
-            crate::requires::FILENAME.into(),
+            crate::deps::requires::FILENAME.into(),
             bytes,
             EntryKind::Requires,
             false,
@@ -204,7 +204,7 @@ pub fn write_archive(
 
     // ── embedded plugin bundles ──────────────────────────────────────
     if opts.include_plugins != IncludePlugins::None {
-        for bundle in crate::requires::bundles_from_aux(&converted.aux) {
+        for bundle in crate::deps::requires::bundles_from_aux(&converted.aux) {
             if opts.include_plugins == IncludePlugins::Free && !bundle.redistributable {
                 continue;
             }

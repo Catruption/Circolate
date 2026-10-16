@@ -4,7 +4,7 @@
 use anyhow::{bail, Result};
 use std::path::PathBuf;
 
-use crate::vst_host_ffi::VstHost;
+use crate::hosting::vst::ffi::VstHost;
 
 const SR: u32 = 44100;
 const BLOCK: usize = 512;

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use crate::sources::trackscript::TrackscriptPart;
+use crate::formats::trackscript::TrackscriptPart;
 
 use super::stretch;
 use super::template::{build_template, PartTemplate};

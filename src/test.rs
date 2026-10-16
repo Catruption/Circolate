@@ -1,411 +1,393 @@
-//! `trackscript-player test` — pipeline diagnostics.
+//! `trackscript-player test` — single-file diagnostic.
 //!
-//! Without flags: walks the load pipeline and prints the first
-//! checkpoint that comes back "no" for each part.
+//! Unlike `check`, which just says clean / dirty per file, `test` prints
+//! the parsed structure of one source and then runs the full probe
+//! pipeline so you can see why each channel is (or isn't) convertible.
 //!
-//! With `--smoke`: additionally instantiates every VST instrument,
-//! loads it with the state blob from the sidecar, plays one note for
-//! one second, and reports the peak output level.  A plugin that
-//! loads but produces silence tells you the state blob wasn't
-//! accepted (or is empty, or points at a file the plugin can't find).
+//! Usage:
+//!     trackscript-player test <file> [--json]
 //!
-//! Output is deliberately verbose and unstructured: it's a debugging
-//! tool, not a UI.  Pipe through `grep` to narrow.
+//! Exit code is non-zero when the probe reports missing dependencies or
+//! unresolved fallbacks, matching `check`.
 
-use anyhow::Result;
-use std::path::Path;
+use anyhow::{bail, Context, Result};
+use std::path::{Path, PathBuf};
 
-use crate::player::{load_project, Project};
-use crate::sources::trackscript::TrackscriptEvent;
-use crate::vst_host_ffi::VstHost;
-
-const TEST_SAMPLE_RATE: u32 = 48000;
-const SMOKE_SR: u32 = 44100;
-const SMOKE_BLOCK: usize = 512;
-const SMOKE_SECONDS: usize = 1;
-
-pub fn run(rest: &[String]) -> Result<()> {
-    let mut smoke = false;
-    let mut file_arg: Option<&str> = None;
-    for a in rest {
-        if a == "--smoke" {
-            smoke = true;
-        } else if !a.starts_with("--") && file_arg.is_none() {
-            file_arg = Some(a);
-        }
-    }
-
-    let Some(file) = file_arg else {
-        anyhow::bail!("test: missing <file>  (use --smoke to also load VST instruments)");
-    };
-    let path = Path::new(file);
-    if !path.exists() {
-        anyhow::bail!("test: no such file: {}", path.display());
-    }
-
-    let (project, _cache) = load_project(path, TEST_SAMPLE_RATE, false, false)?;
-
-    print_summary(&project);
-    print_sf2_keys(&project);
-    print_vst_keys(&project);
-    print_multi_sample_keys(&project);
-    print_path_kinds(&project);
-    print_per_part_trace(&project);
-
-    if smoke {
-        smoke_vst_instruments(&project, path)?;
-    }
-
-    print_footer(smoke);
-    Ok(())
-}
-
-// ── summary ────────────────────────────────────────────────────────────
-
-fn print_summary(p: &Project) {
-    println!("\n=== project ===");
-    println!("  title:              {:?}", p.title);
-    println!("  parts:              {}", p.parts.len());
-    println!("  samples:            {}", p.samples.len());
-    println!("  path_to_id entries: {}", p.path_to_id.len());
-    println!("  sf2_instruments:    {}", p.sf2_instruments.len());
-    println!("  vst_instruments:    {}", p.vst_instruments.len());
-    println!("  multi_sample:       {}", p.multi_sample_instruments.len());
-    println!("  lines:              {}", p.lines.len());
-    println!("  voice_count:        {}", p.voice_count);
-    println!("  bpm:                {}", p.initial_bpm);
-    println!(
-        "  time_signature:     {}/{}",
-        p.time_signature.0, p.time_signature.1
-    );
-}
-
-fn print_sf2_keys(p: &Project) {
-    println!("\n=== sf2_instruments ===");
-    if p.sf2_instruments.is_empty() {
-        println!("  (none)");
-        return;
-    }
-    let mut keys: Vec<_> = p.sf2_instruments.keys().cloned().collect();
-    keys.sort();
-    for k in &keys {
-        let inst = &p.sf2_instruments[k];
-        let zones = inst.zone_count_hint();
-        let first = inst.first_zone_sample_id();
-        let first_ok = first
-            .map(|sid| p.samples.contains_key(&sid))
-            .unwrap_or(false);
-        println!(
-            "  {:<50} zones={:<4} first_sid={:?} in_samples={}",
-            k, zones, first, first_ok
-        );
-    }
-}
-
-fn print_vst_keys(p: &Project) {
-    println!("\n=== vst_instruments ===");
-    if p.vst_instruments.is_empty() {
-        println!("  (none)");
-        return;
-    }
-    let mut keys: Vec<_> = p.vst_instruments.keys().cloned().collect();
-    keys.sort();
-    for k in &keys {
-        let inst = &p.vst_instruments[k];
-        println!(
-            "  {:<50} name={:<14} state={:<6} fallback={} path={}",
-            k,
-            format!("{:?}", inst.name),
-            inst.state_bytes.len(),
-            inst.fallback,
-            inst.plugin_path.display()
-        );
-    }
-}
-
-fn print_multi_sample_keys(p: &Project) {
-    println!("\n=== multi_sample_instruments ===");
-    if p.multi_sample_instruments.is_empty() {
-        println!("  (none)");
-        return;
-    }
-    let mut keys: Vec<_> = p.multi_sample_instruments.keys().cloned().collect();
-    keys.sort();
-    for k in &keys {
-        println!("  {}", k);
-    }
-}
-
-// ── per-part path classification ──────────────────────────────────────
+use crate::convert::{self, ConvertOptions, DepKind, ProbeReport};
+use crate::formats::flp;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PathKind {
-    Multi,
-    Wav,
-    Vst,
-    Sf2,
-    Sf2Empty,
-    Sf2MissingSamples,
-    None,
+enum Kind {
+    Flp,
+    Trackscript,
+    Unknown,
 }
 
-fn classify_path(p: &Project, sample_path: &str) -> PathKind {
-    if p.multi_sample_instruments.contains_key(sample_path) {
-        return PathKind::Multi;
-    }
-    if let Some(id) = p.path_to_id.get(sample_path) {
-        if p.samples.contains_key(id) {
-            return PathKind::Wav;
-        }
-    }
-    if p.vst_instruments.contains_key(sample_path) {
-        return PathKind::Vst;
-    }
-    if let Some(inst) = p.sf2_instruments.get(sample_path) {
-        if inst.zone_count_hint() == 0 {
-            return PathKind::Sf2Empty;
-        }
-        let first_ok = inst
-            .first_zone_sample_id()
-            .map(|sid| p.samples.contains_key(&sid))
-            .unwrap_or(false);
-        if !first_ok {
-            return PathKind::Sf2MissingSamples;
-        }
-        return PathKind::Sf2;
-    }
-    PathKind::None
-}
-
-fn print_path_kinds(p: &Project) {
-    println!("\n=== part path classification ===");
-    let mut names: Vec<_> = p.parts.keys().cloned().collect();
-    names.sort();
-    for name in &names {
-        let part = &p.parts[name];
-        let notes = part.events.iter().filter(|e| !e.is_waypoint()).count();
-        if notes == 0 {
-            continue;
-        }
-        let kind = classify_path(p, &part.sample_path);
-        println!("  {:<40} notes={:<5} kind={:?}", name, notes, kind);
-    }
-}
-
-// ── deep per-part trace ───────────────────────────────────────────────
-
-fn print_per_part_trace(p: &Project) {
-    println!("\n=== per-part trace ===");
-    let mut names: Vec<_> = p.parts.keys().cloned().collect();
-    names.sort();
-    for name in &names {
-        let part = &p.parts[name];
-        let notes: Vec<&TrackscriptEvent> = part
-            .events
-            .iter()
-            .filter(|e| !e.is_waypoint())
-            .collect();
-        if notes.is_empty() {
-            continue;
-        }
-
-        println!("\n── part {:?} ──", name);
-        println!("   sample_path:   {:?}", part.sample_path);
-        println!("   subs_per_beat: {}", part.subs_per_beat);
-        println!(
-            "   events:        {} ({} notes)",
-            part.events.len(),
-            notes.len()
-        );
-
-        let kind = classify_path(p, &part.sample_path);
-        println!("   path_kind:     {:?}", kind);
-
-        match kind {
-            PathKind::None => {
-                println!("   >> no instrument matches this sample_path");
-            }
-            PathKind::Sf2Empty => {
-                println!("   >> sf2 sidecar loaded but has zero zones");
-            }
-            PathKind::Sf2MissingSamples => {
-                println!("   >> sf2 zones exist but their sample ids");
-                println!("   >> are not present in project.samples");
-            }
-            PathKind::Sf2 => trace_sf2(p, name, &notes),
-            PathKind::Vst => {
-                let inst = &p.vst_instruments[&part.sample_path];
-                println!("   vst iid:       {}", inst.iid);
-                println!("   vst name:      {:?}", inst.name);
-                println!("   vst path:      {}", inst.plugin_path.display());
-                println!("   vst state:     {} bytes", inst.state_bytes.len());
-                println!("   fallback:      {}", inst.fallback);
-                println!("   gain:          {}", inst.gain);
-                if let Some(first) = notes.first() {
-                    if let Some(k) = first.pitch_midi {
-                        println!("   first note:    key={} vol={:?}", k, first.vol);
-                    }
+fn detect_kind(p: &Path) -> Kind {
+    match p
+    .extension()
+    .and_then(|s| s.to_str())
+    .map(|s| s.to_ascii_lowercase())
+    .as_deref()
+    {
+        Some("flp") => Kind::Flp,
+        Some("trackscript") | Some("tsz") => Kind::Trackscript,
+        _ => {
+            // Fall back to magic sniffing so `test foo` on a renamed FLP
+            // still works.
+            if let Ok(bytes) = std::fs::read(p) {
+                if bytes.len() >= 4 && &bytes[..4] == b"FLhd" {
+                    return Kind::Flp;
                 }
             }
-            PathKind::Wav => {
-                let id = p.path_to_id[&part.sample_path];
-                let smp = &p.samples[&id];
-                println!("   sample id:     {}", id);
-                println!(
-                    "   sample:        {} frames @ {} Hz",
-                    smp.len(),
-                    smp.rate
-                );
-                println!("   stereo:        {}", smp.stereo);
-                println!("   loop_pts:      {:?}", smp.loop_pts);
-            }
-            PathKind::Multi => {
-                println!("   multi-sample instrument (routed via fidelity.json)");
-            }
+            Kind::Unknown
         }
     }
 }
 
-fn trace_sf2(p: &Project, part_name: &str, notes: &[&TrackscriptEvent]) {
-    let part = &p.parts[part_name];
-    let inst = &p.sf2_instruments[&part.sample_path];
+pub fn run(argv: &[String]) -> Result<()> {
+    let mut json = false;
+    let mut path: Option<PathBuf> = None;
 
-    let n_check = notes.len().min(8);
-    println!("   resolving first {} note(s):", n_check);
-    let mut resolved = 0usize;
-    let mut in_map = 0usize;
-    for (i, ev) in notes.iter().take(n_check).enumerate() {
-        let key = ev.pitch_midi.unwrap_or(60).clamp(0, 127) as u8;
-        let vel = ev
-            .vol
-            .map(|v| (v * 127.0 / 100.0).clamp(0.0, 127.0) as u8)
-            .unwrap_or(100);
-        let fp_cents = ev.fine_pitch.unwrap_or(0) as f64;
-
-        match inst.resolve(key, vel, fp_cents) {
-            Some(spec) => {
-                let ok = p.samples.contains_key(&spec.sample_id);
-                resolved += 1;
-                if ok {
-                    in_map += 1;
+    for a in argv {
+        match a.as_str() {
+            "--json" => json = true,
+            "-h" | "--help" => {
+                print_help();
+                return Ok(());
+            }
+            other if other.starts_with('-') => bail!("unknown flag: {other}"),
+            other => {
+                if path.is_some() {
+                    bail!("test takes at most one file (got extra: {other})");
                 }
-                println!(
-                    "     [{:>2}] key={:<3} vel={:<3} -> sid={:<6} hz={:>8.2} in_samples={}",
-                    i, key, vel, spec.sample_id, spec.pitch_hz, ok
-                );
-            }
-            None => {
-                println!(
-                    "     [{:>2}] key={:<3} vel={:<3} -> resolve() returned None",
-                    i, key, vel
-                );
+                path = Some(PathBuf::from(other));
             }
         }
     }
-    println!(
-        "   summary:       {}/{} resolved, {}/{} samples present",
-        resolved, n_check, in_map, n_check
-    );
+
+    let path = match path {
+        Some(p) => p,
+        None => bail!("test requires a file argument (try --help)"),
+    };
+    if !path.exists() {
+        bail!("no such file: {}", path.display());
+    }
+
+    match detect_kind(&path) {
+        Kind::Flp => test_flp(&path, json),
+        Kind::Trackscript => test_trackscript(&path),
+        Kind::Unknown => bail!(
+            "unrecognised file type: {} (expected .flp, .trackscript or .tsz)",
+                               path.display()
+        ),
+    }
 }
 
-// ── VST smoke ─────────────────────────────────────────────────────────
+fn print_help() {
+    println!("usage: trackscript-player test <file> [--json]");
+    println!();
+    println!("  Parse a source file and report why each channel does or");
+    println!("  does not convert.  Supported inputs: .flp, .trackscript, .tsz.");
+    println!();
+    println!("  --json    emit the report as a single JSON object");
+    println!();
+    println!("  Exit status is 1 if the probe finds missing dependencies.");
+}
 
-/// Instantiate every VST instrument with its state blob, play a note
-/// for one second, report peak.  A `SILENT` result means the plugin
-/// loaded but produced no audio — usually because it rejected the
-/// state blob (format mismatch, missing referenced file, or the state
-/// is empty because the original plugin was a fallback substitution).
-///
-/// Chdirs into the project directory before instantiating so that any
-/// relative paths inside the state (SF2 files, sample references) can
-/// be resolved by the plugin.
-fn smoke_vst_instruments(p: &Project, ts_path: &Path) -> Result<()> {
-    let original_cwd = std::env::current_dir()?;
-    let project_dir = ts_path.parent().unwrap_or(Path::new("."));
-    std::env::set_current_dir(project_dir)?;
+// ── FLP ────────────────────────────────────────────────────────────────
 
-    println!("\n=== vst instrument smoke (--smoke) ===");
-    println!("  sample_rate:   {}", SMOKE_SR);
-    println!("  block_size:    {}", SMOKE_BLOCK);
-    println!("  duration:      {} sec", SMOKE_SECONDS);
-    println!("  cwd:           {}", project_dir.display());
+fn test_flp(path: &Path, json: bool) -> Result<()> {
+    let prj = flp::parse_file(path)
+    .with_context(|| format!("parsing {}", path.display()))?;
 
-    let mut keys: Vec<_> = p.vst_instruments.keys().cloned().collect();
-    keys.sort();
-
-    if keys.is_empty() {
-        println!("  (no vst instruments to smoke)");
-        let _ = std::env::set_current_dir(original_cwd);
-        return Ok(());
+    if !json {
+        print_flp_header(path, &prj);
+        print_flp_channels(&prj);
+        print_flp_patterns(&prj);
+        print_flp_playlist(&prj);
     }
 
-    let total = SMOKE_SR as usize * SMOKE_SECONDS;
-    let blocks = total / SMOKE_BLOCK;
-
-    for key in &keys {
-        let inst = &p.vst_instruments[key];
-        let state_len = inst.state_bytes.len();
-        let plugin_path = inst.plugin_path.to_string_lossy().to_string();
-
-        let mut host = match VstHost::load(&plugin_path, &inst.state_bytes, SMOKE_SR) {
-            Ok(h) => h,
-            Err(e) => {
-                println!(
-                    "  {:<50} LOAD FAILED: {:#}",
-                    key, e
-                );
-                continue;
+    let opts = ConvertOptions::default();
+    let rep = match convert::probe_file(path, &opts) {
+        Ok(r) => r,
+        Err(e) => {
+            if json {
+                let obj = serde_json::json!({
+                    "file": path.display().to_string(),
+                                            "error": format!("{:#}", e),
+                });
+                println!("{}", serde_json::to_string(&obj)?);
+            } else {
+                println!();
+                println!("probe failed: {:#}", e);
             }
-        };
-
-        host.note_on(60, 100);
-        let mut l = vec![0f32; total];
-        let mut r = vec![0f32; total];
-        for b in 0..blocks {
-            if b == 30 {
-                host.note_off(60);
-            }
-            let off = b * SMOKE_BLOCK;
-            host.process(
-                &mut l[off..off + SMOKE_BLOCK],
-                &mut r[off..off + SMOKE_BLOCK],
-            );
+            std::process::exit(1);
         }
+    };
 
-        let peak = l
-            .iter()
-            .chain(r.iter())
-            .fold(0f32, |a, &b| a.max(b.abs()));
-        let rms = (l.iter().chain(r.iter()).map(|&s| s * s).sum::<f32>()
-            / (2 * total) as f32)
-            .sqrt();
-
-        let status = if peak < 1e-4 { "SILENT" } else { "ok" };
-        println!(
-            "  {:<50} state={:<6} peak={:.4} rms={:.4}  {}",
-            key, state_len, peak, rms, status
-        );
+    if json {
+        print_probe_json(path, &rep)?;
+    } else {
+        println!();
+        print_probe(&rep);
     }
 
-    let _ = std::env::set_current_dir(original_cwd);
+    if rep.problem_count() > 0 {
+        std::process::exit(1);
+    }
     Ok(())
 }
 
-// ── footer ────────────────────────────────────────────────────────────
-
-fn print_footer(smoke: bool) {
-    println!("\n=== legend ===");
-    println!("  path_kind values:");
-    println!("    Multi              routed via multi_sample_instruments");
-    println!("    Wav                direct sample via path_to_id");
-    println!("    Vst                VST3 sidecar");
-    println!("    Sf2                SF2 loaded, zones present, samples in map");
-    println!("    Sf2Empty           SF2 loaded but zero zones");
-    println!("    Sf2MissingSamples  zones exist, sample ids not in project.samples");
-    println!("    None               nothing matched the sample_path");
-    if !smoke {
-        println!();
-        println!("  Re-run with --smoke to also instantiate each VST instrument");
-        println!("  and report whether it produces audio from its state blob.");
+fn print_flp_header(path: &Path, prj: &flp::Project) {
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
+    println!("== {} ==", name);
+    println!(
+        "version {}   ppq {}   tempo {:.3}",
+        if prj.version.is_empty() { "?" } else { &prj.version },
+            prj.ppq,
+             prj.tempo,
+    );
+    if !prj.title.is_empty() {
+        println!("title   {}", prj.title);
     }
+    if !prj.author.is_empty() {
+        println!("author  {}", prj.author);
+    }
+    println!(
+        "{} channel(s), {} pattern(s), {} playlist item(s), {} insert(s)",
+             prj.channels.len(),
+             prj.patterns.len(),
+             prj.playlist.len(),
+             prj.inserts.len(),
+    );
+    if !prj.parse_warnings.is_empty() {
+        println!("parse warnings:");
+        for w in &prj.parse_warnings {
+            println!("  ! {}", w);
+        }
+    }
+    println!();
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+fn short_basename(p: &str) -> String {
+    if p.is_empty() {
+        return String::new();
+    }
+    let norm = p.replace('\\', "/");
+    let base = norm.rsplit('/').next().unwrap_or(&norm);
+    truncate(base, 32)
+}
+
+fn print_flp_channels(prj: &flp::Project) {
+    // Count notes per channel across all patterns.
+    let mut notes_per: std::collections::HashMap<u16, usize> =
+    std::collections::HashMap::new();
+    for p in &prj.patterns {
+        for n in &p.notes {
+            *notes_per.entry(n.channel).or_insert(0) += 1;
+        }
+    }
+
+    println!("channels:");
+    for c in &prj.channels {
+        let (state_sz, internal, vst) = match &c.plugin {
+            Some(p) => (
+                p.state_size,
+                p.internal_name.as_str(),
+                        p.vst_path.as_str(),
+            ),
+            None => (0, "", ""),
+        };
+        let notes = notes_per.get(&c.iid).copied().unwrap_or(0);
+        let enabled = match c.enabled {
+            Some(false) => " [disabled]",
+            _ => "",
+        };
+
+        let line = format!(
+            "  [{:>3}] {:<10} notes={:>5} state={:>8} {}",
+            c.iid,
+            c.channel_type,
+            notes,
+            state_sz,
+            truncate(if c.name.is_empty() { "<unnamed>" } else { &c.name }, 36),
+        );
+        println!("{}{}", line, enabled);
+
+        let mut extras: Vec<String> = Vec::new();
+        if !internal.is_empty() {
+            extras.push(format!("internal={}", truncate(internal, 24)));
+        }
+        if !vst.is_empty() {
+            extras.push(format!("vst={}", short_basename(vst)));
+        }
+        if !c.sample_path.is_empty() {
+            extras.push(format!("sample={}", short_basename(&c.sample_path)));
+        }
+        if !c.envelopes.is_empty() {
+            extras.push(format!("envs={}", c.envelopes.len()));
+        }
+        if !extras.is_empty() {
+            println!("        {}", extras.join("  "));
+        }
+    }
+    println!();
+}
+
+fn print_flp_patterns(prj: &flp::Project) {
+    if prj.patterns.is_empty() {
+        return;
+    }
+    println!("patterns:");
+    for p in &prj.patterns {
+        if p.notes.is_empty() {
+            continue;
+        }
+        let mut chans: Vec<u16> = p.notes.iter().map(|n| n.channel).collect();
+        chans.sort_unstable();
+        chans.dedup();
+        let name = if p.name.is_empty() { "<unnamed>" } else { &p.name };
+        println!(
+            "  [{:>3}] {:>5} note(s)  chans={:?}  {}",
+                 p.iid,
+                 p.notes.len(),
+                 chans,
+                 truncate(name, 32),
+        );
+    }
+    println!();
+}
+
+fn print_flp_playlist(prj: &flp::Project) {
+    if prj.playlist.is_empty() {
+        return;
+    }
+    let mut pats = 0usize;
+    let mut chans = 0usize;
+    for it in &prj.playlist {
+        match it.kind.as_str() {
+            "pattern" => pats += 1,
+            "channel" => chans += 1,
+            _ => {}
+        }
+    }
+    println!(
+        "playlist: {} item(s) ({} pattern clip(s), {} channel clip(s))",
+             prj.playlist.len(),
+             pats,
+             chans,
+    );
+    let show = prj.playlist.len().min(8);
+    for it in prj.playlist.iter().take(show) {
+        println!(
+            "    pos={:>7} len={:>6} kind={:<8} ref={}",
+            it.position, it.length, it.kind, it.ref_id,
+        );
+    }
+    if prj.playlist.len() > show {
+        println!("    … {} more", prj.playlist.len() - show);
+    }
+    println!();
+}
+
+// ── trackscript ────────────────────────────────────────────────────────
+
+fn test_trackscript(path: &Path) -> Result<()> {
+    // Text-based inspection only for now; not attempting to load it into
+    // the audio engine.
+    let text = std::fs::read_to_string(path)
+    .with_context(|| format!("reading {}", path.display()))?;
+
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
+    println!("== {} ==", name);
+
+    let mut lines = text.lines();
+    let mut header_count = 0usize;
+    for line in lines.by_ref() {
+        if line.starts_with("//") || line.trim().is_empty() {
+            continue;
+        }
+        println!("  {}", line);
+        header_count += 1;
+        if header_count >= 12 {
+            break;
+        }
+    }
+    let remaining = lines.count();
+    println!("  … {} more line(s)", remaining);
+    println!();
+    println!("note: full trackscript diagnostics are not implemented yet.");
+    Ok(())
+}
+
+// ── probe report printing ──────────────────────────────────────────────
+
+fn kind_label(k: DepKind) -> &'static str {
+    match k {
+        DepKind::Sample => "sample",
+        DepKind::Plugin => "plugin",
+        DepKind::Sf2 => "sf2",
+        DepKind::Unknown => "?",
+    }
+}
+
+fn print_probe(rep: &ProbeReport) {
+    if rep.is_clean() && rep.fallbacks.is_empty() {
+        println!("probe: clean");
+        return;
+    }
+
+    println!("probe:");
+    for m in &rep.missing {
+        println!(
+            "  [{:>3}] {:<6} {:<28} {}",
+            m.channel_iid,
+            kind_label(m.kind),
+                 truncate(&m.channel_name, 28),
+                 m.reason,
+        );
+    }
+    for f in &rep.fallbacks {
+        println!(
+            "  [{:>3}] fallback {} -> {} ({})",
+                 f.channel_iid,
+                 f.replaces,
+                 f.used,
+                 if f.resolved { "resolved" } else { "MISSING" },
+        );
+    }
+    for w in &rep.warnings {
+        println!("  note: {}", w);
+    }
+}
+
+fn print_probe_json(path: &Path, rep: &ProbeReport) -> Result<()> {
+    let obj = serde_json::json!({
+        "file": path.display().to_string(),
+                                "missing": rep.missing.iter().map(|m| serde_json::json!({
+                                    "channel": m.channel_iid,
+                                    "name":    m.channel_name,
+                                    "kind":    kind_label(m.kind),
+                                                                                        "reason":  m.reason,
+                                })).collect::<Vec<_>>(),
+                                "fallbacks": rep.fallbacks.iter().map(|f| serde_json::json!({
+                                    "channel":  f.channel_iid,
+                                    "replaces": f.replaces,
+                                    "used":     f.used,
+                                    "resolved": f.resolved,
+                                })).collect::<Vec<_>>(),
+                                "warnings": rep.warnings,
+    });
+    println!("{}", serde_json::to_string(&obj)?);
+    Ok(())
 }

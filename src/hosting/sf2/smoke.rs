@@ -5,9 +5,9 @@
 use anyhow::{bail, Result};
 use std::path::Path;
 
-use crate::sf2_engine::Sf2Engine;
+use crate::hosting::sf2::engine::Sf2Engine;
 
-const SR: u32 = 44100;
+const DEFAULT_SR: u32 = 44100;
 const SECS: usize = 2;
 const BLOCK: usize = 512;
 
@@ -15,13 +15,14 @@ pub fn run(argv: &[String]) -> Result<()> {
     let Some(path) = argv.first() else {
         bail!(
             "usage: trackscript-player sf2-smoke <file.sf2> \
-[--bank N] [--patch N] [--note N] [--list] [--out FILE.wav]"
+[--bank N] [--patch N] [--note N] [--rate N] [--list] [--out FILE.wav]"
         );
     };
 
     let mut bank: u8 = 0;
     let mut patch: u8 = 0;
     let mut note: u8 = 60;
+    let mut sr: u32 = DEFAULT_SR;
     let mut out: Option<String> = None;
     let mut list = false;
 
@@ -31,14 +32,15 @@ pub fn run(argv: &[String]) -> Result<()> {
             "--bank"  => { bank  = argv[i + 1].parse()?; i += 2; }
             "--patch" => { patch = argv[i + 1].parse()?; i += 2; }
             "--note"  => { note  = argv[i + 1].parse()?; i += 2; }
+            "--rate"  => { sr    = argv[i + 1].parse()?; i += 2; }
             "--out"   => { out = Some(argv[i + 1].clone()); i += 2; }
             "--list"  => { list = true; i += 1; }
             other => bail!("unknown flag: {other}"),
         }
     }
 
-    println!("loading {path}");
-    let mut eng = Sf2Engine::new(SR);
+    println!("loading {path} (engine {sr} Hz)");
+    let mut eng = Sf2Engine::new(sr);
     eng.load(Path::new(path))?;
 
     let presets = eng.list_presets();
@@ -61,7 +63,7 @@ pub fn run(argv: &[String]) -> Result<()> {
         eprintln!("warning: bank {} patch {} not found; will be silent", bank, patch);
     }
 
-    let total = SR as usize * SECS;
+    let total = sr as usize * SECS;
     let mut l = vec![0.0f32; total];
     let mut r = vec![0.0f32; total];
 
@@ -69,7 +71,7 @@ pub fn run(argv: &[String]) -> Result<()> {
 
     let mut b = 0usize;
     while b + BLOCK <= total {
-        if b == SR as usize / 2 {
+        if b == sr as usize / 2 {
             eng.note_off(note);
         }
         eng.process(&mut l[b..b + BLOCK], &mut r[b..b + BLOCK]);
@@ -78,12 +80,12 @@ pub fn run(argv: &[String]) -> Result<()> {
 
     let peak = l.iter().chain(r.iter()).fold(0f32, |a, x| a.max(x.abs()));
     let rms = (l
-    .iter()
-    .chain(r.iter())
-    .map(|x| x * x)
-    .sum::<f32>()
-    / (2 * total) as f32)
-    .sqrt();
+        .iter()
+        .chain(r.iter())
+        .map(|x| x * x)
+        .sum::<f32>()
+        / (2 * total) as f32)
+        .sqrt();
     println!("peak: {peak:.4}   rms: {rms:.4}");
     if peak < 1e-4 {
         eprintln!("SILENT — engine loaded but produced no audio");
@@ -91,7 +93,7 @@ pub fn run(argv: &[String]) -> Result<()> {
     }
 
     if let Some(out_path) = out {
-        write_wav(&out_path, &l, &r, SR)?;
+        write_wav(&out_path, &l, &r, sr)?;
         println!("wrote {out_path}");
     }
 

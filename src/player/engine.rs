@@ -5,13 +5,14 @@ use std::f64::consts::{FRAC_PI_4, PI};
 use std::sync::{Arc, OnceLock};
 
 use crate::effects::EffectChain;
-use crate::sf2_engine::Sf2Engine;
-use crate::sources::trackscript::C5_HZ;
+use crate::hosting::sf2::engine::Sf2Engine;
+use crate::formats::trackscript::C5_HZ;
 use crate::timing::AutomationLane;
 use crate::mixer::mute;
-use crate::vst_host_ffi::VstHost;
+use crate::hosting::vst::ffi::VstHost;
 
 use super::project::{Project, Sample, Sf2VoiceEnvelope};
+use super::inserts;
 
 // ── scheduled sample voice ─────────────────────────────────────────────
 
@@ -241,6 +242,12 @@ pub(crate) struct Engine {
     pending: VecDeque<Scheduled>,
     active: Vec<Active>,
 
+
+    insert_chains: BTreeMap<u8, inserts::InsertChain>,
+    channel_to_insert: BTreeMap<u16, u8>,
+    insert_scratch: BTreeMap<u8, (Vec<f32>, Vec<f32>)>,
+    sf2_scratch: BTreeMap<u16, (Vec<f32>, Vec<f32>)>,
+
     hosts: BTreeMap<u16, VstHost>,
     host_scratch: BTreeMap<u16, (Vec<f32>, Vec<f32>)>,
     vst_gains: BTreeMap<u16, f32>,
@@ -291,8 +298,23 @@ impl Engine {
             vst_hist_l: vec![0.0; hist_len],
             vst_hist_r: vec![0.0; hist_len],
             vst_hist_head: i64::MIN,
+            insert_chains: BTreeMap::new(),
+            channel_to_insert: BTreeMap::new(),
+            insert_scratch: BTreeMap::new(),
+            sf2_scratch: BTreeMap::new(),
             master_fx: None,
         }
+    }
+
+    pub(crate) fn install_insert_chain(&mut self, insert: u8, chain: inserts::InsertChain) {
+        self.insert_chains.insert(insert, chain);
+        self.insert_scratch
+        .entry(insert)
+        .or_insert_with(|| (vec![0.0; VST_BLOCK as usize], vec![0.0; VST_BLOCK as usize]));
+    }
+
+    pub(crate) fn set_channel_insert(&mut self, iid: u16, insert: u8) {
+        self.channel_to_insert.insert(iid, insert);
     }
 
     pub(crate) fn install_host(&mut self, iid: u16, host: VstHost) {
@@ -733,7 +755,6 @@ impl Engine {
 
     fn render_vsts(&mut self, out_l: &mut [f32], out_r: &mut [f32], block_start: i64) {
         let block_len = out_l.len() as i64;
-        let mut chunk_start = block_start;
         let block_end = block_start + block_len;
 
         let Self {
@@ -748,125 +769,166 @@ impl Engine {
             vst_hist_l,
             vst_hist_r,
             sf2_engines,
+            insert_chains,
+            channel_to_insert,
+            insert_scratch,
+            sf2_scratch,
             ..
         } = self;
 
-        let mut events: Vec<(i32, u8, u16, u8, u8)> = Vec::new();
+        for buf in insert_scratch.values_mut() {
+            if buf.0.len() < VST_BLOCK as usize {
+                buf.0.resize(VST_BLOCK as usize, 0.0);
+                buf.1.resize(VST_BLOCK as usize, 0.0);
+            }
+        }
 
+        let mut chunk_start = block_start;
         while chunk_start < block_end {
-            let chunk_len =
-            ((block_end - chunk_start) as usize).min(VST_BLOCK as usize);
+            let chunk_len = ((block_end - chunk_start) as usize).min(VST_BLOCK as usize);
             let chunk_end = chunk_start + chunk_len as i64;
-            events.clear();
+            let mut events: Vec<(i32, u8, u16, u8, u8)> = Vec::new();
 
-            // Note-ons due in this chunk.
-            while vst_pending
-                .front()
-                .map_or(false, |n| n.start < chunk_end)
-                {
-                    let n = vst_pending.pop_front().unwrap();
-                    if !mute::is_note_active(&n.part_path, n.line as usize, n.source_row as i64) {
-                        continue;
-                    }
-                    let off = (n.start - chunk_start).max(0) as i32;
-                    if let Some(i) = vst_active
-                        .iter()
-                        .position(|a| a.iid == n.iid && a.note == n.note)
-                        {
-                            vst_active.remove(i);
-                            events.push((off, 0, n.iid, n.note, 0));
-                        }
-                        events.push((off, 1, n.iid, n.note, n.velocity));
-                    vst_active.push(n);
+            while vst_pending.front().map_or(false, |n| n.start < chunk_end) {
+                let n = vst_pending.pop_front().unwrap();
+                if !crate::mixer::mute::is_note_active(&n.part_path, n.line as usize, n.source_row as i64) {
+                    continue;
                 }
+                let off = (n.start - chunk_start).max(0) as i32;
+                if let Some(i) = vst_active.iter().position(|a| a.iid == n.iid && a.note == n.note) {
+                    vst_active.remove(i);
+                    events.push((off, 0, n.iid, n.note, 0));
+                }
+                events.push((off, 1, n.iid, n.note, n.velocity));
+                vst_active.push(n);
+            }
 
-                // Note-offs due in this chunk.
-                let mut i = 0;
-                while i < vst_active.len() {
-                    if vst_active[i].end < chunk_end {
-                        let n = vst_active.remove(i);
-                        let off = (n.end - chunk_start).max(0) as i32;
-                        events.push((off, 0, n.iid, n.note, 0));
+            let mut i = 0;
+            while i < vst_active.len() {
+                if vst_active[i].end < chunk_end {
+                    let n = vst_active.remove(i);
+                    let off = (n.end - chunk_start).max(0) as i32;
+                    events.push((off, 0, n.iid, n.note, 0));
+                } else {
+                    i += 1;
+                }
+            }
+
+            events.sort_by_key(|e| (e.0, e.1));
+            for &(off, kind, iid, note, vel) in &events {
+                if let Some(host) = hosts.get_mut(&iid) {
+                    let bit = 1u128 << (note.min(127) as u32);
+                    let held = vst_held.entry(iid).or_insert(0);
+                    if kind == 1 {
+                        host.note_on_at(note, vel, off);
+                        *held |= bit;
                     } else {
-                        i += 1;
+                        host.note_off_at(note, off);
+                        *held &= !bit;
+                    }
+                } else if let Some(eng) = sf2_engines.get_mut(&iid) {
+                    if kind == 1 {
+                        eng.note_on_at(note, vel, off);
+                    } else {
+                        eng.note_off_at(note, off);
                     }
                 }
+            }
 
-                events.sort_by_key(|e| (e.0, e.1));
-                for &(off, kind, iid, note, vel) in &events {
-                    if let Some(host) = hosts.get_mut(&iid) {
-                        let bit = 1u128 << (note.min(127) as u32);
-                        let held = vst_held.entry(iid).or_insert(0);
-                        if kind == 1 {
-                            host.note_on_at(note, vel, off);
-                            *held |= bit;
-                        } else {
-                            host.note_off_at(note, off);
-                            *held &= !bit;
+            // Zero master scratch.
+            for s in vst_scratch_l[..chunk_len].iter_mut() { *s = 0.0; }
+            for s in vst_scratch_r[..chunk_len].iter_mut() { *s = 0.0; }
+
+            // Zero insert scratches.
+            for buf in insert_scratch.values_mut() {
+                for s in buf.0[..chunk_len].iter_mut() { *s = 0.0; }
+                for s in buf.1[..chunk_len].iter_mut() { *s = 0.0; }
+            }
+
+            // Channel VSTs.
+            for (iid, host) in hosts.iter_mut() {
+                let Some((tl, tr)) = host_scratch.get_mut(iid) else { continue };
+                for s in tl[..chunk_len].iter_mut() { *s = 0.0; }
+                for s in tr[..chunk_len].iter_mut() { *s = 0.0; }
+                host.process(&mut tl[..chunk_len], &mut tr[..chunk_len]);
+
+                let gain = vst_gains.get(iid).copied().unwrap_or(1.0);
+                let insert = channel_to_insert.get(iid).copied();
+
+                match insert.and_then(|ins| insert_scratch.get_mut(&ins)) {
+                    Some(buf) => {
+                        for j in 0..chunk_len {
+                            buf.0[j] += tl[j] * gain;
+                            buf.1[j] += tr[j] * gain;
                         }
-                    } else if let Some(eng) = sf2_engines.get_mut(&iid) {
-                        // sfl2 has no sample-offset argument, so SF2 notes
-                        // land at the chunk boundary.  512 frames at 44.1 kHz
-                        // is ≤ 11.6 ms, well within tracker timing tolerance.
-                        if kind == 1 {
-                            eng.note_on(note, vel);
-                        } else {
-                            eng.note_off(note);
+                    }
+                    None => {
+                        for j in 0..chunk_len {
+                            vst_scratch_l[j] += tl[j] * gain;
+                            vst_scratch_r[j] += tr[j] * gain;
                         }
                     }
                 }
+            }
 
-                for s in vst_scratch_l[..chunk_len].iter_mut() {
-                    *s = 0.0;
+            // SF2 engines.
+            for (iid, eng) in sf2_engines.iter_mut() {
+                let (sl, sr) = sf2_scratch
+                .entry(*iid)
+                .or_insert_with(|| (vec![0.0; VST_BLOCK as usize], vec![0.0; VST_BLOCK as usize]));
+                if sl.len() < chunk_len {
+                    sl.resize(chunk_len, 0.0);
+                    sr.resize(chunk_len, 0.0);
                 }
-                for s in vst_scratch_r[..chunk_len].iter_mut() {
-                    *s = 0.0;
-                }
+                for s in sl[..chunk_len].iter_mut() { *s = 0.0; }
+                for s in sr[..chunk_len].iter_mut() { *s = 0.0; }
+                eng.process(&mut sl[..chunk_len], &mut sr[..chunk_len]);
 
-                for (iid, host) in hosts.iter_mut() {
-                    let Some((tl, tr)) = host_scratch.get_mut(iid) else { continue };
-                    for s in tl[..chunk_len].iter_mut() { *s = 0.0; }
-                    for s in tr[..chunk_len].iter_mut() { *s = 0.0; }
-                    host.process(&mut tl[..chunk_len], &mut tr[..chunk_len]);
-
-                    let gain = vst_gains.get(iid).copied().unwrap_or(1.0);
-
-                    let slot = *iid as usize;
-                    for j in 0..chunk_len {
-                        let mono = (tl[j] + tr[j]) * 0.5 * gain;
-                        crate::player::scope::scope_push(slot, mono);
+                let insert = channel_to_insert.get(iid).copied();
+                match insert.and_then(|ins| insert_scratch.get_mut(&ins)) {
+                    Some(buf) => {
+                        for j in 0..chunk_len {
+                            buf.0[j] += sl[j];
+                            buf.1[j] += sr[j];
+                        }
                     }
-                    for j in 0..chunk_len {
-                        vst_scratch_l[j] += tl[j] * gain;
-                        vst_scratch_r[j] += tr[j] * gain;
-                    }
-                }
-
-                if !vst_hist_l.is_empty() {
-                    for j in 0..chunk_len {
-                        let pos = chunk_start + j as i64;
-                        let idx = pos.rem_euclid(vst_hist_l.len() as i64) as usize;
-                        vst_hist_l[idx] = vst_scratch_l[j];
-                        vst_hist_r[idx] = vst_scratch_r[j];
+                    None => {
+                        for j in 0..chunk_len {
+                            vst_scratch_l[j] += sl[j];
+                            vst_scratch_r[j] += sr[j];
+                        }
                     }
                 }
+            }
 
-                let out_off = (chunk_start - block_start) as usize;
+            // Insert chains.
+            for (&insert, chain) in insert_chains.iter_mut() {
+                if chain.is_empty() { continue; }
+                if let Some(buf) = insert_scratch.get_mut(&insert) {
+                    chain.process(&mut buf.0[..chunk_len], &mut buf.1[..chunk_len]);
+                    for j in 0..chunk_len {
+                        vst_scratch_l[j] += buf.0[j];
+                        vst_scratch_r[j] += buf.1[j];
+                    }
+                }
+            }
+
+            let out_off = (chunk_start - block_start) as usize;
+            for j in 0..chunk_len {
+                out_l[out_off + j] += vst_scratch_l[j];
+                out_r[out_off + j] += vst_scratch_r[j];
+            }
+
+            if !vst_hist_l.is_empty() {
                 for j in 0..chunk_len {
-                    out_l[out_off + j] += vst_scratch_l[j];
-                    out_r[out_off + j] += vst_scratch_r[j];
+                    let pos = chunk_start + j as i64;
+                    let idx = pos.rem_euclid(vst_hist_l.len() as i64) as usize;
+                    vst_hist_l[idx] = vst_scratch_l[j];
+                    vst_hist_r[idx] = vst_scratch_r[j];
                 }
+            }
 
-                // SF2 engines add their output directly (they own the
-                // voice-scratch and pan/stereo internally).
-                for eng in sf2_engines.values_mut() {
-                    eng.process(
-                        &mut out_l[out_off..out_off + chunk_len],
-                        &mut out_r[out_off..out_off + chunk_len],
-                    );
-                }
-
-                chunk_start = chunk_end;
+            chunk_start = chunk_end;
         }
     }
 

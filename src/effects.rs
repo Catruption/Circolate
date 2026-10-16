@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-use crate::vst_host_ffi::VstHost;
+use crate::hosting::vst::ffi::VstHost;
 
 #[derive(Debug, Deserialize)]
 struct Config {

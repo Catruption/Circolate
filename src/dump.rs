@@ -13,7 +13,7 @@
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
-use crate::sources::{self, SourceKind};
+use crate::formats::{self, SourceKind};
 
 pub fn run(argv: &[String]) -> Result<()> {
     let mut path_arg: Option<&str> = None;
@@ -49,7 +49,7 @@ pub fn run(argv: &[String]) -> Result<()> {
 
     match SourceKind::from_path(path)? {
         SourceKind::Flp => {
-            let prj = sources::flp::parse_file(path)?;
+            let prj = formats::flp::parse_file(path)?;
 
             if raw_events {
                 for (ev, raw) in &prj.events {
@@ -74,15 +74,15 @@ pub fn run(argv: &[String]) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&prj)?);
         }
         SourceKind::It => {
-            let module = sources::it::parse_file(path)?;
+            let module = formats::it::parse_file(path)?;
             println!("{}", serde_json::to_string_pretty(&module)?);
         }
         SourceKind::Trackscript => {
-            let parsed = crate::sources::trackscript::parse_file(path)?;
+            let parsed = crate::formats::trackscript::parse_file(path)?;
             println!("{}", serde_json::to_string_pretty(&parsed)?);
         }
         SourceKind::Midi => {
-            let mf = sources::midi::parse_file(path)?;
+            let mf = formats::midi::parse_file(path)?;
             let out = serde_json::json!({
                 "ppq": mf.ppq,
                 "time_sig": [mf.time_sig.0, mf.time_sig.1],
@@ -114,7 +114,7 @@ fn states_dir_for(src: &Path) -> PathBuf {
     src.with_file_name(stem)
 }
 
-fn write_flp_states(prj: &sources::flp::Project, dir: &Path) -> Result<usize> {
+fn write_flp_states(prj: &formats::flp::Project, dir: &Path) -> Result<usize> {
     std::fs::create_dir_all(dir)
     .with_context(|| format!("creating {}", dir.display()))?;
 

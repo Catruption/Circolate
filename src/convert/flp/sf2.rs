@@ -23,12 +23,34 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::formats::flp::Plugin;
+
 pub(super) struct SfState {
     pub path: String,
-    /// MIDI bank.  FL stores drum kits on bank 128, melodic on bank 0.
     pub bank: u32,
-    /// Patch within the bank.
     pub preset: u32,
+}
+
+/// True when the plugin is one of FL's SoundFont players.
+///
+/// Used by `classify.rs` to gate the byte-scan for a `.sf2` marker.
+/// Without this gate, any synth whose state blob happens to contain the
+/// four bytes `.sf2` (a preset name, a path fragment, a wavetable label)
+/// was misrouted into the SF2 path and its channel went silent.  Match
+/// on the plugin's declared identity, not on the contents of its state.
+pub(super) fn is_sf2_player(p: &Plugin) -> bool {
+    let norm = |s: &str| s.to_ascii_lowercase();
+    let i = norm(&p.internal_name);
+    let d = norm(&p.display_name);
+    let hit = |s: &str| {
+        s.contains("soundfont")
+            || s.contains("sf2 player")
+            || s.contains("sf2player")
+            || s == "sflt"
+            || s.starts_with("sflt")
+            || s.contains("sflt ")
+    };
+    hit(&i) || hit(&d)
 }
 
 fn normalize_sf2_key(s: &str) -> String {
@@ -48,34 +70,27 @@ fn normalize_sf2_key(s: &str) -> String {
         .collect()
 }
 
-/// Find the position one past a case-insensitive `.sf2` marker.
 fn find_sf2_marker(state: &[u8]) -> Option<usize> {
     let low: Vec<u8> = state.iter().map(|b| b.to_ascii_lowercase()).collect();
     let pos = low.windows(4).position(|w| w == b".sf2")?;
     Some(pos + 4)
 }
 
-/// Start of the SFLT path: the first `s` where the u32 just before it
-/// equals the byte count from `s` up to and including ".sf2", and every
-/// byte in between could belong to a path (anything printable; bytes
-/// >= 0x80 are allowed so non-ASCII user names do not break parsing).
 fn sflt_path_start(state: &[u8], at: usize) -> Option<usize> {
     if at > state.len() {
         return None;
     }
     (4..at).find(|&s| {
         let prefix = u32::from_le_bytes([
-            state[s - 4], state[s - 3], state[s - 2], state[s - 1],
+            state[s - 4],
+            state[s - 3],
+            state[s - 2],
+            state[s - 1],
         ]);
-        prefix as usize == at - s
-            && state[s..at].iter().all(|&b| b >= 0x20 && b != 0x7f)
+        prefix as usize == at - s && state[s..at].iter().all(|&b| b >= 0x20 && b != 0x7f)
     })
 }
 
-/// SFLT layout.  u32 length prefix; the value equals the number of
-/// bytes from the byte after the prefix up to and including `.sf2`.
-/// Bank and preset pack into one little-endian u32 immediately after
-/// the path.
 fn try_sflt(state: &[u8], at: usize) -> Option<SfState> {
     let s = sflt_path_start(state, at)?;
     let path = String::from_utf8_lossy(&state[s..at]).into_owned();
@@ -87,15 +102,9 @@ fn try_sflt(state: &[u8], at: usize) -> Option<SfState> {
     Some(SfState { path, bank, preset })
 }
 
-/// Fruity SoundFont Player layout.  u8 length prefix; the path is the
-/// next `len` bytes (ASCII, Windows backslashes).  Preset is an LE u32
-/// at a fixed offset (21) inside the 27-byte trailer that follows the
-/// path.  Bank is implicitly 0 — FSP has no bank parameter, only a
-/// patch selector.
 fn try_fruity(state: &[u8], at: usize) -> Option<SfState> {
     let mut path_start: Option<usize> = None;
     for p in 0..at {
-        // Need at least one byte of path before the marker.
         if p + 1 >= at {
             break;
         }
@@ -114,27 +123,14 @@ fn try_fruity(state: &[u8], at: usize) -> Option<SfState> {
     let s = path_start?;
     let path = String::from_utf8_lossy(&state[s..at]).into_owned();
 
-    // Preset sits at a fixed offset inside the trailer.  Verify the
-    // bytes are available before reading.
     let preset_at = at + 21;
-    let preset = u32::from_le_bytes(
-        state.get(preset_at..preset_at + 4)?.try_into().ok()?,
-    );
-
-    // FSP presets are 0..=127 in the melodic range.  A value outside
-    // that suggests we matched a false positive; bail rather than
-    // route a bogus preset into the SF2 reader.
+    let preset = u32::from_le_bytes(state.get(preset_at..preset_at + 4)?.try_into().ok()?);
     if preset > 127 {
         return None;
     }
-
     Some(SfState { path, bank: 0, preset })
 }
 
-/// Parse an FL SoundFont player state blob.  Tries both known layouts
-/// and returns whichever one validates.  Emits a hex + ASCII dump when
-/// `FLP_DEBUG` is set, so unrecognised layouts can be inspected
-/// without another rebuild.
 pub(super) fn parse_sf2_state(state: &[u8]) -> Option<SfState> {
     let debug = std::env::var_os("FLP_DEBUG").is_some();
 
@@ -196,8 +192,6 @@ fn collect_sf2(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Look up the SF2 by the stem of the path stored in the state first,
-/// then by channel name.  Searches six levels deep under each dir.
 pub(super) fn find_sf2(st: Option<&SfState>, chan_name: &str, dirs: &[&Path]) -> Option<PathBuf> {
     let debug = std::env::var_os("FLP_DEBUG").is_some();
 
@@ -205,13 +199,11 @@ pub(super) fn find_sf2(st: Option<&SfState>, chan_name: &str, dirs: &[&Path]) ->
     if let Some(st) = st {
         let base = st.path.rsplit(|c| c == '\\' || c == '/').next().unwrap_or("");
         let stem = base.rsplit_once('.').map_or(base, |(a, _)| a);
-        // The stored file name is the real signal, however short ("gm").
         let k = normalize_sf2_key(stem);
         if !k.is_empty() {
             keys.push(k);
         }
     }
-    // Channel names are noisy ("SFLT #3"), so only trust longer ones.
     let name_key = normalize_sf2_key(chan_name);
     if name_key.len() >= 4 {
         keys.push(name_key);
@@ -219,12 +211,8 @@ pub(super) fn find_sf2(st: Option<&SfState>, chan_name: &str, dirs: &[&Path]) ->
 
     let mut files = Vec::new();
     for d in dirs {
-        // Depth from each search root.  soundfonts/github-collection/SF2/GM/
-        // is four levels down from the pool root, so 3 misses the GM banks.
         collect_sf2(d, 6, &mut files);
     }
-    // read_dir order is arbitrary; sort so duplicates (e.g. "X.sf2" and
-    // "X_.sf2") always resolve the same way.
     files.sort();
     files.dedup();
 

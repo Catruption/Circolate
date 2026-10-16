@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::sf2::{attenuation_cb_to_linear, timecents_to_secs, Sf2File};
-use crate::sources::trackscript::C5_HZ;
+use crate::formats::sf2::{attenuation_cb_to_linear, timecents_to_secs, Sf2File};
+use crate::formats::trackscript::C5_HZ;
 
 // ── samples ────────────────────────────────────────────────────────────
 

@@ -3,68 +3,112 @@
 //! `.instrument` and `.state` sidecars that the player reads back.
 
 use anyhow::Result;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::convert::AuxFile;
-use crate::fallbacks::FallbackTable;
-use crate::plugins::PluginIndex;
-use crate::sources::flp::{self as flp_src, Channel};
+use crate::deps::index::PluginIndex;
+use crate::deps::registry::{RegistryTable, Resolution};
+use crate::formats::flp::{self as flp_src, Channel};
 
 /// What resolution ended up choosing for one channel.
 pub(super) enum Resolved {
     /// Exact plugin found installed.  Load original state.
     Exact { name: String, path: PathBuf },
-    /// Fallback substituted.  Do not load original state.  `gain` is a
-    /// linear trim applied to the plugin's *audio output* so a
-    /// replacement synth's default patch doesn't drown the mix.  The
-    /// player applies this after the plugin runs, since many synths
-    /// ignore MIDI velocity entirely.
+    /// Fallback substituted.  Do not load original state.
     Fallback { name: String, path: Option<PathBuf>, replaces: String, gain: f32 },
     /// Nothing found, no fallback.  Channel is dead.
     Unresolved { name: String },
 }
 
-pub(super) fn resolve_plugin(
-    plugin: &flp_src::Plugin,
-    index: &PluginIndex,
-    fallbacks: Option<&FallbackTable>,
-) -> Resolved {
-    let display = if !plugin.display_name.is_empty() {
+/// Canonical user-facing name.  MUST match what `extract_inserts` uses
+/// so the two never disagree about which plugin a channel is.
+pub(super) fn canonical_name(plugin: &flp_src::Plugin) -> String {
+    if !plugin.display_name.is_empty() {
         plugin.display_name.clone()
     } else {
         plugin.internal_name.clone()
+    }
+}
+
+/// Candidate index keys, in priority order.  FL stores the friendly
+/// preset name in `display_name`, the wrapper name in `internal_name`,
+/// and the actual binary path in `vst_path`.  The plugin index matches
+/// on the binary stem, so try all three, plus the usual
+/// `_x64`/`_64`/`x64` suffix strips.
+fn name_candidates(plugin: &flp_src::Plugin) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |s: &str| {
+        let s = s.trim();
+        if !s.is_empty() && !out.iter().any(|x| x == s) {
+            out.push(s.to_string());
+        }
     };
 
-    if let Some(path) = index.find_vst3(&display) {
-        return Resolved::Exact { name: display, path: path.clone() };
-    }
+    push(&plugin.display_name);
+    push(&plugin.internal_name);
 
-    if let Some(table) = fallbacks {
-        if let Some((_m, target)) = table.resolve(&plugin.vst_path, &display) {
-            let target_path = index.find_vst3(&target.name).cloned();
-            return Resolved::Fallback {
-                name: target.name.clone(),
-                path: target_path,
-                replaces: display,
-                gain: target.gain,
-            };
+    if !plugin.vst_path.is_empty() {
+        let p = Path::new(&plugin.vst_path);
+        if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+            push(stem);
+            for suffix in ["_x64", "_64", "x64", "64", "_vst3", "_vst"] {
+                if let Some(stripped) = stem.strip_suffix(suffix) {
+                    push(stripped);
+                }
+            }
+        }
+        if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+            push(name);
+        }
+    }
+    out
+}
+
+pub(super) fn resolve_plugin(
+    plugin: &flp_src::Plugin,
+    index: &PluginIndex,
+    registry: Option<&RegistryTable>,
+) -> Resolved {
+    let canonical = canonical_name(plugin);
+
+    // Search every plugin format (VST3, VST2, LV2, CLAP) by file stem.
+    // A Windows path in the FLP like `...\Foo.dll` reduces to the stem
+    // `Foo`; if anything named `Foo` is installed anywhere on this
+    // machine, use it.
+    for candidate in name_candidates(plugin) {
+        if let Some(path) = index.find_any(&candidate) {
+            return Resolved::Exact { name: candidate, path: path.clone() };
         }
     }
 
-    if let Some(table) = fallbacks {
-        let rule = table.default_rule();
-        if let Some(target) = &rule.fallback {
-            let target_path = index.find_vst3(&target.name).cloned();
-            return Resolved::Fallback {
-                name: target.name.clone(),
-                path: target_path,
-                replaces: display,
-                gain: target.gain,
-            };
-        }
+    // Nothing installed by that name.  Consult the registry.
+    if let Some(table) = registry {
+        return match table.resolve_instrument(index, &canonical) {
+            Resolution::Exact { name, path } => Resolved::Exact { name, path },
+            Resolution::Fallback { name, path, replaces, gain } => {
+                Resolved::Fallback { name, path: Some(path), replaces, gain }
+            }
+            Resolution::FallbackMissing { name, replaces } => {
+                Resolved::Fallback { name, path: None, replaces, gain: 1.0 }
+            }
+            Resolution::NativeArtifact { name, path, replaces, gain } => {
+                // Shouldn't happen for instruments — native effects only.
+                // Treat as a substitute that has a concrete artifact.
+                Resolved::Fallback { name, path: Some(path), replaces, gain }
+            }
+            Resolution::NativeMissing { replaces, .. } => {
+                Resolved::Unresolved {
+                    name: format!("{} (native model not profiled)", replaces),
+                }
+            }
+            Resolution::Skipped { note } => {
+                Resolved::Unresolved { name: format!("{} ({})", canonical, note) }
+            }
+            Resolution::NoMatch => Resolved::Unresolved { name: canonical },
+        };
     }
 
-    Resolved::Unresolved { name: display }
+    Resolved::Unresolved { name: canonical }
 }
 
 pub(super) fn vst_sidecar(
@@ -97,9 +141,6 @@ pub(super) fn vst_sidecar(
             }
             lines.push(format!("    Replaces: '{}';", replaces));
             lines.push("    Fallback: true;".to_string());
-            // Post-plugin output trim.  Applied by the engine after the
-            // VST has run, so it works even on patches that ignore
-            // velocity or that set their own internal gain.
             lines.push(format!("    Gain: {};", gain));
         }
         Resolved::Unresolved { name } => {
@@ -122,9 +163,6 @@ pub(super) fn vst_sidecar(
         bytes: inst_text.into_bytes(),
     }];
 
-    // Only write the raw state blob when we're loading the exact plugin
-    // it came from.  State for one plugin fed to another corrupts the
-    // load.
     if let Resolved::Exact { .. } = resolved {
         if !plugin.state.is_empty() {
             files.push(AuxFile {

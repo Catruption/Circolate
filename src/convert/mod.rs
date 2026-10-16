@@ -16,8 +16,8 @@ use anyhow::Result;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
-use crate::sources::trackscript;
-use crate::sources::{self, SourceKind};
+use crate::formats::trackscript;
+use crate::formats::{self, SourceKind};
 
 // ── public API ─────────────────────────────────────────────────────────
 
@@ -76,15 +76,15 @@ pub struct Converted {
 pub fn convert_file(src: &Path, opts: &ConvertOptions) -> Result<Converted> {
     match SourceKind::from_path(src)? {
         SourceKind::Flp => {
-            let prj = sources::flp::parse_file(src)?;
+            let prj = formats::flp::parse_file(src)?;
             flp::convert(&prj, src, opts)
         }
         SourceKind::It => {
-            let module = sources::it::parse_file(src)?;
+            let module = formats::it::parse_file(src)?;
             it::convert(&module, src, opts)
         }
         SourceKind::Midi => {                         // ← new
-            let mf = sources::midi::parse_file(src)?;
+            let mf = formats::midi::parse_file(src)?;
             midi::convert(&mf, src, opts)
         }
         SourceKind::Trackscript => {

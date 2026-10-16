@@ -26,10 +26,10 @@ use std::sync::atomic::AtomicU32;
 
 use super::song::{Call, MeasureLine, Song};
 use super::{fmt, note_name, pos_str, safe_name, AuxFile, ConvertOptions, Converted};
-use crate::sfl2::hi::SoundFont;
-use crate::sfl2::lo::Sf2Data;
+use crate::hosting::sf2::sfl2::hi::SoundFont;
+use crate::hosting::sf2::sfl2::lo::Sf2Data;
 use crate::spec;
-use crate::sources::midi::{MidiChannel, MidiFile, MidiNote};
+use crate::formats::midi::{MidiChannel, MidiFile, MidiNote};
 
 /// Files bigger than this are assumed to be general-purpose GM banks
 /// and skipped during per-channel matching.  A single-instrument SF2

@@ -7,7 +7,7 @@ use super::helpers::*;
 use super::sim::{Converter, Voice};
 use crate::convert::song::{Call, MeasureLine, Song};
 use crate::convert::PitchMode;
-use crate::sources::it::Module;
+use crate::formats::it::Module;
 
 // ── position / pitch / pan text ────────────────────────────────────────
 

@@ -21,7 +21,7 @@ use crate::player::envelope::{
 use crate::player::notes::{split_notes, value_at, ColumnLine, DisplayNote};
 use crate::player::scope::scope_snapshot;
 use crate::player::{Project, Transport};
-use crate::sources::trackscript::C5_HZ;
+use crate::formats::trackscript::C5_HZ;
 use crate::tui::shared::braille::{braille_char, dot_bit};
 use crate::tui::shared::label;
 use crate::tui::shared::note_fmt::fmt_note;

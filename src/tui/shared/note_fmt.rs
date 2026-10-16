@@ -3,7 +3,7 @@
 //! prints and the horizontal view lays out in columns.
 
 use crate::player::notes::{value_at, NoteRow};
-use crate::sources::trackscript::hz_to_note;
+use crate::formats::trackscript::hz_to_note;
 
 use super::note_style::NoteState;
 

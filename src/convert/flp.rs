@@ -1,16 +1,6 @@
+
 // src/convert/flp.rs
 //! FLP → Trackscript converter.
-//!
-//! The work is split across submodules:
-//!   * `classify`  — which channels are usable, and how
-//!   * `resolve`   — installed / fallback / unresolved plugin resolution
-//!   * `extract`   — fidelity.json + insert chain extraction
-//!   * `place`     — playlist → (channel, tick) placements
-//!   * `render`    — notes in a measure → one Trackscript section
-//!   * `sf2`       — SoundFont state parsing
-//!   * `wav`       — sample decoding and lookup
-//!
-//! This file owns the flow: parse → classify → render → assemble.
 
 mod classify;
 mod extract;
@@ -30,10 +20,10 @@ use super::{
     identifier, safe_name, AuxFile, ConvertOptions, Converted, SampleJsonEntry,
     SampleOut, SamplesJson,
 };
-use crate::fallbacks::FallbackTable;
+use crate::deps::registry::RegistryTable;
 use crate::fidelity::MultiSampleFidelity;
-use crate::plugins::PluginIndex;
-use crate::sources::flp as flp_src;
+use crate::deps::index::PluginIndex;
+use crate::formats::flp as flp_src;
 
 use classify::{classify_channels, Classified};
 use extract::{build_fidelity, extract_inserts};
@@ -53,9 +43,8 @@ pub(super) const MIN_EMBEDDED_BYTES: usize = 512;
 pub(super) const FL_C5_MIDI: i32 = 60;
 pub(super) const FL_C5_KEY: u16 = 60;
 
-/// Built-in generators with no vst_path and a state smaller than this are
-/// checked for a SoundFont path.  Anything bigger (DirectWave, Serum, ...)
-/// can't be the SoundFont player.
+/// Built-in generators with no vst_path and a state smaller than this
+/// are checked for a SoundFont path.
 pub(super) const SF2_STATE_MAX: usize = 4096;
 
 // ── shared helpers ─────────────────────────────────────────────────────
@@ -65,10 +54,7 @@ pub(super) fn debug_on() -> bool {
 }
 
 pub(super) fn hex(b: &[u8]) -> String {
-    b.iter()
-    .map(|x| format!("{:02x}", x))
-    .collect::<Vec<_>>()
-    .join(" ")
+    b.iter().map(|x| format!("{:02x}", x)).collect::<Vec<_>>().join(" ")
 }
 
 // ── main entry ─────────────────────────────────────────────────────────
@@ -79,23 +65,15 @@ pub(super) fn convert(
     opts: &ConvertOptions,
 ) -> Result<Converted> {
     let subs = opts.subdivisions;
-    let ppq = if prj.ppq == 0 {
-        DEFAULT_FLPPQ
-    } else {
-        prj.ppq as u32
-    };
+    let ppq = if prj.ppq == 0 { DEFAULT_FLPPQ } else { prj.ppq as u32 };
     let ticks_per_measure = ppq * 4;
     let flp_dir = src_path.parent().unwrap_or_else(|| Path::new("."));
-    let tempo = if prj.tempo > 0.0 {
-        prj.tempo
-    } else {
-        DEFAULT_TEMPO
-    };
+    let tempo = if prj.tempo > 0.0 { prj.tempo } else { DEFAULT_TEMPO };
 
     let (placed, used_playlist, dropped_notes) = place_notes(prj);
 
     let plugin_index = PluginIndex::scan();
-    let fallback_table = match FallbackTable::load_default() {
+    let fallback_table = match RegistryTable::load() {
         Ok(t) => Some(t),
         Err(e) => {
             eprintln!("flp: fallback table unavailable ({e:#}); native channels use exact match only");
@@ -104,12 +82,7 @@ pub(super) fn convert(
     };
 
     if debug_on() {
-        eprintln!(
-            "flp: ppq {} tempo {} playlist items {}",
-            ppq,
-            tempo,
-            prj.playlist.len()
-        );
+        eprintln!("flp: ppq {} tempo {} playlist items {}", ppq, tempo, prj.playlist.len());
         for c in &prj.channels {
             eprintln!(
                 "flp: chan {:>3} {:<10} placed {:>5} env {:>2} levels={} sample {:?} name {:?}",
@@ -165,11 +138,7 @@ pub(super) fn convert(
             let detail = skipped
             .iter()
             .map(|(c, w)| {
-                let name = if c.name.is_empty() {
-                    &c.channel_type
-                } else {
-                    &c.name
-                };
+                let name = if c.name.is_empty() { &c.channel_type } else { &c.name };
                 format!("  [{:2}] {}: {}", c.iid, name, w)
             })
             .collect::<Vec<_>>()
@@ -179,18 +148,10 @@ pub(super) fn convert(
 
         // ── end tick / measure count ─────────────────────────────────────
         let mut end_tick: u32 = 0;
-        for (chan, _) in &usable_samples {
-            end_tick = end_tick.max(end_tick_of(&placed, chan.iid));
-        }
-        for (chan, _) in &usable_embedded {
-            end_tick = end_tick.max(end_tick_of(&placed, chan.iid));
-        }
-        for chan in &usable_natives {
-            end_tick = end_tick.max(end_tick_of(&placed, chan.iid));
-        }
-        for chan in &usable_sf2 {
-            end_tick = end_tick.max(end_tick_of(&placed, chan.iid));
-        }
+        for (chan, _) in &usable_samples { end_tick = end_tick.max(end_tick_of(&placed, chan.iid)); }
+        for (chan, _) in &usable_embedded { end_tick = end_tick.max(end_tick_of(&placed, chan.iid)); }
+        for chan in &usable_natives { end_tick = end_tick.max(end_tick_of(&placed, chan.iid)); }
+        for chan in &usable_sf2 { end_tick = end_tick.max(end_tick_of(&placed, chan.iid)); }
         let n_measures = std::cmp::max(1, (end_tick + ticks_per_measure - 1) / ticks_per_measure);
 
         // ── sample files ─────────────────────────────────────────────────
@@ -199,15 +160,11 @@ pub(super) fn convert(
         let mut sample_outs: Vec<SampleOut> = Vec::new();
         let mut styles: HashMap<u16, NoteStyle> = HashMap::new();
 
-        let mut decoded: Vec<(&flp_src::Channel, PathBuf)> =
-        Vec::with_capacity(usable_samples.len());
+        let mut decoded: Vec<(&flp_src::Channel, PathBuf)> = Vec::with_capacity(usable_samples.len());
 
         for (chan, src) in &usable_samples {
             let raw_name = if chan.name.is_empty() {
-                src.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("sample")
-                .to_string()
+                src.file_stem().and_then(|s| s.to_str()).unwrap_or("sample").to_string()
             } else {
                 chan.name.clone()
             };
@@ -220,12 +177,8 @@ pub(super) fn convert(
                     warnings.push(format!(
                         "[{:2}] {}: failed to decode {}: {:#}",
                         chan.iid,
-                        if chan.name.is_empty() {
-                            "<unnamed>"
-                        } else {
-                            &chan.name
-                        },
-                        src.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
+                        if chan.name.is_empty() { "<unnamed>" } else { &chan.name },
+                            src.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
                                           e,
                     ));
                     continue;
@@ -244,20 +197,13 @@ pub(super) fn convert(
                           sample_rate,
                 },
             );
-            sample_outs.push(SampleOut {
-                rel_path: rel.clone(),
-                             wav: bytes,
-            });
+            sample_outs.push(SampleOut { rel_path: rel.clone(), wav: bytes });
             sample_files.insert(chan.iid, rel.clone());
             sample_meta.push(SampleJsonEntry {
                 id: chan.iid,
-                name: if chan.name.is_empty() {
-                    raw_name
-                } else {
-                    chan.name.clone()
-                },
-                file: rel,
-                c5_speed: sample_rate,
+                name: if chan.name.is_empty() { raw_name } else { chan.name.clone() },
+                             file: rel,
+                             c5_speed: sample_rate,
             });
             decoded.push((*chan, src.clone()));
         }
@@ -308,10 +254,7 @@ pub(super) fn convert(
                 };
                 let zone_rate = wav_sample_rate(wav).unwrap_or(sample_rate);
 
-                sample_outs.push(SampleOut {
-                    rel_path: rel.clone(),
-                                 wav: wav.clone(),
-                });
+                sample_outs.push(SampleOut { rel_path: rel.clone(), wav: wav.to_vec() });
                 sample_meta.push(SampleJsonEntry {
                     id: zone_id,
                     name: zone_name,
@@ -325,10 +268,7 @@ pub(super) fn convert(
             if !zone_files.is_empty() {
                 multi_zones.insert(
                     chan.iid.to_string(),
-                                   MultiSampleFidelity {
-                                       files: zone_files,
-                                       root_keys: zone_roots,
-                                   },
+                                   MultiSampleFidelity { files: zone_files, root_keys: zone_roots },
                 );
             }
         }
@@ -351,18 +291,11 @@ pub(super) fn convert(
 
         // ── render parts into a Song ─────────────────────────────────────
         let title = if prj.title.is_empty() {
-            src_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("(untitled)")
-            .to_string()
+            src_path.file_stem().and_then(|s| s.to_str()).unwrap_or("(untitled)").to_string()
         } else {
             prj.title.clone()
         };
-        let source_name = src_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("(untitled)");
+        let source_name = src_path.file_name().and_then(|s| s.to_str()).unwrap_or("(untitled)");
 
         let mut song = Song::new(
             &title,
@@ -379,33 +312,28 @@ pub(super) fn convert(
         let mut part_for_iid: HashMap<u16, usize> = HashMap::new();
         let mut part_name_used: HashMap<String, u32> = HashMap::new();
 
+        // Built once; the measure loop only walks notes.
+        let mut channels_here: Vec<(&flp_src::Channel, &'static str)> = Vec::new();
+        channels_here.extend(usable_samples.iter().map(|(c, _)| (*c, "sample")));
+        channels_here.extend(usable_embedded.iter().map(|(c, _)| (*c, "sample")));
+        channels_here.extend(usable_natives.iter().map(|c| (*c, "instrument")));
+        channels_here.extend(usable_sf2.iter().map(|c| (*c, "instrument")));
+
         for m in 0..n_measures {
             let m_start = m * ticks_per_measure;
             let m_end = m_start + ticks_per_measure;
 
-            let mut channels_here: Vec<(&flp_src::Channel, &'static str)> = Vec::new();
-            channels_here.extend(usable_samples.iter().map(|(c, _)| (*c, "sample")));
-            channels_here.extend(usable_embedded.iter().map(|(c, _)| (*c, "sample")));
-            channels_here.extend(usable_natives.iter().map(|c| (*c, "instrument")));
-            channels_here.extend(usable_sf2.iter().map(|c| (*c, "instrument")));
-
             let mut line = MeasureLine { calls: Vec::new(), extra: Vec::new() };
 
-            for (chan, kind) in channels_here {
+            for &(chan, kind) in &channels_here {
                 let notes_here = notes_in_measure(&placed, chan.iid, m_start, m_end);
                 if notes_here.is_empty() {
                     continue;
                 }
 
                 let source_path = match kind {
-                    "sample" => sample_files
-                    .get(&chan.iid)
-                    .map(|s| s.as_str())
-                    .unwrap_or(""),
-                    "instrument" => sidecar_path
-                    .get(&chan.iid)
-                    .map(|s| s.as_str())
-                    .unwrap_or(""),
+                    "sample" => sample_files.get(&chan.iid).map(|s| s.as_str()).unwrap_or(""),
+                    "instrument" => sidecar_path.get(&chan.iid).map(|s| s.as_str()).unwrap_or(""),
                     _ => "",
                 };
 
@@ -414,10 +342,7 @@ pub(super) fn convert(
                     m_start,
                     subs,
                     ppq,
-                    styles
-                    .get(&chan.iid)
-                    .copied()
-                    .unwrap_or(NoteStyle::neutral(tempo)),
+                    styles.get(&chan.iid).copied().unwrap_or(NoteStyle::neutral(tempo)),
                                        source_path,
                 );
 
@@ -435,11 +360,7 @@ pub(super) fn convert(
                             *e += 1;
                             *e
                         };
-                        let name = if count == 1 {
-                            base
-                        } else {
-                            format!("{}{:02}", base, count)
-                        };
+                        let name = if count == 1 { base } else { format!("{}{:02}", base, count) };
                         let source_arg = crate::spec::source_arg(source_path, None);
                         let idx = song.get_or_create_part(&name, source_arg);
                         part_for_iid.insert(chan.iid, idx);
@@ -477,15 +398,13 @@ pub(super) fn convert(
         if !used_playlist {
             song.post_comments.push(
                 "//\n// No pattern clips found in the playlist: patterns were laid out at their\n\
-// own local positions (all patterns overlap from the start)."
-.to_string(),
+// own local positions (all patterns overlap from the start).".to_string(),
             );
         }
 
         if !envelope_only.is_empty() {
             song.post_comments.push(
-                "//\n// Channels with active sampler envelopes (parsed, not yet rendered):"
-                .to_string(),
+                "//\n// Channels with active sampler envelopes (parsed, not yet rendered):".to_string(),
             );
             for (iid, name, n) in &envelope_only {
                 song.post_comments.push(format!(
@@ -500,11 +419,7 @@ pub(super) fn convert(
                 "//\n// Embedded audio extracted from plugin state:".to_string(),
             );
             for (chan, emb) in &usable_embedded {
-                let name = if chan.name.is_empty() {
-                    &chan.channel_type
-                } else {
-                    &chan.name
-                };
+                let name = if chan.name.is_empty() { &chan.channel_type } else { &chan.name };
                 song.post_comments.push(format!(
                     "//   [{:2}] {}: {} file(s) found, {} zone(s) written to samples.json{}",
                                                 chan.iid,
@@ -527,13 +442,8 @@ pub(super) fn convert(
         if !skipped.is_empty() {
             song.post_comments.push("//\n// Skipped:".to_string());
             for (c, w) in &skipped {
-                let name = if c.name.is_empty() {
-                    &c.channel_type
-                } else {
-                    &c.name
-                };
-                song.post_comments
-                .push(format!("//   [{:2}] {}: {}", c.iid, name, w));
+                let name = if c.name.is_empty() { &c.channel_type } else { &c.name };
+                song.post_comments.push(format!("//   [{:2}] {}: {}", c.iid, name, w));
             }
         }
 
@@ -547,7 +457,7 @@ pub(super) fn convert(
         })?;
 
         // ── fidelity sidecar ─────────────────────────────────────────────
-        let mut fidelity = build_fidelity(prj);
+        let mut fidelity = build_fidelity(prj, &resolved_map, &sidecar_path);
         fidelity.multi_sample = multi_zones;
         fidelity.inserts = extract_inserts(
             prj,
@@ -577,11 +487,7 @@ pub(super) fn convert(
 }
 
 // ── probe (check) ──────────────────────────────────────────────────────
-//
-// Walk an FLP's channels and report what would be missing at render
-// time.  Never decodes samples, never renders, never writes.
 
-/// A dependency that blocked a channel from converting.
 #[derive(Debug)]
 pub struct MissingDep {
     pub channel_iid: u16,
@@ -593,13 +499,11 @@ pub struct MissingDep {
 #[derive(Debug, Clone, Copy)]
 pub enum DepKind { Sample, Plugin, Sf2, Unknown }
 
-/// A plugin that resolved to something other than the exact original.
 #[derive(Debug)]
 pub struct FallbackUse {
     pub channel_iid: u16,
     pub replaces: String,
     pub used: String,
-    /// false ⇒ the fallback itself isn't installed; the channel is dead.
     pub resolved: bool,
 }
 
@@ -611,24 +515,22 @@ pub struct ProbeReport {
 }
 
 impl ProbeReport {
-    /// Missing deps + fallbacks whose target is itself absent.
     pub fn problem_count(&self) -> usize {
         self.missing.len()
         + self.fallbacks.iter().filter(|f| !f.resolved).count()
     }
-
     pub fn is_clean(&self) -> bool {
         self.problem_count() == 0 && self.fallbacks.is_empty()
     }
 }
 
 pub fn probe(src_path: &Path, opts: &ConvertOptions) -> Result<ProbeReport> {
-    let prj = crate::sources::flp::parse_file(src_path)?;
+    let prj = crate::formats::flp::parse_file(src_path)?;
     let flp_dir = src_path.parent().unwrap_or_else(|| Path::new("."));
 
     let (placed, _, _) = place_notes(&prj);
     let plugin_index = PluginIndex::scan();
-    let fallback_table = FallbackTable::load_default().ok();
+    let fallback_table = RegistryTable::load().ok();
     let mut aux_files: Vec<AuxFile> = Vec::new();
 
     let Classified {
@@ -658,8 +560,6 @@ pub fn probe(src_path: &Path, opts: &ConvertOptions) -> Result<ProbeReport> {
 
     let mut report = ProbeReport { warnings, ..Default::default() };
 
-    // Only flag channels that actually have notes.  Empty mixer stubs
-    // and unused generators are noise.
     for chan in &prj.channels {
         if used.contains(&chan.iid) { continue; }
         let notes = placed.get(&chan.iid).map_or(0, |v| v.len());
@@ -707,3 +607,4 @@ pub fn probe(src_path: &Path, opts: &ConvertOptions) -> Result<ProbeReport> {
 
     Ok(report)
 }
+

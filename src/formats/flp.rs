@@ -123,22 +123,22 @@ fn decode_env_lfo(b: &[u8]) -> Option<EnvelopeLfo> {
     }
     Some(EnvelopeLfo {
         flags: i32le(b, 0),
-         env_enabled: i32le(b, 4),
-         env_predelay: i32le(b, 8),
-         env_attack: i32le(b, 12),
-         env_hold: i32le(b, 16),
-         env_decay: i32le(b, 20),
-         env_sustain: i32le(b, 24),
-         env_release: i32le(b, 28),
-         env_amount: i32le(b, 32),
-         lfo_predelay: u32le(b, 36),
-         lfo_attack: u32le(b, 40),
-         lfo_amount: i32le(b, 44),
-         lfo_speed: u32le(b, 48),
-         lfo_shape: i32le(b, 52),
-         env_attack_tension: i32le(b, 56),
-         env_decay_tension: i32le(b, 60),
-         env_release_tension: i32le(b, 64),
+        env_enabled: i32le(b, 4),
+        env_predelay: i32le(b, 8),
+        env_attack: i32le(b, 12),
+        env_hold: i32le(b, 16),
+        env_decay: i32le(b, 20),
+        env_sustain: i32le(b, 24),
+        env_release: i32le(b, 28),
+        env_amount: i32le(b, 32),
+        lfo_predelay: u32le(b, 36),
+        lfo_attack: u32le(b, 40),
+        lfo_amount: i32le(b, 44),
+        lfo_speed: u32le(b, 48),
+        lfo_shape: i32le(b, 52),
+        env_attack_tension: i32le(b, 56),
+        env_decay_tension: i32le(b, 60),
+        env_release_tension: i32le(b, 64),
     })
 }
 
@@ -148,11 +148,11 @@ fn decode_levels(b: &[u8]) -> Option<Levels> {
     }
     Some(Levels {
         pan: i32le(b, 0),
-         volume: u32le(b, 4),
-         pitch_shift: i32le(b, 8),
-         filter_mod_x: u32le(b, 12),
-         filter_mod_y: u32le(b, 16),
-         filter_type: u32le(b, 20),
+        volume: u32le(b, 4),
+        pitch_shift: i32le(b, 8),
+        filter_mod_x: u32le(b, 12),
+        filter_mod_y: u32le(b, 16),
+        filter_type: u32le(b, 20),
     })
 }
 
@@ -162,9 +162,9 @@ fn decode_tracking(b: &[u8]) -> Option<Tracking> {
     }
     Some(Tracking {
         middle_value: u32le(b, 0),
-         pan: i32le(b, 4),
-         mod_x: i32le(b, 8),
-         mod_y: i32le(b, 12),
+        pan: i32le(b, 4),
+        mod_x: i32le(b, 8),
+        mod_y: i32le(b, 12),
     })
 }
 
@@ -174,9 +174,9 @@ fn decode_level_adjusts(b: &[u8]) -> Option<LevelAdjusts> {
     }
     Some(LevelAdjusts {
         pan: i32le(b, 0),
-         volume: u32le(b, 4),
-         mod_x: i32le(b, 12),
-         mod_y: i32le(b, 16),
+        volume: u32le(b, 4),
+        mod_x: i32le(b, 12),
+        mod_y: i32le(b, 16),
     })
 }
 
@@ -276,6 +276,13 @@ impl Channel {
         0.0
     }
 
+    /// Channel volume as a linear scale factor.
+    ///
+    /// 12800 is PyFLP's documented max for `Channel.volume`; the default
+    /// in FL is 10000, which maps to 0.781 here.  The scale is nonlinear
+    /// in FL's UI, so this is an approximation, but it is not wrong.
+    /// Do not "fix" the divisor without a project whose raw `Levels.volume`
+    /// you can cross-check against FL's displayed percentage.
     pub fn volume_scale(&self) -> f64 {
         if let Some(l) = &self.levels {
             if l.volume == 0 {
@@ -365,7 +372,7 @@ fn read_events(data: &[u8]) -> Result<(u16, Vec<(u8, Vec<u8>)>, Vec<String>)> {
         bail!("missing FLdt data chunk");
     }
     let length =
-    u32::from_le_bytes([data[p + 4], data[p + 5], data[p + 6], data[p + 7]]) as usize;
+        u32::from_le_bytes([data[p + 4], data[p + 5], data[p + 6], data[p + 7]]) as usize;
     p += 8;
     let end = (p + length).min(data.len());
 
@@ -414,7 +421,7 @@ fn read_events(data: &[u8]) -> Result<(u16, Vec<(u8, Vec<u8>)>, Vec<String>)> {
             let have = end.saturating_sub(p);
             warnings.push(format!(
                 "truncated event {:#04x} at offset {:#x}: needs {} byte(s), {} available; stopping parse",
-                                  ev, ev_off, size, have
+                ev, ev_off, size, have
             ));
             return Ok((ppq, events, warnings));
         }
@@ -423,32 +430,78 @@ fn read_events(data: &[u8]) -> Result<(u16, Vec<(u8, Vec<u8>)>, Vec<String>)> {
         p += size;
     }
 
+    // If we consumed the whole event stream, p == end.  Anything else
+    // means we mis-sized at least one event and silently drifted.
+    if p != end {
+        warnings.push(format!(
+            "event stream ended at offset {:#x}, expected {:#x} ({} bytes unread); \
+             event sizes are likely misparsed",
+            p,
+            end,
+            end.saturating_sub(p)
+        ));
+    }
+
     Ok((ppq, events, warnings))
 }
 
 // ── text decoding ──────────────────────────────────────────────────────
 
+fn decode_utf16le(raw: &[u8]) -> String {
+    let cap = raw.len() & !1;
+    let mut n = 0;
+    while n + 1 < cap {
+        if raw[n] == 0 && raw[n + 1] == 0 {
+            break;
+        }
+        n += 2;
+    }
+    let units: Vec<u16> = (0..n)
+        .step_by(2)
+        .map(|i| u16::from_le_bytes([raw[i], raw[i + 1]]))
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+/// Heuristic: UTF-16LE text has a BOM, or has mostly-zero odd bytes
+/// because it is ASCII-range text.  The original code keyed off byte
+/// length being even, which mangled any even-length ASCII string with
+/// trailing NULs — the overwhelmingly common case for FLP sample paths
+/// and plugin names.
+fn looks_like_utf16le(raw: &[u8]) -> bool {
+    if raw.len() < 4 || raw.len() % 2 != 0 {
+        return false;
+    }
+    if raw.len() >= 2 && raw[0] == 0xFF && raw[1] == 0xFE {
+        return true;
+    }
+    let check_len = raw.len().min(64);
+    let mut odd_zeros = 0usize;
+    let mut odd_total = 0usize;
+    let mut i = 1;
+    while i < check_len {
+        odd_total += 1;
+        if raw[i] == 0 {
+            odd_zeros += 1;
+        }
+        i += 2;
+    }
+    odd_total >= 2 && odd_zeros * 4 >= odd_total * 3
+}
+
 fn text(ev: u8, raw: &[u8]) -> String {
+    if raw.is_empty() {
+        return String::new();
+    }
     if ev == EV_TEXT_VERSION {
         let nul = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
         return String::from_utf8_lossy(&raw[..nul]).into_owned();
     }
-    if raw.len() % 2 != 0 {
-        let nul = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
-        return raw[..nul].iter().map(|&b| b as char).collect();
+    if looks_like_utf16le(raw) {
+        return decode_utf16le(raw);
     }
-    let mut end = 0;
-    while end + 1 < raw.len() {
-        if raw[end] == 0 && raw[end + 1] == 0 {
-            break;
-        }
-        end += 2;
-    }
-    let units: Vec<u16> = (0..end)
-    .step_by(2)
-    .map(|i| u16::from_le_bytes([raw[i], raw[i + 1]]))
-    .collect();
-    String::from_utf16_lossy(&units)
+    let nul = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    String::from_utf8_lossy(&raw[..nul]).into_owned()
 }
 
 // ── VST path extraction ────────────────────────────────────────────────
@@ -678,7 +731,7 @@ pub fn parse(data: &[u8]) -> Result<Project> {
             EV_COLOR if raw.len() == 4 && pat_idx.is_none() => {
                 if let Some(i) = chan_idx {
                     prj.channels[i].color =
-                    Some(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]));
+                        Some(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]));
                 }
             }
             EV_TEXT_CHAN_NAME => {
@@ -767,7 +820,7 @@ pub fn parse(data: &[u8]) -> Result<Project> {
                     let ins = prj.inserts.entry(owner).or_insert_with(|| Insert {
                         index: owner,
                         name: String::new(),
-                                                                      plugins: Vec::new(),
+                        plugins: Vec::new(),
                     });
                     ins.plugins.push(blank);
                     let j = ins.plugins.len() - 1;
@@ -785,10 +838,10 @@ pub fn parse(data: &[u8]) -> Result<Project> {
                         if p.internal_name.is_empty()
                             && p.display_name.is_empty()
                             && p.state.is_empty()
-                            {
-                                p.internal_name = s.clone();
-                                assigned = true;
-                            }
+                        {
+                            p.internal_name = s.clone();
+                            assigned = true;
+                        }
                     }
                 }
                 pending_def_plugin = if assigned { None } else { Some(s) };
@@ -824,7 +877,7 @@ pub fn parse(data: &[u8]) -> Result<Project> {
                 prj.patterns.push(Pattern {
                     iid,
                     name: String::new(),
-                                  notes: Vec::new(),
+                    notes: Vec::new(),
                 });
                 pat_idx = Some(prj.patterns.len() - 1);
                 chan_idx = None;
@@ -835,12 +888,36 @@ pub fn parse(data: &[u8]) -> Result<Project> {
                     prj.patterns[i].name = text(*ev, raw);
                 }
             }
+            // Keep only the *first* `PAT_NOTES` event per pattern, matching
+            // PyFLP (`self.events.first(PatternID.Notes)`).  Concatenating
+            // multiple events was producing extra notes on one channel in
+            // projects where FL emits duplicate notes events — the second
+            // event carries a stale or partial batch that must not be
+            // merged with the first.
             EV_PAT_NOTES => {
                 if let Some(i) = pat_idx {
-                    prj.patterns[i].notes = decode_notes(raw);
+                    let notes = decode_notes(raw);
+                    if std::env::var_os("FLP_DEBUG").is_some() {
+                        eprintln!(
+                            "flp: PAT_NOTES pat_idx={} iid={} {} note(s) (existing: {})",
+                            i,
+                            prj.patterns[i].iid,
+                            notes.len(),
+                            prj.patterns[i].notes.len()
+                        );
+                    }
+                    if prj.patterns[i].notes.is_empty() {
+                        prj.patterns[i].notes = notes;
+                    }
                 }
             }
-            EV_PLAYLIST => prj.playlist = decode_playlist(raw, version_major(&prj.version)),
+            // Some FL versions split a large playlist across several
+            // EV_PLAYLIST events.  Extend instead of overwriting so the
+            // earlier batches survive.
+            EV_PLAYLIST => {
+                prj.playlist
+                    .extend(decode_playlist(raw, version_major(&prj.version)));
+            }
             _ => {}
         }
     }

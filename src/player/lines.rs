@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use crate::sources::trackscript::{BlockCall, CallOverrides, ShimEvent, TrackscriptPart};
+use crate::formats::trackscript::{BlockCall, CallOverrides, ShimEvent, TrackscriptPart};
 
 #[derive(Clone)]
 pub(crate) struct LineCall {

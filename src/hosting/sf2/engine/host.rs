@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use crate::sfl2::hi::HostData;
+use crate::hosting::sf2::sfl2::hi::HostData;
 
 #[derive(Clone)]
 pub struct Sf2HostData {

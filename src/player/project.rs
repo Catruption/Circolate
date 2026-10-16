@@ -9,8 +9,8 @@ use std::sync::Arc;
 use crate::asset::{AssetSource, DirSource, ENTRY_KEY};
 use crate::audio_decode::decode_audio;
 use crate::fidelity::{Fidelity, FIDELITY_FILENAME};
-use crate::requires::{self, Requires};
-use crate::sources::trackscript::{parse_str, TrackscriptEvent, TrackscriptPart};
+use crate::deps::requires::{self, Requires};
+use crate::formats::trackscript::{parse_str, TrackscriptEvent, TrackscriptPart};
 use crate::timing::TempoMap;
 
 use super::cache::{fingerprint, hash_part};
@@ -141,6 +141,15 @@ fn sf2_cache_dir() -> PathBuf {
 /// Materialize an SF2 from the source into the cache and return the
 /// path on disk.  The native engine reads SF2s through the filesystem,
 /// not from memory, so archives need their samples extracted once.
+/// Materialize an SF2 from the source into the cache and return the
+/// path on disk.  The native engine reads SF2s through the filesystem,
+/// not from memory, so archives need their samples extracted once.
+///
+/// Always rewrites.  An earlier "only write when sizes differ" check
+/// was wrong: re-exporting the same project with different environment
+/// variables (e.g. `FLP_SLICEX_BASE_1`) produces a same-size SF2 with
+/// different contents, and the stale cached copy was silently used for
+/// playback.  One disk write per load is negligible.
 fn materialize_sf2_file(source: &dyn AssetSource, rel: &str) -> Result<Option<PathBuf>> {
     let Some(bytes) = source.read_bytes(rel)? else {
         return Ok(None);
@@ -148,22 +157,12 @@ fn materialize_sf2_file(source: &dyn AssetSource, rel: &str) -> Result<Option<Pa
     let key = source.cache_key().unwrap_or_else(|| "anonymous".into());
     let dest = sf2_cache_dir().join(&key).join(rel);
 
-    // Only rewrite when the size differs.  A 148 MB FluidR3 vs an old
-    // 4 MB cached bank: size check catches the "user swapped the
-    // SoundFont" case without hashing 148 MB on every load.  Same-size
-    // different content is unlikely and would need a full content
-    // hash — not worth the cost.
-    let needs_write = match std::fs::metadata(&dest) {
-        Ok(md) => md.len() != bytes.len() as u64,
-        Err(_) => true,
-    };
-    if needs_write {
-        if let Some(p) = dest.parent() {
-            std::fs::create_dir_all(p)?;
-        }
-        std::fs::write(&dest, &bytes)
-            .with_context(|| format!("writing {}", dest.display()))?;
+    if let Some(p) = dest.parent() {
+        std::fs::create_dir_all(p)?;
     }
+    std::fs::write(&dest, &bytes)
+        .with_context(|| format!("writing {}", dest.display()))?;
+
     Ok(Some(dest))
 }
 
@@ -587,7 +586,7 @@ pub(crate) fn load_project_from_source(
             eprintln!("  (sidecar unreadable: {})", rel);
             continue;
         };
-        let Ok(inst) = crate::instruments::parse(&text, &rel) else { continue };
+        let Ok(inst) = crate::deps::instruments::parse(&text, &rel) else { continue };
         let stem = rel
             .rsplit('/')
             .next()

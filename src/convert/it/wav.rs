@@ -5,7 +5,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
-use crate::sources::it::{Module, Sample};
+use crate::formats::it::{Module, Sample};
 
 pub(super) fn write_wav(s: &Sample) -> Vec<u8> {
     let rate: u32 = (if s.c5 == 0 { 8363 } else { s.c5 }).clamp(100, 192_000);

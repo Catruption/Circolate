@@ -4,35 +4,26 @@
 //! subcommand modules.
 #![allow(dead_code)]
 
-mod requires;
-mod fidelity;
-mod display;
-mod check;
-mod convert;
-mod dump;
-mod effects;
-mod export;
-mod fallbacks;
-mod fetch;
-mod instruments;
-mod mixer;
-mod play;
-mod player;
-mod plugins;
-mod sf2;
-mod sf2_engine;
-mod sf2_smoke;
-mod sfl2;
-mod sources;
-mod test;
-mod timing;
-mod tui;
-mod vst_host_ffi;
-mod vst_smoke;
-mod spec;
 mod archive;
 mod asset;
 mod audio_decode;
+mod check;
+mod convert;
+mod deps;
+mod display;
+mod dump;
+mod effects;
+mod export;
+mod fidelity;
+mod formats;
+mod hosting;
+mod mixer;
+mod play;
+mod player;
+mod spec;
+mod test;
+mod timing;
+mod tui;
 
 use anyhow::{bail, Result};
 
@@ -55,10 +46,10 @@ fn main() -> Result<()> {
         Some("dump")      => dump::run(rest),
         Some("test")      => test::run(rest),
         Some("check")     => check::run(rest),
-        Some("plugins")   => plugins::run(rest),
-        Some("fetch")     => fetch::run(rest),
-        Some("vst-smoke") => vst_smoke::run(rest),
-        Some("sf2-smoke") => sf2_smoke::run(rest),
+        Some("plugins")   => deps::index::run(rest),
+        Some("fetch")     => deps::fetch::run(rest),
+        Some("vst-smoke") => hosting::vst::smoke::run(rest),
+        Some("sf2-smoke") => hosting::sf2::smoke::run(rest),
         Some("-h") | Some("--help") | None => {
             print_help();
             Ok(())

@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::sources::trackscript::{TrackscriptPart, C5_HZ};
+use crate::formats::trackscript::{TrackscriptPart, C5_HZ};
 use crate::timing::Waypoint;
 
 use super::types::{

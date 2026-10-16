@@ -1,3 +1,4 @@
+
 //! FL fidelity sidecar schema.
 //!
 //! The .trackscript is the readable arrangement.  This is everything
@@ -34,7 +35,30 @@ pub struct Fidelity {
     pub inserts: BTreeMap<String, InsertFidelity>,
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+/// Plugin metadata for a channel rack channel.  Populated from the
+/// parsed FLP directly (not through serde_json::to_value) because the
+/// raw state blob can be tens of megabytes and is skipped by Serialize.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ChannelPluginFidelity {
+    #[serde(default)]
+    pub internal_name: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub canonical_name: String,
+    #[serde(default)]
+    pub vst_path: String,
+    #[serde(default)]
+    pub state_size: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instrument_path: Option<String>,
+    #[serde(default)]
+    pub fallback: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChannelFidelity {
     #[serde(default)]
     pub iid: u16,
@@ -58,6 +82,8 @@ pub struct ChannelFidelity {
     pub root_note: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fine_tune: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<ChannelPluginFidelity>,
 }
 
 /// Superset of FL's `levels` and `level_adjusts` shapes.  Fields absent

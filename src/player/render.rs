@@ -7,8 +7,8 @@ use std::sync::Arc;
 use super::engine::Engine;
 use super::project::{Cache, Loader, Project};
 use crate::effects::EffectChain;
-use crate::sf2_engine::Sf2Engine;
-use crate::vst_host_ffi::VstHost;
+use crate::hosting::sf2::engine::Sf2Engine;
+use crate::hosting::vst::ffi::VstHost;
 
 const BLOCK: usize = 4096;
 
@@ -66,10 +66,30 @@ pub(crate) fn render_offline(
             continue;
         }
         sf2.set_preset(spec.bank, spec.preset);
-        sf2.set_gain(crate::sf2_engine::DEFAULT_GAIN * spec.gain);
+        sf2.set_gain(crate::hosting::sf2::engine::DEFAULT_GAIN * spec.gain);
         engine.install_sf2_engine(spec.iid, sf2);
     }
     println!("  installed {} SF2 engine(s)", engine.sf2_engine_count());
+
+    // Insert chains: VST effects on mixer inserts, loaded from the
+    // `.instrument` sidecars the FLP converter wrote next to the
+    // trackscript.  The directory is passed via TRACKSCRIPT_INSERT_DIR
+    // for now; later this becomes a Project field.
+    if let Ok(dir) = std::env::var("TRACKSCRIPT_INSERT_DIR") {
+        let dir = std::path::PathBuf::from(dir);
+        let inserts_dir = dir.join("inserts");
+        let chains = crate::player::inserts::load_chains(&inserts_dir, project.sample_rate);
+        let total_slots: usize = chains.values().map(|c| c.slot_count()).sum();
+        println!("  loaded {} insert chain(s), {} slot(s) total", chains.len(), total_slots);
+        for (idx, chain) in chains {
+            println!("    insert {:02}: {} slot(s)", idx, chain.slot_count());
+            engine.install_insert_chain(idx, chain);
+        }
+        let routing = crate::player::inserts::load_routing(&dir);
+        for (iid, insert) in routing {
+            engine.set_channel_insert(iid, insert);
+        }
+    }
 
     // Master bus effects.  Silent if master_fx.json is missing or empty.
     if !no_master_fx {

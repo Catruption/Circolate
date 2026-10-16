@@ -34,12 +34,14 @@ usage: run.sh <verb> [args] [flags]
   export <file>      export to trackscripts/<stem>/
   export -a <file>   export to trackscripts/<stem>.tsz
   dump   [file]      print parsed structure as JSON
-  test   [file]      run diagnostics
+  test   [file]      run single-file diagnostics
   check  [path]      recursively probe for missing dependencies
   plugins [--paths]  list discovered plugins
   fetch              download missing fallback plugins
   smoke  <plugin.vst3> [state.file]
                      VST3 smoke test
+  sf2-smoke <file.sf2> [--bank N] [--patch N] [--note N] [--list] [--out FILE.wav]
+                     SF2 engine smoke test
   list               list trackscripts/
   rebuild            cargo build --release
   help               this message
@@ -70,7 +72,7 @@ verb=""
 verb_explicit=0
 first="$1"
 case "$first" in
-    play|export|dump|test|check|plugins|fetch|smoke|list|rebuild|help|-h|--help)
+    play|export|dump|test|check|plugins|fetch|smoke|sf2-smoke|list|rebuild|help|-h|--help)
         verb="$first"
         verb_explicit=1
         shift
@@ -90,6 +92,14 @@ case "$verb" in
     smoke)
         [ $# -lt 1 ] && { echo "usage: run.sh smoke <plugin.vst3> [state.file]" >&2; exit 1; }
         exec "$bin" vst-smoke "$@"
+        ;;
+
+    sf2-smoke)
+        [ $# -lt 1 ] && {
+            echo "usage: run.sh sf2-smoke <file.sf2> [--bank N] [--patch N] [--note N] [--list] [--out FILE.wav]" >&2
+            exit 1
+        }
+        exec "$bin" sf2-smoke "$@"
         ;;
 
     rebuild)

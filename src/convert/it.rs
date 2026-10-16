@@ -25,7 +25,7 @@ use std::fs;
 use std::path::Path;
 
 use super::{AuxFile, ConvertOptions, Converted, SampleOut};
-use crate::sources::it::Module;
+use crate::formats::it::Module;
 
 use helpers::safe_name;
 use render::build_song;

@@ -17,11 +17,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
-use crate::sfl2::hi::{
+use crate::hosting::sf2::sfl2::hi::{
     EngineSettings, EngineTweak, EnvPhase, RenderContext, SoundFont,
     SynthOverrides, Voice,
 };
-use crate::sfl2::lo::{Gen, ResampleMethod, Sf2Data};
+use crate::hosting::sf2::sfl2::lo::{Gen, ResampleMethod, Sf2Data};
 
 use fx::{ChorusMode, ChorusUnit, ReverbMode, ReverbUnit};
 
@@ -29,10 +29,6 @@ pub use host::Sf2HostData;
 
 const MAX_POLY: usize = 64;
 
-/// Post-voice gain.  sfl2 applies `final_gain_db = 2.0` (≈ 1.26×)
-/// inside every InstVoice, and stereo SoundFont zones spawn two voices
-/// per note, so the raw sum runs hot.  Tuned so the dry output level
-/// matches a FluidSynth session (which applies `synth.gain = 0.2`).
 pub const DEFAULT_GAIN: f32 = 0.22;
 
 pub struct Sf2Engine {
@@ -42,6 +38,7 @@ pub struct Sf2Engine {
 
     ctx: RenderContext,
     voices: Vec<VoiceSlot>,
+    pending: Vec<PendingEvent>,
 
     reverb: ReverbUnit,
     chorus: ChorusUnit,
@@ -57,11 +54,25 @@ struct VoiceSlot {
     released: bool,
 }
 
+#[derive(Clone, Copy)]
+enum EventKind {
+    On,
+    Off,
+}
+
+/// A note event scheduled to fire at a specific sample offset within
+/// the next `process` call.  Offsets are relative to the start of that
+/// call; events with offset >= buffer length are dropped.
+#[derive(Clone, Copy)]
+struct PendingEvent {
+    offset: usize,
+    kind: EventKind,
+    key: u8,
+    velocity: u8,
+}
+
 impl Sf2Engine {
     pub fn new(sample_rate: u32) -> Self {
-        // `SynthOverrides::default()` gives 0, but -1 means "use the
-        // SF2's own value" throughout sfl2.  0s would collapse every
-        // envelope and filter cutoff to their minimum.
         let overrides = SynthOverrides {
             attack: -1,
             decay: -1,
@@ -75,8 +86,6 @@ impl Sf2Engine {
             filter_bypass: false,
         };
 
-        // `EngineSettings::default()` has every tweak off.  SFLT's own
-        // default is all tweaks on (`newest_default(i) == true`).
         let mut tweaks: u64 = 0;
         for i in 0..EngineTweak::EngineTweakMax as usize {
             if EngineTweak::newest_default(i) {
@@ -93,11 +102,6 @@ impl Sf2Engine {
         };
         ctx.overrides = overrides;
 
-        // FluidSynth enables both units by default.  Per-voice wet
-        // level comes from the SF2's own send generators (16 = reverb,
-        // 15 = chorus), not from the units being on/off.
-        // `SF2_FX=0` disables them entirely, `SF2_FX=1` (default) keeps
-        // FluidSynth's behaviour.
         let fx_on = std::env::var("SF2_FX")
             .ok()
             .map(|v| v != "0")
@@ -121,6 +125,7 @@ impl Sf2Engine {
             patch: 0,
             ctx,
             voices: Vec::new(),
+            pending: Vec::new(),
             reverb,
             chorus,
             resample: ResampleMethod::Hermite,
@@ -155,6 +160,8 @@ impl Sf2Engine {
             .collect()
     }
 
+    /// Fire a note immediately (used by sf2-smoke and by any caller
+    /// that doesn't have a sub-chunk offset to give).
     pub fn note_on(&mut self, key: u8, velocity: u8) {
         let Some(sf) = self.sf.clone() else { return };
         let Some(preset_idx) = sf.get_preset_idx(self.bank, self.patch) else {
@@ -186,6 +193,17 @@ impl Sf2Engine {
         });
     }
 
+    /// Schedule a note-on to fire `offset` samples into the next
+    /// `process` call.  Negative offsets are clamped to 0.
+    pub fn note_on_at(&mut self, key: u8, velocity: u8, offset: i32) {
+        self.pending.push(PendingEvent {
+            offset: offset.max(0) as usize,
+            kind: EventKind::On,
+            key,
+            velocity,
+        });
+    }
+
     pub fn note_off(&mut self, key: u8) {
         for slot in self.voices.iter_mut() {
             if slot.key == key && !slot.released {
@@ -198,6 +216,15 @@ impl Sf2Engine {
                 slot.released = true;
             }
         }
+    }
+
+    pub fn note_off_at(&mut self, key: u8, offset: i32) {
+        self.pending.push(PendingEvent {
+            offset: offset.max(0) as usize,
+            kind: EventKind::Off,
+            key,
+            velocity: 0,
+        });
     }
 
     pub fn all_notes_off(&mut self) {
@@ -214,13 +241,50 @@ impl Sf2Engine {
 
     pub fn active_voices(&self) -> usize { self.voices.len() }
 
-    /// Render `out_l.len()` samples and add them to the buffers.
+    /// Render `out_l.len()` samples into the buffers, firing any
+    /// pending note events at their exact sub-chunk offsets.  Output is
+    /// added to `out_l`/`out_r`; the caller is responsible for zeroing
+    /// them first.
     pub fn process(&mut self, out_l: &mut [f32], out_r: &mut [f32]) {
+        let n = out_l.len().min(out_r.len());
+        if n == 0 {
+            return;
+        }
+
+        // Drain events scheduled for this chunk.  Any event past `n`
+        // gets dropped — the caller schedules events per chunk and none
+        // should ever exceed the buffer it is about to process.
+        let mut events = std::mem::take(&mut self.pending);
+        events.retain(|e| e.offset < n);
+        events.sort_by_key(|e| e.offset);
+
+        let mut pos = 0usize;
+        let mut i = 0usize;
+        while pos < n {
+            let next_ev = if i < events.len() { events[i].offset } else { n };
+
+            if next_ev > pos {
+                self.render_range(&mut out_l[pos..next_ev], &mut out_r[pos..next_ev]);
+            }
+            pos = next_ev;
+
+            while i < events.len() && events[i].offset == pos {
+                let ev = events[i];
+                match ev.kind {
+                    EventKind::On  => self.note_on(ev.key, ev.velocity),
+                    EventKind::Off => self.note_off(ev.key),
+                }
+                i += 1;
+            }
+        }
+    }
+
+    /// Render a stretch of audio with no event handling; the caller has
+    /// already updated the voice set for this range.
+    fn render_range(&mut self, out_l: &mut [f32], out_r: &mut [f32]) {
         let n = out_l.len().min(out_r.len());
         if n == 0 { return; }
 
-        // Dry master (everything the voices produce, gain already
-        // applied) and the two send buses.
         let mut dry_l = vec![0.0f32; n];
         let mut dry_r = vec![0.0f32; n];
 
@@ -241,13 +305,11 @@ impl Sf2Engine {
             );
         }
 
-        // Sum the dry mix.
         for i in 0..n {
             out_l[i] += dry_l[i];
             out_r[i] += dry_r[i];
         }
 
-        // Reverb: fill its input with the send bus, process, add wet.
         if !rev_l.is_empty() {
             self.reverb.input[0].resize(n, 0.0);
             self.reverb.input[1].resize(n, 0.0);
@@ -266,7 +328,6 @@ impl Sf2Engine {
             }
         }
 
-        // Chorus: same pattern.
         if !cho_l.is_empty() {
             self.chorus.input[0].resize(n, 0.0);
             self.chorus.input[1].resize(n, 0.0);
@@ -333,18 +394,12 @@ impl VoiceSlot {
             );
 
             if ok {
-                // SF2 pan generator: -500 hard left, 0 centre, +500
-                // hard right.  Equal-power pan law.
                 let pan_raw = iv.gen_values[Gen::Pan].sh_amount() as f32;
                 let pan = (pan_raw / 500.0).clamp(-1.0, 1.0);
                 let theta = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
                 let gl = theta.cos();
                 let gr = theta.sin();
 
-                // SF2 send generators: 0..1000, in 0.1% steps.  These
-                // are what determines whether a note gets reverb or
-                // chorus at all, regardless of whether the units are
-                // running — same as FluidSynth.
                 let rev_send =
                     (iv.gen_values[Gen::ReverbEffectsSend].w_amount() as f32 / 1000.0)
                         .clamp(0.0, 1.0);

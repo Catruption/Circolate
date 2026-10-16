@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::convert::AuxFile;
-use crate::fallbacks::FallbackTable;
+use crate::deps::registry::RegistryTable;
 
 pub const FILENAME: &str = "requires.json";
 pub const FORMAT_TAG: &str = "trackscript-requires";
@@ -79,7 +79,7 @@ pub struct Bundle {
 /// Reads the `.instrument` sidecars; each carries the plugin's display
 /// name and its path on the machine that made the file.
 pub fn bundles_from_aux(aux: &[AuxFile]) -> Vec<Bundle> {
-    let table = FallbackTable::load_default().ok();
+    let table = RegistryTable::load().ok();
     let mut out: Vec<Bundle> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
@@ -88,7 +88,7 @@ pub fn bundles_from_aux(aux: &[AuxFile]) -> Vec<Bundle> {
             continue;
         }
         let text = String::from_utf8_lossy(&file.bytes);
-        let Ok(inst) = crate::instruments::parse(&text, &file.rel_path) else {
+        let Ok(inst) = crate::deps::instruments::parse(&text, &file.rel_path) else {
             continue;
         };
         if !inst.is_vst3() {
@@ -146,7 +146,7 @@ pub fn bundles_from_aux(aux: &[AuxFile]) -> Vec<Bundle> {
 
 pub fn build_from_aux(aux: &[AuxFile]) -> Requires {
     let bundles = bundles_from_aux(aux);
-    let table = FallbackTable::load_default().ok();
+    let table = RegistryTable::load().ok();
 
     let mut by_name: BTreeMap<String, PluginNeed> = BTreeMap::new();
     let mut fallbacks: Vec<FallbackUse> = Vec::new();
@@ -158,7 +158,7 @@ pub fn build_from_aux(aux: &[AuxFile]) -> Requires {
             continue;
         }
         let text = String::from_utf8_lossy(&file.bytes);
-        let Ok(inst) = crate::instruments::parse(&text, &file.rel_path) else {
+        let Ok(inst) = crate::deps::instruments::parse(&text, &file.rel_path) else {
             continue;
         };
         if !inst.is_vst3() || !inst.fallback || inst.replaces.is_empty() {

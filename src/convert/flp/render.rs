@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use crate::convert::{fmt, note_name, pos_str};
-use crate::sources::flp::Channel;
+use crate::formats::flp::Channel;
 
 use super::place::Placed;
 use super::{MAX_FULL_BEATS, PLAY_FULL_SAMPLE};
@@ -70,7 +70,7 @@ fn source_bpm(p: &Placed, ppq: u32, style: &NoteStyle) -> Option<f64> {
     };
 
     let speed = (end_ms - start_ms) / clip_ms;
-    let tolerance = (1.0 / ticks as f64).max(0.005);
+    let tolerance: f64 = (1.0 / ticks as f64).max(0.005);
     if (0.25..=4.0).contains(&speed) && (speed - 1.0).abs() > tolerance {
         Some(style.bpm / speed)
     } else {

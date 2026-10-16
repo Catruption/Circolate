@@ -2,12 +2,12 @@ fn main() {
     let sdk = std::env::var("VST3_SDK").unwrap_or_else(|_| "/opt/vst3sdk".to_string());
     let lib_dir = format!("{sdk}/build/lib/Release");
 
-    println!("cargo:rerun-if-changed=src/vst_shim.cpp");
+    println!("cargo:rerun-if-changed=src/hosting/vst/shim.cpp");
     println!("cargo:rerun-if-env-changed=VST3_SDK");
 
     cc::Build::new()
     .cpp(true)
-    .file("src/vst_shim.cpp")
+    .file("src/hosting/vst/shim.cpp")
     // The SDK cmake does not compile these into any library target —
     // they only land in the sample binaries.  Pull them into our
     // static lib so the linker can find Module::create and MemoryStream.

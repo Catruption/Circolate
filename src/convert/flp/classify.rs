@@ -7,11 +7,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::convert::{identifier, safe_name, AuxFile, ConvertOptions};
-use crate::fallbacks::FallbackTable;
+use crate::deps::registry::RegistryTable;
 use crate::fidelity::FIDELITY_FILENAME;
-use crate::plugins::PluginIndex;
-use crate::sources::flp::{self as flp_src, Channel};
-use crate::sources::flp_audio;
+use crate::deps::index::PluginIndex;
+use crate::formats::flp::{self as flp_src, Channel};
+use crate::formats::flp_audio;
 
 use super::place::Placed;
 use super::render::EmbeddedSample;
@@ -39,7 +39,7 @@ pub(super) fn classify_channels<'a>(
     opts: &ConvertOptions,
     flp_dir: &Path,
     plugin_index: &PluginIndex,
-    fallback_table: Option<&FallbackTable>,
+    fallback_table: Option<&RegistryTable>,
     aux_files: &mut Vec<AuxFile>,
 ) -> Classified<'a> {
     let mut usable_samples: Vec<(&Channel, PathBuf)> = Vec::new();
@@ -53,21 +53,13 @@ pub(super) fn classify_channels<'a>(
     let mut sf2_copied: HashMap<PathBuf, String> = HashMap::new();
     let mut sidecar_path: HashMap<u16, String> = HashMap::new();
 
-    // SF2 channels always route through the native engine now.  The
-    // engine is picked up at load time from the SF2 sidecar's `File:`
-    // field, so nothing SFLT-specific is needed here.
-
     for chan in &prj.channels {
         if !chan.enabled.unwrap_or(true) {
             skipped.push((chan, "disabled in FL".into()));
             continue;
         }
 
-        let active_envs = chan
-        .envelopes
-        .iter()
-        .filter(|e| e.env_enabled != 0)
-        .count();
+        let active_envs = chan.envelopes.iter().filter(|e| e.env_enabled != 0).count();
         if active_envs > 0 {
             let label = if chan.name.is_empty() {
                 chan.channel_type.clone()
@@ -80,10 +72,7 @@ pub(super) fn classify_channels<'a>(
         let has_notes = placed.get(&chan.iid).map_or(false, |v| !v.is_empty());
         if !has_notes {
             let has_content = !chan.sample_path.is_empty()
-            || chan
-            .plugin
-            .as_ref()
-            .map_or(false, |p| !p.state.is_empty());
+            || chan.plugin.as_ref().map_or(false, |p| !p.state.is_empty());
             if has_content
                 && matches!(
                     chan.channel_type.as_str(),
@@ -101,11 +90,7 @@ pub(super) fn classify_channels<'a>(
                     skipped.push((chan, "no sample path".into()));
                     continue;
                 }
-                match find_sample(
-                    &chan.sample_path,
-                    opts.samples_dir.as_deref(),
-                                  Some(flp_dir),
-                ) {
+                match find_sample(&chan.sample_path, opts.samples_dir.as_deref(), Some(flp_dir)) {
                     Some(p) => usable_samples.push((chan, p)),
                     None => {
                         let basename = Path::new(&chan.sample_path.replace('\\', "/"))
@@ -123,28 +108,49 @@ pub(super) fn classify_channels<'a>(
                     continue;
                 }
 
-                // 0. Slicex?  Its slices are cue points inside an embedded WAV and
-                //    notes pick slices by key, so build a SoundFont from them and
-                //    route the channel through the normal SF2 sidecar path.
+                if debug_on() {
+                    if let Some(p) = chan.plugin.as_ref() {
+                        eprintln!(
+                            "flp: chan {:>3} native internal={:?} display={:?} vst_path={:?} state_len={}",
+                            chan.iid,
+                            p.internal_name,
+                            p.display_name,
+                            p.vst_path,
+                            p.state.len(),
+                        );
+                    } else {
+                        eprintln!("flp: chan {:>3} native, no plugin", chan.iid);
+                    }
+                }
+
+                // 0. Slicex?
                 if let Some(plugin) = chan.plugin.as_ref() {
                     if slicex::is_slicex(plugin) {
                         match slicex::convert(chan, plugin, aux_files, &mut warnings) {
                             Ok(out) => {
                                 let (lo, hi) = (out.base_key, out.base_key + out.slices as u32);
-                                let stray = placed.get(&chan.iid).map_or(0, |v| {
+                                let mut stray_keys: Vec<u32> =
+                                placed.get(&chan.iid).map_or_else(Vec::new, |v| {
                                     v.iter()
-                                    .filter(|p| {
-                                        (p.note.key as u32) < lo || (p.note.key as u32) >= hi
-                                    })
-                                    .count()
+                                    .map(|p| p.note.key as u32)
+                                    .filter(|&k| k < lo || k >= hi)
+                                    .collect()
                                 });
+                                let stray = stray_keys.len();
+                                stray_keys.sort_unstable();
+                                stray_keys.dedup();
                                 if stray > 0 {
                                     warnings.push(format!(
-                                        "[{:2}] Slicex: {} note(s) outside slice keys {}..{} will be silent",
+                                        "[{:2}] Slicex: {} note(s) outside slice keys {}..{} will be silent (keys: {})",
                                                           chan.iid,
                                                           stray,
                                                           lo,
-                                                          hi - 1
+                                                          hi - 1,
+                                                          stray_keys
+                                                          .iter()
+                                                          .map(|k| k.to_string())
+                                                          .collect::<Vec<_>>()
+                                                          .join(", ")
                                     ));
                                 }
                                 sidecar_path.insert(chan.iid, out.instrument_rel);
@@ -156,25 +162,41 @@ pub(super) fn classify_channels<'a>(
                     }
                 }
 
-                // 1. SoundFont player?  Its state carries the SF2 path
-                //    (and bank/patch).  Runs before the embedded-audio
-                //    scan so nothing else claims the channel.
+                // 1. SoundFont player?
+                //
+                //    Gated on the plugin's declared identity, not just on
+                //    whether its state blob contains the bytes ".sf2".
+                //    Synths like Serum, FLEX, DirectWave, and any plugin
+                //    with a preset name or path fragment containing
+                //    ".sf2" were being fed to the state parser and either
+                //    silently classified wrong or dropped.
                 if let Some(plugin) = chan.plugin.as_ref() {
-                    if plugin.vst_path.is_empty() && plugin.state.len() < SF2_STATE_MAX {
-                        if debug_on()
-                            && !plugin
-                            .state
-                            .windows(4)
-                            .any(|w| w.eq_ignore_ascii_case(b".sf2"))
-                            {
-                                let n = plugin.state.len();
-                                eprintln!(
-                                    "flp: chan {} native state {} bytes, no .sf2 marker; first 64: {}",
-                                    chan.iid,
-                                    n,
-                                    hex(&plugin.state[..n.min(64)])
-                                );
-                            }
+                    let is_sf2_plugin = sf2::is_sf2_player(plugin);
+                    let has_sf2_marker = plugin
+                    .state
+                    .windows(4)
+                    .any(|w| w.eq_ignore_ascii_case(b".sf2"));
+
+                    if debug_on() {
+                        let n = plugin.state.len();
+                        eprintln!(
+                            "flp: chan {} native internal={:?} sf2_player={} has_marker={} state={} bytes",
+                            chan.iid, plugin.internal_name, is_sf2_plugin, has_sf2_marker, n,
+                        );
+                        if !has_sf2_marker && plugin.vst_path.is_empty() && n > 0 {
+                            eprintln!(
+                                "flp: chan {} first 64: {}",
+                                chan.iid,
+                                hex(&plugin.state[..n.min(64)])
+                            );
+                        }
+                    }
+
+                    if is_sf2_plugin
+                        && plugin.vst_path.is_empty()
+                        && plugin.state.len() < SF2_STATE_MAX
+                        && has_sf2_marker
+                        {
                             if let Some(sf) = sf2::parse_sf2_state(&plugin.state) {
                                 if let Some(rel) = handle_sf2(
                                     chan,
@@ -191,7 +213,7 @@ pub(super) fn classify_channels<'a>(
                                 }
                                 continue;
                             }
-                    }
+                        }
                 }
 
                 // 2. Embedded audio in plugin state?
@@ -203,10 +225,7 @@ pub(super) fn classify_channels<'a>(
                 }
 
                 // 3. VST — resolve to installed plugin, fallback, or warn.
-                let has_state = chan
-                .plugin
-                .as_ref()
-                .map_or(false, |p| !p.state.is_empty());
+                let has_state = chan.plugin.as_ref().map_or(false, |p| !p.state.is_empty());
                 if !has_state {
                     skipped.push((chan, "native channel without saved state".into()));
                     continue;
@@ -234,7 +253,12 @@ pub(super) fn classify_channels<'a>(
                             path.display()
                         ));
                     }
-                    Resolved::Fallback { name, path, replaces, .. } => {
+                    Resolved::Fallback {
+                        name,
+                        path,
+                        replaces,
+                        ..
+                    } => {
                         let path_str = path
                         .as_ref()
                         .map(|p| p.display().to_string())
@@ -254,6 +278,20 @@ pub(super) fn classify_channels<'a>(
 
                 resolved_map.insert(chan.iid, resolved);
                 usable_natives.push(chan);
+
+                if debug_on() {
+                    eprintln!(
+                        "flp: chan {:>3} native -> {:?}",
+                        chan.iid,
+                        match resolved_map.get(&chan.iid) {
+                            Some(Resolved::Exact { name, .. }) => format!("Exact({})", name),
+                              Some(Resolved::Fallback { name, path, .. }) =>
+                              format!("Fallback({} -> {:?})", name, path),
+                                  Some(Resolved::Unresolved { name }) => format!("Unresolved({})", name),
+                              None => "??".into(),
+                        }
+                    );
+                }
             }
             other => {
                 skipped.push((chan, format!("channel type '{}' not converted", other)));
@@ -315,13 +353,6 @@ pub(super) fn classify_channels<'a>(
 
 // ── SF2 handling ───────────────────────────────────────────────────────
 
-/// Resolve an SF2-state channel to a bundle-relative `.instrument`
-/// sidecar.  The SF2 file itself is copied into the bundle under
-/// `samples/`, and the sidecar's `File:` field points at that copy.
-/// The player builds a native `Sf2Engine` from it at load time.
-///
-/// Returns the relative path of the `.instrument` sidecar, or `None`
-/// if the SF2 couldn't be found on disk.
 fn handle_sf2<'a>(
     chan: &'a Channel,
     sf: &SfState,
@@ -339,7 +370,7 @@ fn handle_sf2<'a>(
     .unwrap_or("?")
     .to_string();
 
-    let soundfonts_dir: Option<PathBuf> = crate::fallbacks::repo_root()
+    let soundfonts_dir: Option<PathBuf> = crate::deps::registry::install_root()
     .map(|r| r.join("soundfonts"))
     .filter(|p| p.is_dir());
 
@@ -396,9 +427,6 @@ fn handle_sf2<'a>(
     )
 }
 
-/// Copy the `.sf2` into the output bundle and write an `.instrument`
-/// sidecar with `Kind: sf2`.  The `File:` field references the bundle-
-/// relative copy so the resulting trackscript is self-contained.
 fn write_sf2_sidecar<'a>(
     chan: &'a Channel,
     base: &str,
@@ -460,10 +488,6 @@ fn write_sf2_sidecar<'a>(
 
 // ── embedded audio handling ────────────────────────────────────────────
 
-/// Extract every embedded sample zone from a plugin state.  Returns a
-/// single `EmbeddedSample` carrying all zones; playback uses the first,
-/// the fidelity sidecar records all of them.  Returns None if nothing
-/// usable was found.
 fn extract_embedded(
     chan: &Channel,
     state: &[u8],

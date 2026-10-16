@@ -45,7 +45,7 @@ fn synesthetic_bg(pitch_hz: f64, vol: f64, synth: &SynesthesiaConfig) -> Option<
     if !synth.enabled {
         return None;
     }
-    let midi = crate::sources::trackscript::hz_to_note(pitch_hz);
+    let midi = crate::formats::trackscript::hz_to_note(pitch_hz);
     let hue = midi.rem_euclid(12) as f64 * synth.hue_step;
     let sat = if synth.saturation_from_volume {
         (vol / 100.0).clamp(0.0, 1.0) * synth.saturation_scale

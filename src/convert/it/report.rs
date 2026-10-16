@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 use super::helpers::*;
 use super::render::build_sections;
 use super::sim::{note_name_from_it, Converter};
-use crate::sources::it::Module;
+use crate::formats::it::Module;
 
 pub(super) fn make_report(
     conv: &mut Converter,

@@ -1,8 +1,0 @@
-{
-  "chain": [
-    {
-      "name": "Dragonfly Hall Reverb",
-      "path": "plugins/dragonfly-reverb-3.2.10/DragonflyHallReverb.vst3"
-    }
-  ]
-}

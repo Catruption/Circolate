@@ -1,9 +1,11 @@
-// src/sources/mod.rs
+//! Raw format parsers.  Bytes to structs and back, no policy.
+
 pub mod flp;
+pub mod flp_audio;
 pub mod it;
 pub mod midi;
+pub mod sf2;
 pub mod trackscript;
-pub mod flp_audio;
 
 use anyhow::{anyhow, bail, Result};
 use std::path::Path;
@@ -30,10 +32,10 @@ impl SourceKind {
         }
 
         let ext = p
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|s| s.to_ascii_lowercase())
-            .ok_or_else(|| anyhow!("no file extension on {}", p.display()))?;
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .ok_or_else(|| anyhow!("no file extension on {}", p.display()))?;
 
         Ok(match ext.as_str() {
             "flp" => SourceKind::Flp,

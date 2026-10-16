@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::sources::it::{
+use crate::formats::it::{
     note_termination, Instrument, ITEnvelope, Module, NoteTermination, PatternEvent,
 };
 

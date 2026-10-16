@@ -19,7 +19,7 @@ use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::fallbacks::{Acquire, FallbackTable};
+use crate::deps::registry::{Acquire, RegistryTable};
 
 pub fn run(argv: &[String]) -> Result<()> {
     let mut dry = false;
@@ -43,7 +43,7 @@ pub fn run(argv: &[String]) -> Result<()> {
         }
     }
 
-    let table = FallbackTable::load_default()
+    let table = RegistryTable::load()
     .context("fallbacks.json not found (run from the repo root)")?;
 
     // Make sure we're at the repo root for relative paths in the JSON.

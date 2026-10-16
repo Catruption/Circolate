@@ -6,7 +6,7 @@
 //! ratatui, colours, or note states.  Formatting for the tracker
 //! views lives in `crate::tui::shared::note_fmt`.
 
-use crate::sources::trackscript::TrackscriptEvent;
+use crate::formats::trackscript::TrackscriptEvent;
 
 #[derive(Clone)]
 pub struct Point {

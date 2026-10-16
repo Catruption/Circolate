@@ -17,11 +17,11 @@ use crate::archive;
 use crate::convert::{self, ConvertOptions};
 use crate::effects::EffectChain;
 use crate::player::{self, Cache, Engine, Loader, Msg, Project, Transport};
-use crate::sources::SourceKind;
+use crate::formats::SourceKind;
 use crate::tui;
 use crate::tui::config::{Config, Settings};
 use crate::tui::state as queue;
-use crate::vst_host_ffi::VstHost;
+use crate::hosting::vst::ffi::VstHost;
 
 // ── silence guard ──────────────────────────────────────────────────────
 
@@ -311,6 +311,10 @@ fn install_vst_hosts(engine: &mut Engine, project: &player::Project) {
 /// Install a native SF2 engine for every `Sf2EngineSpec` in the project.
 /// `sf2_override` (from `--sf2`) replaces the SF2 each spec references;
 /// the spec's bank/patch/gain are preserved either way.
+///
+/// The engine must be `.load()`ed with the file path before
+/// `install_sf2_engine` hands it to the mixer.  Constructing the engine,
+/// setting a preset, and installing it without loading leaves it silent.
 fn install_sf2_engines(
     engine: &mut Engine,
     project: &player::Project,
@@ -319,9 +323,18 @@ fn install_sf2_engines(
     for (name, spec) in &project.sf2_engine_specs {
         let path = sf2_override.unwrap_or(&spec.sf2_path);
 
-        let mut sf2 = crate::sf2_engine::Sf2Engine::new(project.sample_rate);
+        let mut sf2 = crate::hosting::sf2::engine::Sf2Engine::new(project.sample_rate);
+        if let Err(e) = sf2.load(&path) {
+            eprintln!(
+                "sf2 [{}]: failed to load {}: {:#}",
+                name,
+                path.display(),
+                e,
+            );
+            continue;
+        }
         sf2.set_preset(spec.bank, spec.preset);
-        sf2.set_gain(crate::sf2_engine::DEFAULT_GAIN * spec.gain);
+        sf2.set_gain(crate::hosting::sf2::engine::DEFAULT_GAIN * spec.gain);
         engine.install_sf2_engine(spec.iid, sf2);
     }
 }
@@ -401,9 +414,6 @@ fn worker(
     wrap_tx: Sender<Msg>,
 ) {
     let mut epoch = 0u64;
-    // True once the start of the song has been pre-built and handed to
-    // the audio callback.  While set, the loader sits at the start of the
-    // song, so normal streaming is paused until the callback wraps.
     let mut wrap_ready = false;
     let mut last_wraps = tp.loop_wraps.load(Ordering::Acquire);
     let tail_margin = lookahead * 8;
@@ -454,9 +464,6 @@ fn worker(
             }
             tp.loaded_lines.store(loader.cursor as i64, Ordering::Relaxed);
 
-            // Near the end of a song that still owes a repeat: load the
-            // rest of the tail, then pre-build the first batch of the
-            // song so the callback can wrap with no gap and no reload.
             if tp.loop_next.load(Ordering::Acquire)
                 && tp.speed.load(Ordering::Relaxed) == 1
                 && total > 0
@@ -540,7 +547,6 @@ fn play_one(
         .default_output_device()
         .ok_or_else(|| anyhow!("no default output device"))?;
     let device_config = device.default_output_config()?;
-        let device_config = device.default_output_config()?;
     if device_config.sample_format() != cpal::SampleFormat::F32 {
         bail!(
             "default output format is {:?}; this player only drives f32 devices for now",
@@ -597,9 +603,6 @@ fn play_one(
         }
     };
 
-    // A song launched from the command line isn't in the queue, so its
-    // loop count would never apply.  Put it in the cursor line (if that
-    // line is empty) so the [n] counter works for it too.
     let mut queue = queue;
     if queue.playing.is_none() {
         if let Some(name) = song
@@ -701,14 +704,6 @@ fn play_one(
             let loop_next = tp.loop_next.load(Ordering::Acquire);
 
             // ── End-of-song fallback ───────────────────────────────
-            // The loader pre-builds the next pass and ships it via
-            // wrap_rx.  If the tail Batch that came with it didn't
-            // keep `engine.ready` true across the boundary — which
-            // happens whenever the current pass has been fully
-            // rendered and the tail is empty — the engine sits at
-            // `!ready` and we'd otherwise return silence forever.
-            // Apply the wrap here so the loop survives even when the
-            // seamless-buffer path can't be reached.
             if !engine.ready && speed == 1 && loop_next && pending_wrap.is_some() {
                 if let Some(m) = pending_wrap.take() {
                     if let Msg::Seek { epoch, .. } = &m {
@@ -747,9 +742,6 @@ fn play_one(
                 right.resize(frames, 0.0);
             }
             let (l, r) = (&mut left[..frames], &mut right[..frames]);
-            // Seamless repeat: render up to the end of the song, jump to
-            // the pre-built start, and render the rest of this buffer
-            // from there.
             let mut head = 0usize;
             if can_wrap {
                 let rem = (total - engine.pos).max(0) as usize;
@@ -794,7 +786,7 @@ fn play_one(
     let notes: Vec<String> = project
         .requires
         .as_ref()
-        .map(|r| crate::requires::report_lines(r))
+        .map(|r| crate::deps::requires::report_lines(r))
         .unwrap_or_default();
 
     let (request, queue) = tui::run_against(
@@ -852,9 +844,6 @@ pub fn run(argv: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    // Live playback: the TUI owns the terminal for the entire loop.
-    // Settings are reloaded per song so a `player_settings.json` next
-    // to a `.trackscript` applies when that song comes up in the queue.
     let mut term = tui::setup()?;
     let mut song = args.song.clone();
     let mut queue = queue::QueueState::new();
