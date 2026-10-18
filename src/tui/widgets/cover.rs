@@ -6,7 +6,10 @@
 
 use image::GenericImageView;
 use ratatui::{buffer::Buffer, style::Color};
-use std::path::Path;
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 /// Brightness multiplier applied to the cover image.  0.5 = "half
 /// transparency" — the image is visible but text on top stays readable.
@@ -96,6 +99,39 @@ impl Cover {
         }
         Some(self.cells[row * self.cols + col])
     }
+}
+
+/// Pick a random image file from `dir`, for songs that ship no cover of
+/// their own.  Files are recognised by their magic bytes, not their
+/// names, so any filename (or none of an extension) works; anything
+/// that isn't a png/jpeg/webp/gif is skipped, as are subdirectories.
+/// Returns `None` if the directory is missing or holds no images.
+///
+/// Call this once per song and keep the result: it is random each call,
+/// so re-picking on every resize or redraw would swap the image.
+pub fn random_image_in(dir: &Path) -> Option<PathBuf> {
+    let mut images: Vec<PathBuf> = std::fs::read_dir(dir)
+    .ok()?
+    .filter_map(|e| e.ok())
+    .map(|e| e.path())
+    .filter(|p| p.is_file() && looks_like_image(p))
+    .collect();
+    if images.is_empty() {
+        return None;
+    }
+    // Sort so the choice depends only on the random number, not on
+    // directory iteration order.
+    images.sort();
+    // std-only randomness: RandomState is seeded randomly per instance.
+    let r = RandomState::new().build_hasher().finish() as usize;
+    Some(images.swap_remove(r % images.len()))
+}
+
+fn looks_like_image(path: &Path) -> bool {
+    let mut head = [0u8; 16];
+    let Ok(mut f) = std::fs::File::open(path) else { return false };
+    let Ok(n) = f.read(&mut head) else { return false };
+    guess_format(&head[..n]) != "unknown"
 }
 
 /// Paint the cover as a background over every cell that doesn't carry

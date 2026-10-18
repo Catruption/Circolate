@@ -57,6 +57,7 @@ pub(crate) struct Sf2EngineSpec {
 #[derive(Clone, Copy)]
 pub(crate) struct Sf2VoiceEnvelope {
     pub peak: f32,
+    pub delay_sec: f32,
     pub attack_sec: f32,
     pub hold_sec: f32,
     pub decay_sec: f32,
@@ -68,6 +69,7 @@ impl Default for Sf2VoiceEnvelope {
     fn default() -> Self {
         Sf2VoiceEnvelope {
             peak: 1.0,
+            delay_sec: 0.0,
             attack_sec: 0.0,
             hold_sec: 0.0,
             decay_sec: 0.0,
@@ -216,12 +218,23 @@ fn voice_for_zone(z: &Sf2ZoneEntry, key: u8, fine_pitch_cents: f64) -> Sf2VoiceS
     }
 }
 
+/// Per-instrument overrides for generated Slicex SoundFonts. Ordinary SF2
+/// instruments pass `None` and retain their parsed zone settings.
+#[derive(Clone, Copy)]
+pub(crate) struct Sf2InstrumentOverrides {
+    pub pan: f64,
+    pub gain: f32,
+    pub tune_cents: i16,
+    pub env: Sf2VoiceEnvelope,
+}
+
 pub(crate) fn build_sf2_instrument(
     bytes: &[u8],
     bank: u16,
     preset: u16,
     base_id: u32,
     samples: &mut HashMap<u32, Arc<Sample>>,
+    overrides: Option<Sf2InstrumentOverrides>,
 ) -> anyhow::Result<Sf2Instrument> {
     let sf2 = match Sf2File::load_preset_bytes(bytes, bank, preset) {
         Ok(f) => f,
@@ -278,11 +291,23 @@ pub(crate) fn build_sf2_instrument(
         }
         let env = Sf2VoiceEnvelope {
             peak: attenuation_cb_to_linear(z.initial_attenuation_cb),
+            delay_sec: 0.0,
             attack_sec,
             hold_sec: timecents_to_secs(z.hold_timecents),
             decay_sec: timecents_to_secs(z.decay_timecents),
             sustain_fraction: attenuation_cb_to_linear(z.sustain_level_cb),
             release_sec,
+        };
+        let (pan, tune_cents, env) = if let Some(o) = overrides {
+            let mut env = o.env;
+            env.peak = (env.peak * o.gain).clamp(0.0, 1.0);
+            (
+                (o.pan.clamp(-1.0, 1.0) * 500.0).round() as i16,
+                o.tune_cents,
+                env,
+            )
+        } else {
+            (0, z.tune_cents, env)
         };
 
         zones.push(Sf2ZoneEntry {
@@ -292,9 +317,9 @@ pub(crate) fn build_sf2_instrument(
             vel_hi: z.vel_hi,
             sample_id: sid,
             root_key,
-            tune_cents: z.tune_cents,
+            tune_cents,
             scale_tuning: 100,
-            pan: 0,
+            pan,
             env,
         });
     }

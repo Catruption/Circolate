@@ -266,3 +266,70 @@ fn search_basename(dir: &Path, basename: &OsStr, depth: usize) -> Option<PathBuf
     }
     None
 }
+// src/convert/flp/wav.rs
+// Replace the `crop_wav` function you added with this one.
+// (Do not add an extra `use anyhow::Context;` at the bottom, the file already has it.)
+
+/// Physically crop a WAV file to the given start and end sample indices.
+/// `start_sample` and `end_sample` are absolute frame indices (not bytes).
+/// This slices the raw `data` chunk and patches the RIFF and `data` size fields.
+pub fn crop_wav(bytes: &[u8], start_sample: u32, end_sample: u32) -> anyhow::Result<Vec<u8>> {
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Ok(bytes.to_vec()); // Not a valid WAV, return as-is
+    }
+
+    let reader = hound::WavReader::new(std::io::Cursor::new(bytes))?;
+    let spec = reader.spec();
+    let channels = spec.channels as usize;
+    let bytes_per_sample = (spec.bits_per_sample / 8) as usize;
+    let block_align = channels * bytes_per_sample;
+
+    let start_byte = (start_sample as usize) * block_align;
+    let end_byte = (end_sample as usize) * block_align;
+
+    let mut data_offset = 0;
+    let mut data_size = 0;
+    let mut data_size_offset = 0;
+    let mut p = 12;
+
+    while p + 8 <= bytes.len() {
+        let chunk_id = &bytes[p..p + 4];
+        let chunk_size = u32::from_le_bytes(bytes[p + 4..p + 8].try_into().unwrap()) as usize;
+        if chunk_id == b"data" {
+            data_offset = p + 8;
+            data_size = chunk_size;
+            data_size_offset = p + 4;
+            break;
+        }
+        p += 8 + chunk_size;
+        if chunk_size % 2 != 0 {
+            p += 1;
+        }
+    }
+
+    if data_offset == 0 {
+        return Ok(bytes.to_vec()); // No data chunk found
+    }
+
+    let actual_start = data_offset + start_byte;
+    let actual_end = (data_offset + end_byte)
+    .min(data_offset + data_size)
+    .min(bytes.len());
+    let new_data_size = actual_end.saturating_sub(actual_start);
+
+    if new_data_size == 0 {
+        return Ok(bytes.to_vec());
+    }
+
+    let mut out = Vec::with_capacity(actual_start + new_data_size);
+    out.extend_from_slice(&bytes[..actual_start]);
+    out.extend_from_slice(&bytes[actual_start..actual_end]);
+
+    // Patch RIFF size (total file size minus 8 bytes) and data chunk size
+    let out_len = (out.len() - 8) as u32;
+    out[4..8].copy_from_slice(&out_len.to_le_bytes());
+    out[data_size_offset..data_size_offset + 4]
+    .copy_from_slice(&(new_data_size as u32).to_le_bytes());
+
+    Ok(out)
+}

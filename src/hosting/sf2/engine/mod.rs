@@ -29,7 +29,7 @@ pub use host::Sf2HostData;
 
 const MAX_POLY: usize = 64;
 
-pub const DEFAULT_GAIN: f32 = 0.22;
+pub const DEFAULT_GAIN: f32 = 1.0;
 
 pub struct Sf2Engine {
     sf: Option<Arc<SoundFont>>,
@@ -147,6 +147,10 @@ impl Sf2Engine {
     pub fn set_preset(&mut self, bank: u8, patch: u8) {
         self.bank = bank;
         self.patch = patch;
+    }
+    pub fn has_preset(&self, bank: u16, preset: u16) -> bool {
+        let Some(sf) = &self.sf else { return false };
+        sf.presets.iter().any(|p| p.bank == bank && p.preset == preset)
     }
 
     pub fn set_gain(&mut self, gain: f32) { self.gain = gain; }

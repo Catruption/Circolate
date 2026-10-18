@@ -17,6 +17,7 @@ mod export;
 mod fidelity;
 mod formats;
 mod hosting;
+mod measure;
 mod mixer;
 mod play;
 mod player;
@@ -46,6 +47,8 @@ fn main() -> Result<()> {
         Some("dump")      => dump::run(rest),
         Some("test")      => test::run(rest),
         Some("check")     => check::run(rest),
+        Some("census")    => check::run_census(rest),
+        Some("measure")   => measure::run(rest),
         Some("plugins")   => deps::index::run(rest),
         Some("fetch")     => deps::fetch::run(rest),
         Some("vst-smoke") => hosting::vst::smoke::run(rest),
@@ -74,7 +77,11 @@ fn print_help() {
     println!("  export    <file> [-o DIR]   convert a source file to trackscript");
     println!("  dump      <file>            print a file's parsed structure as JSON");
     println!("  test      <file>            run diagnostics");
-    println!("  check     [path]            recursively probe .flp files for missing deps");
+    println!("  check     [path] [flags]    recursively probe .flp files for missing deps");
+    println!("             --scaffold-fallbacks  add empty rules for new required plugins");
+    println!("             --write-requirements FILE  write required_plugins.json");
+    println!("  census    [path] [--out F]  tally plugin names across all .flp files");
+    println!("  measure   [--all] [--out F] measure plugin default output levels");
     println!("  plugins   [--paths]         list discovered VST3 / LV2 / CLAP");
     println!("  fetch     [--dry] [--only NAME]");
     println!("                              download missing fallback plugins");

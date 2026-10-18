@@ -1,11 +1,10 @@
-//! Plugin dependencies: what a project needs, where it lives, and how
-//! to substitute when the original isn't available.
-//!
-//! Knows *what* a dependency is.  Does not know how to make sound —
-//! that's `crate::hosting`.
+//! Plugin dependency resolution: registry, index, inventory, census.
 
+pub mod census;
 pub mod fetch;
+pub mod fallbacks;
 pub mod index;
+pub mod instruments;
+pub mod inventory;
 pub mod registry;
 pub mod requires;
-pub mod instruments;

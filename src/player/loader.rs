@@ -86,13 +86,13 @@ pub(crate) fn prepare_line(
         let Some(part) = project.parts.get(&call.name) else { continue };
         let tpl = cache.template(
             project.part_hash_map()[&call.name],
-            part,
-            &project.path_to_id,
-            &project.samples,
-            &project.sf2_instruments,
-            &project.sf2_engine_specs,
-            &project.vst_instruments,
-            &project.multi_sample_instruments,
+                                 part,
+                                 &project.path_to_id,
+                                 &project.samples,
+                                 &project.sf2_instruments,
+                                 &project.sf2_engine_specs,
+                                 &project.vst_instruments,
+                                 &project.multi_sample_instruments,
         );
 
         let measure_start = call.pattern_measure_start;
@@ -145,11 +145,11 @@ pub(crate) fn prepare_line(
             let mut offset = tv.offset as f64;
             if let Some(src_bpm) = tv.src_bpm {
                 let beat_secs = tempo.time_at_row(start_row + part.subs_per_beat as f64)
-                    - tempo.time_at_row(start_row);
+                - tempo.time_at_row(start_row);
                 if beat_secs > 0.0 {
                     let song_bpm = 60.0 / beat_secs;
                     let factor = src_bpm / song_bpm;
-                    if (factor - 1.0).abs() > 0.001 && factor > 0.05 && factor < 20.0 {
+                    if (factor - 1.0).abs() > 0.001 && factor > 0.01 && factor < 100.0 {
                         sample = cache.stretched(tv.sample_id, &sample, factor);
                         offset *= factor;
                     }
@@ -161,9 +161,9 @@ pub(crate) fn prepare_line(
                     return None;
                 }
                 let abs: Vec<_> = wp
-                    .iter()
-                    .map(|&(r, d, x)| (call_base_row + r - measure_start, d, x))
-                    .collect();
+                .iter()
+                .map(|&(r, d, x)| (call_base_row + r - measure_start, d, x))
+                .collect();
                 Some(AutomationLane::new(initial, start_row, &abs, tempo))
             };
 
@@ -178,12 +178,12 @@ pub(crate) fn prepare_line(
                 vol,
                 pan,
                 pitch_lane: mk(&tv.pitch_wp, tv.pitch_hz),
-                vol_lane: mk(&tv.vol_wp, vol),
-                pan_lane: mk(&tv.pan_wp, pan),
-                const_gain: gains(vol, pan, project.song_volume, project.linear_pan),
-                part_path: part.sample_path.clone(),
-                source_row: tv.rel_row,
-                env: tv.env,
+                         vol_lane: mk(&tv.vol_wp, vol),
+                         pan_lane: mk(&tv.pan_wp, pan),
+                         const_gain: gains(vol, pan, project.song_volume, project.linear_pan),
+                         part_path: part.sample_path.clone(),
+                         source_row: tv.rel_row,
+                         env: tv.env,
             });
 
             if let Ok(target) = std::env::var("VOICE_TRACE_SAMPLE") {
@@ -191,8 +191,8 @@ pub(crate) fn prepare_line(
                     if tv.sample_id == tid {
                         eprintln!(
                             "vtrace: scheduled sample {} start={} end={} ({} samples, {:.3}s) offset={} pitch_hz={:.2} vol={}",
-                            tv.sample_id, start, end, end - start,
-                            (end - start) as f64 / sr, offset, tv.pitch_hz, vol
+                                  tv.sample_id, start, end, end - start,
+                                  (end - start) as f64 / sr, offset, tv.pitch_hz, vol
                         );
                     }
                 }
@@ -221,7 +221,7 @@ pub(crate) fn prepare_line(
                 line: li as u32,
                 seq,
                 part_path: part.sample_path.clone(),
-                source_row: vn.rel_row,
+                      source_row: vn.rel_row,
             });
         }
     }

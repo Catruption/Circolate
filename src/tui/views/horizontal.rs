@@ -26,6 +26,7 @@ use crate::tui::shared::braille::{braille_char, dot_bit};
 use crate::tui::shared::label;
 use crate::tui::shared::note_fmt::fmt_note;
 use crate::tui::shared::note_style::{note_style, NoteState};
+use crate::tui::shared::waveform::rasterize_time_y;
 use crate::tui::state::{RenderState, TrackerColumnHit, TrackerHit};
 use crate::tui::theme::{Theme, Token};
 
@@ -78,9 +79,9 @@ pub fn draw(
         }
         by_path.entry(key).or_default().push((
             call.name.clone(),
-            0.0,
-            call.pattern_measure_start,
-            call.pattern_measure_len,
+                                              0.0,
+                                              call.pattern_measure_start,
+                                              call.pattern_measure_len,
         ));
     }
 
@@ -93,14 +94,14 @@ pub fn draw(
             let measure_end = call.pattern_measure_start + call.pattern_measure_len;
             let still_on = split_notes(
                 p.part_events(&call.name),
-                subs,
-                p.part_sample_offset_u32(&call.name),
+                                       subs,
+                                       p.part_sample_offset_u32(&call.name),
             )
             .iter()
             .any(|n| {
                 n.start_row >= call.pattern_measure_start
-                    && n.start_row < measure_end
-                    && (n.end_row - call.pattern_measure_start) > offset_rows
+                && n.start_row < measure_end
+                && (n.end_row - call.pattern_measure_start) > offset_rows
             });
             if !still_on {
                 continue;
@@ -111,9 +112,9 @@ pub fn draw(
             }
             by_path.entry(key).or_default().push((
                 call.name.clone(),
-                offset_rows,
-                call.pattern_measure_start,
-                call.pattern_measure_len,
+                                                  offset_rows,
+                                                  call.pattern_measure_start,
+                                                  call.pattern_measure_len,
             ));
         }
     }
@@ -126,11 +127,11 @@ pub fn draw(
 
     let present: HashSet<&String> = discovery.iter().collect();
     let mut merged: Vec<String> = state
-        .column_order
-        .iter()
-        .filter(|path| present.contains(path))
-        .cloned()
-        .collect();
+    .column_order
+    .iter()
+    .filter(|path| present.contains(path))
+    .cloned()
+    .collect();
     for path in &discovery {
         if !merged.iter().any(|m| m == path) {
             merged.push(path.clone());
@@ -152,8 +153,8 @@ pub fn draw(
     let max_visible = (inner_w / (min_col_w + 1)).max(1);
     let visible_cols = path_count.min(max_visible);
     let col_w = (inner_w / visible_cols)
-        .saturating_sub(1)
-        .clamp(min_col_w, max_col_w);
+    .saturating_sub(1)
+    .clamp(min_col_w, max_col_w);
 
     let char_rows = inner_h.saturating_sub(1);
     let pixel_rows = char_rows * 4;
@@ -166,9 +167,9 @@ pub fn draw(
     let current_row = playhead_frac * rpmeasure;
 
     let header_names: Vec<Option<String>> = path_order
-        .iter()
-        .map(|path| by_path[path].first().map(|(n, _, _, _)| n.clone()))
-        .collect();
+    .iter()
+    .map(|path| by_path[path].first().map(|(n, _, _, _)| n.clone()))
+    .collect();
 
     let snap = mute::snapshot();
     let muted_parts = &snap.muted_parts;
@@ -193,8 +194,8 @@ pub fn draw(
 
             for mut note in split_notes(
                 p.part_events(name),
-                subs,
-                p.part_sample_offset_u32(name),
+                                        subs,
+                                        p.part_sample_offset_u32(name),
             ) {
                 if note.start_row < *measure_start || note.start_row >= measure_end {
                     continue;
@@ -238,16 +239,16 @@ pub fn draw(
         let mut idx: Vec<usize> = (0..notes.len()).collect();
         idx.sort_by(|&a, &b| {
             notes[a]
-                .value_offset
-                .partial_cmp(&notes[b].value_offset)
+            .value_offset
+            .partial_cmp(&notes[b].value_offset)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                notes[a]
+                .note
+                .start_row
+                .partial_cmp(&notes[b].note.start_row)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| {
-                    notes[a]
-                        .note
-                        .start_row
-                        .partial_cmp(&notes[b].note.start_row)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
+            })
         });
         let notes: Vec<DisplayNote> = idx.iter().map(|&i| notes[i].clone()).collect();
         let bl: Vec<usize> = idx.iter().map(|&i| block_line_for_note[i]).collect();
@@ -277,39 +278,44 @@ pub fn draw(
     // Which columns have a note currently under the playhead?  Drives
     // the block-number highlight in the header.
     let col_playing: Vec<bool> = (0..visible_cols)
-        .map(|col| {
-            columns[col].iter().any(|line| {
-                if let ColumnLine::Note(dn) = line {
-                    dn.display_end > 0.0
-                        && dn.display_start <= current_row
-                        && current_row < dn.display_end
-                } else {
-                    false
-                }
-            })
+    .map(|col| {
+        columns[col].iter().any(|line| {
+            if let ColumnLine::Note(dn) = line {
+                dn.display_end > 0.0
+                && dn.display_start <= current_row
+                && current_row < dn.display_end
+            } else {
+                false
+            }
         })
-        .collect();
+    })
+    .collect();
 
-    // Envelopes.
+    // Build the per-column dot matrix. Two-step so the envelope can be
+    // cached per pixel row while the dot matrix is recomputed each
+    // frame (col_w can change on resize while pixel_rows stays fixed).
+    // `rasterize_time_y` is shared with the vertical view — it handles
+    // auto-scaling (so a 0.058-gain synth doesn't render as a 5%
+    // strip) and the pixel-range clamping in one place.
     if state.last_synth_env.len() < visible_cols {
         state.last_synth_env.resize_with(visible_cols, Vec::new);
     }
-    let mut envelopes: Vec<Vec<(f32, f32)>> = Vec::with_capacity(visible_cols);
+    let mut dot_matrices: Vec<Vec<Vec<bool>>> = Vec::with_capacity(visible_cols);
     for col in 0..visible_cols {
         let path = &path_order[col];
         let Some((name, _, _, _)) = by_path[path].first() else {
-            envelopes.push(vec![(0.0, 0.0); pixel_rows]);
+            dot_matrices.push(vec![vec![false; col_w * 2]; pixel_rows]);
             continue;
         };
-        if let Some(sample) = p.preview_sample_for_part(name) {
+        let env: Vec<(f32, f32)> = if let Some(sample) = p.preview_sample_for_part(name) {
             let key = (path.clone(), pixel_rows);
-            let env = state
-                .sample_env_cache
-                .entry(key)
-                .or_insert_with(|| whole_sample_envelope(&sample, pixel_rows));
-            envelopes.push(env.clone());
+            state
+            .sample_env_cache
+            .entry(key)
+            .or_insert_with(|| whole_sample_envelope(&sample, pixel_rows))
+            .clone()
         } else {
-            let env = p.iid_for_part(name).and_then(|iid| {
+            let live = p.iid_for_part(name).and_then(|iid| {
                 scope_snapshot(iid as usize, &mut state.snapshot);
                 if state.snapshot.is_empty() {
                     None
@@ -318,21 +324,22 @@ pub fn draw(
                     if e.is_empty() { None } else { Some(e) }
                 }
             });
-            match env {
+            match live {
                 Some(env) => {
                     state.last_synth_env[col] = env.clone();
-                    envelopes.push(env);
+                    env
                 }
                 None => {
                     let cached = &state.last_synth_env[col];
                     if cached.len() == pixel_rows {
-                        envelopes.push(cached.clone());
+                        cached.clone()
                     } else {
-                        envelopes.push(synth_envelope_static(p, name, pixel_rows));
+                        synth_envelope_static(p, name, pixel_rows)
                     }
                 }
             }
-        }
+        };
+        dot_matrices.push(rasterize_time_y(&env, col_w * 2, pixel_rows));
     }
 
     // Sample-position playhead.
@@ -409,7 +416,7 @@ pub fn draw(
 
         let t = (ph.position / nf).clamp(0.0, 1.0);
         let row = ((t * pixel_rows as f64).floor() as usize)
-            .min(pixel_rows.saturating_sub(1));
+        .min(pixel_rows.saturating_sub(1));
         playhead_pys.push(Some(row));
     }
 
@@ -425,11 +432,11 @@ pub fn draw(
     for col in 0..visible_cols {
         let path = &path_order[col];
         let label_text = by_path[path]
-            .first()
-            .map(|(name, _, _, _)| {
-                p.line_block_title(li, name).unwrap_or(name).to_string()
-            })
-            .unwrap_or_else(|| "(?)".to_string());
+        .first()
+        .map(|(name, _, _, _)| {
+            p.line_block_title(li, name).unwrap_or(name).to_string()
+        })
+        .unwrap_or_else(|| "(?)".to_string());
 
         let label_chars = label_text.chars().count();
         let trimmed = if label_chars > col_w {
@@ -454,10 +461,10 @@ pub fn draw(
 
         hit_columns.push(TrackerColumnHit {
             path: path.clone(),
-            x_start: x_cursor,
-            width: col_w as u16,
-            header_y: 0,
-            rows: column_rows_hit[col].clone(),
+                         x_start: x_cursor,
+                         width: col_w as u16,
+                         header_y: 0,
+                         rows: column_rows_hit[col].clone(),
         });
         x_cursor += col_w as u16 + 1;
     }
@@ -482,80 +489,72 @@ pub fn draw(
                     if py >= pixel_rows {
                         continue;
                     }
-                    let (lo, hi) = envelopes[col].get(py).copied().unwrap_or((0.0, 0.0));
-                    let half = (col_w * 2) as f32 / 2.0;
-                    let center = half;
-                    let px_lo = (center + lo * half).round() as isize;
-                    let px_hi = (center + hi * half).round() as isize;
-                    let px_lo = px_lo.max(0) as usize;
-                    let px_hi = (px_hi.min((col_w * 2 - 1) as isize)).max(px_lo as isize)
-                        as usize;
-                    let cell_x0 = cx * 2;
-                    let cell_x1 = cx * 2 + 1;
-                    if (px_lo..=px_hi).contains(&cell_x0) {
+                    let px0 = cx * 2;
+                    let px1 = cx * 2 + 1;
+                    if px0 < col_w * 2 && dot_matrices[col][py][px0] {
                         bits |= dot_bit(0, ly);
                     }
-                    if (px_lo..=px_hi).contains(&cell_x1) {
+                    if px1 < col_w * 2 && dot_matrices[col][py][px1] {
                         bits |= dot_bit(1, ly);
                     }
                 }
 
                 let row_entry = columns[col].get(r);
                 let (cell_text, is_note_muted): (Option<(String, Style)>, bool) =
-                    match row_entry {
-                        Some(ColumnLine::Note(dn)) => {
-                            let lines_back = (dn.value_offset / rpmeasure).round() as usize;
-                            let block_line = li.saturating_sub(lines_back);
-                            let start_row = dn.note.start_row as i64;
-                            let note_muted = muted_notes.contains(&(
-                                dn.source_name.clone(),
-                                block_line,
-                                start_row,
-                            ));
+                match row_entry {
+                    Some(ColumnLine::Note(dn)) => {
+                        let lines_back = (dn.value_offset / rpmeasure).round() as usize;
+                        let block_line = li.saturating_sub(lines_back);
+                        let start_row = dn.note.start_row as i64;
+                        let note_muted = muted_notes.contains(&(
+                            dn.source_name.clone(),
+                                                                block_line,
+                                                                start_row,
+                        ));
 
-                            let note_local_row = dn.value_offset + current_row;
-                            let lookup_row = note_local_row.max(dn.note.start_row);
+                        let note_local_row = dn.value_offset + current_row;
+                        let lookup_row = note_local_row.max(dn.note.start_row);
 
-                            let playing = dn.display_end > 0.0
-                                && dn.display_start <= current_row
-                                && current_row < dn.display_end;
-                            let played = !playing
-                                && (dn.display_end == 0.0
-                                    || current_row >= dn.display_end);
+                        let playing = dn.display_end > 0.0
+                        && dn.display_start <= current_row
+                        && current_row < dn.display_end;
+                        let played = !playing
+                        && (dn.display_end == 0.0
+                        || current_row >= dn.display_end);
 
-                            let state_note = if playing {
-                                NoteState::Playing
-                            } else if played {
-                                NoteState::Played
-                            } else if dn.note.start_row >= rpmeasure {
-                                NoteState::Future
-                            } else {
-                                NoteState::Waiting
-                            };
+                        let state_note = if playing {
+                            NoteState::Playing
+                        } else if played {
+                            NoteState::Played
+                        } else if dn.note.start_row >= rpmeasure {
+                            NoteState::Future
+                        } else {
+                            NoteState::Waiting
+                        };
 
-                            let text = fmt_note(&dn.note, lookup_row, dn.subs, state_note);
-                            let pitch = value_at(&dn.note.pitch_points, lookup_row)
-                                .unwrap_or(440.0);
-                            let vol = value_at(&dn.note.vol_points, lookup_row)
-                                .unwrap_or(100.0);
-                            let sty = note_style(pitch, vol, state_note, &theme, &synth);
-                            (Some((text, sty)), note_muted)
-                        }
-                        Some(ColumnLine::Divider { label }) => (
-                            Some((
-                                label.clone(),
-                                Style::default()
-                                    .fg(ratatui::style::Color::DarkGray)
-                                    .add_modifier(Modifier::ITALIC),
-                            )),
-                            false,
-                        ),
-                        None => (None, false),
-                    };
+                        let text = fmt_note(&dn.note, lookup_row, dn.subs, state_note);
+                        let pitch = value_at(&dn.note.pitch_points, lookup_row)
+                        .unwrap_or(440.0);
+                        let vol = value_at(&dn.note.vol_points, lookup_row)
+                        .unwrap_or(100.0);
+                        let sty = note_style(pitch, vol, state_note, &theme, &synth);
+                        (Some((text, sty)), note_muted)
+                    }
+                    Some(ColumnLine::Divider { label }) => (
+                        Some((
+                            label.clone(),
+                              Style::default()
+                              .fg(ratatui::style::Color::DarkGray)
+                              .add_modifier(Modifier::ITALIC),
+                        )),
+                        false,
+                    ),
+                    None => (None, false),
+                };
 
                 let text_char: Option<char> = cell_text
-                    .as_ref()
-                    .and_then(|(t, _)| t.chars().nth(cx));
+                .as_ref()
+                .and_then(|(t, _)| t.chars().nth(cx));
 
                 let under_playhead = playhead_char == Some(r);
                 let off = is_muted_col || solo_hides_col || is_note_muted;
@@ -584,7 +583,7 @@ pub fn draw(
                 } else if under_playhead {
                     spans.push(Span::styled(
                         playhead_marker.clone(),
-                        Style::default().fg(playhead_fg),
+                                            Style::default().fg(playhead_fg),
                     ));
                 } else {
                     spans.push(Span::raw(" "));

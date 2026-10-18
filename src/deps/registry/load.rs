@@ -11,7 +11,6 @@
 
 use anyhow::{Context, Result};
 use std::collections::HashSet;
-use std::path::Path;
 
 use super::paths;
 use super::schema::*;

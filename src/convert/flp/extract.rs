@@ -171,6 +171,10 @@ fn playlist_fidelity_from_value(v: &serde_json::Value) -> PlaylistFidelity {
 
 // ── mixer insert chains ────────────────────────────────────────────────
 
+fn insert_volume(_ins: &flp_src::Insert) -> f32 {
+    1.0
+}
+
 pub(super) fn extract_inserts(
     prj: &flp_src::Project,
     plugin_index: &PluginIndex,
@@ -182,10 +186,9 @@ pub(super) fn extract_inserts(
     for (insert_index, ins) in &prj.inserts {
         let mut slots: Vec<InsertSlotFidelity> = Vec::new();
 
+        let insert_vol = insert_volume(ins);
+
         for (slot_i, plugin) in ins.plugins.iter().enumerate() {
-            // Canonical user-facing name.  For native FL effects,
-            // display_name is usually empty and internal_name is the
-            // real one (e.g. "Fruity Reeverb 2").
             let display = canonical_name(plugin);
             if display.is_empty() && plugin.state.is_empty() {
                 continue;
@@ -194,7 +197,6 @@ pub(super) fn extract_inserts(
             let base_raw = format!("insert{:02}_slot{:02}_{}", insert_index, slot_i, display);
             let base = identifier(&base_raw);
 
-            // Always persist the raw state blob if there is one.
             let state_rel = if !plugin.state.is_empty() {
                 let rel = format!("inserts/{}.state", base);
                 aux_files.push(AuxFile {
@@ -216,7 +218,6 @@ pub(super) fn extract_inserts(
             let mut fallback = false;
 
             if is_vst {
-                // ── VST slot: resolve via the plugin index ─────────────
                 let resolved = resolve_plugin(plugin, plugin_index, registry);
                 fallback = matches!(
                     resolved,
@@ -236,7 +237,8 @@ pub(super) fn extract_inserts(
                             lines.push(format!("    State: '{}.state';", base));
                         }
                     }
-                    Resolved::Fallback { name, path, replaces, gain } => {
+                    // FIX: Add `state: _` to this pattern
+                    Resolved::Fallback { name, path, replaces, gain, via_default: _, state: _ } => {
                         lines.push(format!("    Plugin: '{}';", name));
                         if let Some(p) = path {
                             lines.push(format!("    Path: '{}';", p.display()));
@@ -257,6 +259,7 @@ pub(super) fn extract_inserts(
                 }
                 lines.push(format!("    Insert: {};", insert_index));
                 lines.push(format!("    Slot: {};", slot_i));
+                lines.push(format!("    Volume: {};", insert_vol));
                 lines.push("}".to_string());
 
                 let inst_rel = format!("inserts/{}.instrument", base);
@@ -266,7 +269,6 @@ pub(super) fn extract_inserts(
                 });
                 instrument_rel = Some(inst_rel);
             } else if !plugin.internal_name.is_empty() {
-                // ── Native FL effect: consult the registry ─────────────
                 let internal = plugin.internal_name.as_str();
 
                 if let Some(table) = registry {
@@ -282,6 +284,7 @@ pub(super) fn extract_inserts(
                                                 format!("    OriginalPlugin: '{}';", internal),
                                                     format!("    Insert: {};", insert_index),
                                                         format!("    Slot: {};", slot_i),
+                                                            format!("    Volume: {};", insert_vol),
                             ];
                             if let Some(st) = &state_rel {
                                 lines.push(format!("    State: '{}';", st));
@@ -302,7 +305,9 @@ pub(super) fn extract_inserts(
                                       insert_index, slot_i, replaces, name
                             );
                         }
-                        Resolution::Fallback { name, path, replaces, gain } => {
+                        // FIX: This is Resolution::Fallback, NOT Resolved::Fallback.
+                        // Path is PathBuf (no Option), so we don't use `if let Some(p) = path`
+                        Resolution::Fallback { name, path, replaces, gain, via_default: _, state: _ } => {
                             let mut lines = vec![
                                 format!("Instrument {base}"),
                                     "{".to_string(),
@@ -315,6 +320,7 @@ pub(super) fn extract_inserts(
                                                     format!("    OriginalPlugin: '{}';", internal),
                                                         format!("    Insert: {};", insert_index),
                                                             format!("    Slot: {};", slot_i),
+                                                                format!("    Volume: {};", insert_vol),
                             ];
                             if let Some(st) = &state_rel {
                                 lines.push(format!("    State: '{}';", st));
@@ -349,7 +355,6 @@ pub(super) fn extract_inserts(
                         }
                         Resolution::Exact { .. } => {
                             // An installed copy of a native FL plugin.
-                            // Impossible in practice, but record the slot.
                         }
                     }
                 }

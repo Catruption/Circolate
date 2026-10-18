@@ -10,18 +10,19 @@ use crate::deps::index::PluginIndex;
 use crate::deps::registry::{RegistryTable, Resolution};
 use crate::formats::flp::{self as flp_src, Channel};
 
-/// What resolution ended up choosing for one channel.
 pub(super) enum Resolved {
-    /// Exact plugin found installed.  Load original state.
     Exact { name: String, path: PathBuf },
-    /// Fallback substituted.  Do not load original state.
-    Fallback { name: String, path: Option<PathBuf>, replaces: String, gain: f32 },
-    /// Nothing found, no fallback.  Channel is dead.
+    Fallback {
+        name: String,
+        path: Option<PathBuf>,
+        replaces: String,
+        gain: f32,
+        via_default: bool,
+        state: Option<PathBuf>, // <--- NEW
+    },
     Unresolved { name: String },
 }
 
-/// Canonical user-facing name.  MUST match what `extract_inserts` uses
-/// so the two never disagree about which plugin a channel is.
 pub(super) fn canonical_name(plugin: &flp_src::Plugin) -> String {
     if !plugin.display_name.is_empty() {
         plugin.display_name.clone()
@@ -30,11 +31,6 @@ pub(super) fn canonical_name(plugin: &flp_src::Plugin) -> String {
     }
 }
 
-/// Candidate index keys, in priority order.  FL stores the friendly
-/// preset name in `display_name`, the wrapper name in `internal_name`,
-/// and the actual binary path in `vst_path`.  The plugin index matches
-/// on the binary stem, so try all three, plus the usual
-/// `_x64`/`_64`/`x64` suffix strips.
 fn name_candidates(plugin: &flp_src::Plugin) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut push = |s: &str| {
@@ -64,6 +60,43 @@ fn name_candidates(plugin: &flp_src::Plugin) -> Vec<String> {
     out
 }
 
+fn find_loose(wanted: &str, index: &PluginIndex) -> Option<PathBuf> {
+    if let Some(p) = index.find_any(wanted) {
+        return Some(p.clone());
+    }
+
+    let no_space: String = wanted.chars().filter(|c| !c.is_whitespace()).collect();
+    if no_space != wanted {
+        if let Some(p) = index.find_any(&no_space) {
+            return Some(p.clone());
+        }
+    }
+
+    let no_underscore: String = wanted.chars().filter(|c| *c != '_').collect();
+    if no_underscore != wanted && no_underscore != no_space {
+        if let Some(p) = index.find_any(&no_underscore) {
+            return Some(p.clone());
+        }
+    }
+
+    if !wanted.contains(' ') {
+        let mut spaced = String::with_capacity(wanted.len() + 8);
+        for (i, c) in wanted.chars().enumerate() {
+            if i > 0 && c.is_ascii_uppercase() {
+                spaced.push(' ');
+            }
+            spaced.push(c);
+        }
+        if spaced != wanted {
+            if let Some(p) = index.find_any(&spaced) {
+                return Some(p.clone());
+            }
+        }
+    }
+
+    None
+}
+
 pub(super) fn resolve_plugin(
     plugin: &flp_src::Plugin,
     index: &PluginIndex,
@@ -71,30 +104,55 @@ pub(super) fn resolve_plugin(
 ) -> Resolved {
     let canonical = canonical_name(plugin);
 
-    // Search every plugin format (VST3, VST2, LV2, CLAP) by file stem.
-    // A Windows path in the FLP like `...\Foo.dll` reduces to the stem
-    // `Foo`; if anything named `Foo` is installed anywhere on this
-    // machine, use it.
     for candidate in name_candidates(plugin) {
         if let Some(path) = index.find_any(&candidate) {
             return Resolved::Exact { name: candidate, path: path.clone() };
         }
     }
 
-    // Nothing installed by that name.  Consult the registry.
     if let Some(table) = registry {
         return match table.resolve_instrument(index, &canonical) {
             Resolution::Exact { name, path } => Resolved::Exact { name, path },
-            Resolution::Fallback { name, path, replaces, gain } => {
-                Resolved::Fallback { name, path: Some(path), replaces, gain }
+            Resolution::Fallback { name, path, replaces, gain, via_default, state } => {
+                Resolved::Fallback {
+                    name,
+                    path: Some(path),
+                    replaces,
+                    gain,
+                    via_default,
+                    state,
+                }
             }
             Resolution::FallbackMissing { name, replaces } => {
-                Resolved::Fallback { name, path: None, replaces, gain: 1.0 }
+                if let Some(p) = find_loose(&name, index) {
+                    Resolved::Fallback {
+                        name,
+                        path: Some(p),
+                        replaces,
+                        gain: 1.0,
+                        via_default: false,
+                        state: None,
+                    }
+                } else {
+                    Resolved::Fallback {
+                        name,
+                        path: None,
+                        replaces,
+                        gain: 1.0,
+                        via_default: false,
+                        state: None,
+                    }
+                }
             }
             Resolution::NativeArtifact { name, path, replaces, gain } => {
-                // Shouldn't happen for instruments — native effects only.
-                // Treat as a substitute that has a concrete artifact.
-                Resolved::Fallback { name, path: Some(path), replaces, gain }
+                Resolved::Fallback {
+                    name,
+                    path: Some(path),
+                    replaces,
+                    gain,
+                    via_default: false,
+                    state: None,
+                }
             }
             Resolution::NativeMissing { replaces, .. } => {
                 Resolved::Unresolved {
@@ -132,16 +190,25 @@ pub(super) fn vst_sidecar(
                 lines.push(format!("    State: '{base_name}.state';"));
             }
         }
-        Resolved::Fallback { name, path, replaces, gain } => {
+        Resolved::Fallback { name, path, replaces, gain, via_default, state } => {
             lines.push(format!("    Plugin: '{}';", name));
             if let Some(p) = path {
                 lines.push(format!("    Path: '{}';", p.display()));
             } else {
                 lines.push("    Unresolved: true;".to_string());
+                lines.push("    UnresolvedReason: 'fallback plugin not installed';".to_string());
             }
             lines.push(format!("    Replaces: '{}';", replaces));
             lines.push("    Fallback: true;".to_string());
             lines.push(format!("    Gain: {};", gain));
+            if *via_default {
+                lines.push("    ViaDefault: true;".to_string());
+            }
+            if let Some(st) = state {
+                // Write the absolute or relative path. The player will
+                // read this and pass the bytes into the VST host.
+                lines.push(format!("    State: '{}';", st.display())); // <--- NEW
+            }
         }
         Resolved::Unresolved { name } => {
             lines.push(format!("    Plugin: '{}';", name));

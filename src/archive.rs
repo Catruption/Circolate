@@ -86,11 +86,8 @@ pub enum EntryKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IncludePlugins {
-    /// Never embed plugin bundles; always write a requires.json entry.
     None,
-    /// Embed only plugins marked `redistributable: true`.
     Free,
-    /// Embed every plugin, regardless of licensing metadata.
     All,
 }
 
@@ -113,7 +110,122 @@ impl Default for WriteOptions {
     }
 }
 
-// ── write ──────────────────────────────────────────────────────────────
+// ── directory manifest writer ──────────────────────────────────────────
+
+pub fn write_manifest_and_requires(
+    out_dir: &Path,
+    converted: &Converted,
+    entry_path: &str,
+    title: &str,
+    sample_rate: u32,
+    cover: Option<(&str, &[u8])>,
+) -> Result<()> {
+    let mut staged: Vec<(String, Vec<u8>, EntryKind)> = Vec::new();
+
+    staged.push((
+        entry_path.to_string(),
+                 converted.trackscript.as_bytes().to_vec(),
+                 EntryKind::Trackscript,
+    ));
+
+    let mut lib: serde_json::Value = if converted.samples_json.trim().is_empty() {
+        serde_json::json!({
+            "format": "trackscript-sample-library",
+            "version": 2,
+            "samples": [],
+            "instruments": []
+        })
+    } else {
+        serde_json::from_str(&converted.samples_json).context("parsing samples.json")?
+    };
+
+    if let Some(arr) = lib.get_mut("samples").and_then(|v| v.as_array_mut()) {
+        for s in arr.iter_mut() {
+            let Some(obj) = s.as_object_mut() else { continue };
+            let id = obj.get("id").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+            let rel = obj.get("file").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if let Some(src) = converted.samples.iter().find(|x| x.rel_path == rel) {
+                let decoded = decode_audio(&src.wav, &src.rel_path)?;
+                staged.push((
+                    src.rel_path.clone(),
+                             src.wav.clone(),
+                             EntryKind::Sample {
+                                 sample_id: id,
+                                 encoding: "wav".into(),
+                             channels: decoded.channels_count() as u8,
+                             rate: decoded.rate as u32,
+                             },
+                ));
+            }
+        }
+    }
+
+    staged.push((
+        "samples.json".into(),
+                 converted.samples_json.as_bytes().to_vec(),
+                 EntryKind::SampleLibrary,
+    ));
+
+    for aux in &converted.aux {
+        if aux.rel_path.starts_with("source/") {
+            continue;
+        }
+        let (kind, _) = classify_aux(aux);
+        staged.push((aux.rel_path.clone(), aux.bytes.clone(), kind));
+    }
+
+    if let Some((name, bytes)) = cover {
+        staged.push((name.to_string(), bytes.to_vec(), EntryKind::Cover));
+    }
+
+    let requires = crate::deps::requires::build_from_aux(&converted.aux);
+    let need_requires = !requires.plugins.is_empty() || !requires.fallbacks.is_empty();
+    let mut requires_bytes = Vec::new();
+
+    if need_requires {
+        requires_bytes = serde_json::to_string_pretty(&requires)?.into_bytes();
+        staged.push((
+            crate::deps::requires::FILENAME.into(),
+                     requires_bytes.clone(),
+                     EntryKind::Requires,
+        ));
+    }
+
+    let entries: Vec<Entry> = staged
+    .into_iter()
+    .map(|(path, bytes, kind)| Entry {
+        path,
+         size: bytes.len() as u64,
+         sha256: sha256_hex(&bytes),
+         kind,
+    })
+    .collect();
+
+    let manifest = Manifest {
+        format: FORMAT_TAG.into(),
+            version: FORMAT_VERSION,
+            tool: format!("circolate {}", env!("CARGO_PKG_VERSION")),
+            created: now_iso8601(),
+            title: title.into(),
+            entry: entry_path.into(),
+            sample_format: "wav".into(),
+            sample_rate,
+            entries,
+    };
+
+    if need_requires {
+        let p = out_dir.join(crate::deps::requires::FILENAME);
+        std::fs::write(&p, requires_bytes)?;
+    }
+
+    let manifest_bytes = serde_json::to_string_pretty(&manifest)?.into_bytes();
+    let p = out_dir.join(MANIFEST_PATH);
+    std::fs::write(&p, manifest_bytes)?;
+
+    Ok(())
+}
+
+// ── archive writer ─────────────────────────────────────────────────────
 
 pub fn write_archive(
     out: &Path,
@@ -121,23 +233,17 @@ pub fn write_archive(
     title: &str,
     sample_rate: u32,
     cover: Option<(&str, &[u8])>,
-    opts: WriteOptions,
+                     opts: WriteOptions,
 ) -> Result<Manifest> {
     let mut staged: Vec<(String, Vec<u8>, EntryKind, bool)> = Vec::new();
 
     staged.push((
         ENTRY_KEY.into(),
-        converted.trackscript.as_bytes().to_vec(),
-        EntryKind::Trackscript,
-        false,
+                 converted.trackscript.as_bytes().to_vec(),
+                 EntryKind::Trackscript,
+                 false,
     ));
 
-    // Samples — FLAC when it wins, WAV otherwise.  Entries keep their
-    // original `.wav` names regardless of the bytes inside, so the
-    // trackscript's sample references stay valid.
-        // MIDI-only exports have no samples, and the converter leaves
-    // `samples_json` empty for them.  Seed a valid empty document so
-    // archives always carry a well-formed samples.json.
     let mut lib: serde_json::Value = if converted.samples_json.trim().is_empty() {
         serde_json::json!({
             "format": "trackscript-sample-library",
@@ -147,7 +253,7 @@ pub fn write_archive(
         })
     } else {
         serde_json::from_str(&converted.samples_json)
-            .context("parsing samples.json")?
+        .context("parsing samples.json")?
     };
     let mut sample_format = "wav".to_string();
 
@@ -169,13 +275,11 @@ pub fn write_archive(
 
     staged.push((
         "samples.json".into(),
-        serde_json::to_string_pretty(&lib)?.into_bytes(),
-        EntryKind::SampleLibrary,
-        false,
+                 serde_json::to_string_pretty(&lib)?.into_bytes(),
+                 EntryKind::SampleLibrary,
+                 false,
     ));
 
-    // Aux files: instruments, SF2s, fidelity.  Skip the source bundle
-    // that directory exports carry, but keep everything else.
     for aux in &converted.aux {
         if aux.rel_path.starts_with("source/") {
             continue;
@@ -184,25 +288,22 @@ pub fn write_archive(
         staged.push((aux.rel_path.clone(), aux.bytes.clone(), kind, store));
     }
 
-    // Cover image.
     if let Some((name, bytes)) = cover {
         staged.push((name.to_string(), bytes.to_vec(), EntryKind::Cover, false));
     }
 
-    // ── requires.json ────────────────────────────────────────────────
     let requires = crate::deps::requires::build_from_aux(&converted.aux);
     let need_requires_entry = !requires.plugins.is_empty() || !requires.fallbacks.is_empty();
     if need_requires_entry {
         let bytes = serde_json::to_string_pretty(&requires)?.into_bytes();
         staged.push((
             crate::deps::requires::FILENAME.into(),
-            bytes,
-            EntryKind::Requires,
-            false,
+                     bytes,
+                     EntryKind::Requires,
+                     false,
         ));
     }
 
-    // ── embedded plugin bundles ──────────────────────────────────────
     if opts.include_plugins != IncludePlugins::None {
         for bundle in crate::deps::requires::bundles_from_aux(&converted.aux) {
             if opts.include_plugins == IncludePlugins::Free && !bundle.redistributable {
@@ -224,7 +325,7 @@ pub fn write_archive(
                     bytes,
                     EntryKind::Plugin {
                         name: bundle.name.clone(),
-                        license: bundle.license.clone(),
+                             license: bundle.license.clone(),
                     },
                     false,
                 ));
@@ -233,34 +334,34 @@ pub fn write_archive(
     }
 
     let entries: Vec<Entry> = staged
-        .iter()
-        .map(|(p, b, k, _)| Entry {
-            path: p.clone(),
-            size: b.len() as u64,
-            sha256: sha256_hex(b),
-            kind: k.clone(),
-        })
-        .collect();
+    .iter()
+    .map(|(p, b, k, _)| Entry {
+        path: p.clone(),
+         size: b.len() as u64,
+         sha256: sha256_hex(b),
+         kind: k.clone(),
+    })
+    .collect();
 
     let manifest = Manifest {
         format: FORMAT_TAG.into(),
-        version: FORMAT_VERSION,
-        tool: format!("circolate {}", env!("CARGO_PKG_VERSION")),
-        created: now_iso8601(),
-        title: title.into(),
-        entry: ENTRY_KEY.into(),
-        sample_format,
-        sample_rate,
-        entries,
+            version: FORMAT_VERSION,
+            tool: format!("circolate {}", env!("CARGO_PKG_VERSION")),
+            created: now_iso8601(),
+            title: title.into(),
+            entry: ENTRY_KEY.into(),
+            sample_format,
+            sample_rate,
+            entries,
     };
     let manifest_bytes = serde_json::to_string_pretty(&manifest)?.into_bytes();
 
     let file = File::create(out).with_context(|| format!("creating {}", out.display()))?;
     let mut zip = zip::ZipWriter::new(file);
     let deflate = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
+    .compression_method(zip::CompressionMethod::Deflated);
     let store = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Stored);
+    .compression_method(zip::CompressionMethod::Stored);
 
     zip.start_file(MANIFEST_PATH, deflate)?;
     zip.write_all(&manifest_bytes)?;
@@ -274,19 +375,16 @@ pub fn write_archive(
     Ok(manifest)
 }
 
-/// Recursively read every regular file under `root`, returning
-/// (relative path from root, file bytes).  Handles both bundle
-/// directories and single-file `.vst3`.
 fn walk_plugin(root: &Path) -> Vec<(String, Vec<u8>)> {
     let mut out: Vec<(String, Vec<u8>)> = Vec::new();
     let Ok(md) = std::fs::symlink_metadata(root) else { return out };
     if md.file_type().is_file() {
         if let Ok(bytes) = std::fs::read(root) {
             let name = root
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("plugin.vst3")
-                .to_string();
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("plugin.vst3")
+            .to_string();
             out.push((name, bytes));
         }
         return out;
@@ -326,32 +424,43 @@ fn encode_sample(src: &SampleOut, id: u16, opts: WriteOptions) -> Result<Encoded
     let channels = decoded.channels_count() as u8;
     let rate = decoded.rate as u32;
 
-    if let Ok(flac) = encode_flac(&decoded) {
-        if (flac.len() as f32) <= opts.flac_max_ratio * (src.wav.len() as f32) {
-            return Ok(EncodedSample {
-                bytes: flac,
-                kind: EntryKind::Sample {
-                    sample_id: id,
-                    encoding: "flac".into(),
-                    channels,
-                    rate,
-                },
-                store_raw: true,
-                used_flac: true,
-            });
+    match encode_flac(&decoded) {
+        Ok(flac) => {
+            let ratio = flac.len() as f32 / src.wav.len() as f32;
+            if ratio <= opts.flac_max_ratio {
+                return Ok(EncodedSample {
+                    bytes: flac,
+                    kind: EntryKind::Sample {
+                        sample_id: id,
+                        encoding: "flac".into(),
+                          channels,
+                          rate,
+                    },
+                    store_raw: true,
+                    used_flac: true,
+                });
+            } else {
+                eprintln!(
+                    "  {}: FLAC saved {:.1}% (threshold is {:.1}%), keeping WAV",
+                          src.rel_path, (1.0 - ratio) * 100.0, (1.0 - opts.flac_max_ratio) * 100.0
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("  {}: FLAC encoding failed: {:#}", src.rel_path, e);
         }
     }
 
     Ok(EncodedSample {
         bytes: src.wav.clone(),
-        kind: EntryKind::Sample {
-            sample_id: id,
-            encoding: "wav".into(),
-            channels,
-            rate,
-        },
-        store_raw: false,
-        used_flac: false,
+       kind: EntryKind::Sample {
+           sample_id: id,
+           encoding: "wav".into(),
+       channels,
+       rate,
+       },
+       store_raw: false,
+       used_flac: false,
     })
 }
 
@@ -432,18 +541,18 @@ fn encode_flac(audio: &DecodedAudio) -> Result<Vec<u8>> {
     let out_path = tmp.join(format!("circolate-flac-{}-{}.flac", pid, seq));
 
     std::fs::write(&in_path, &wav)
-        .with_context(|| format!("writing {}", in_path.display()))?;
+    .with_context(|| format!("writing {}", in_path.display()))?;
 
     let status = Command::new("flac")
-        .args(["--silent", "--force", "-o"])
-        .arg(&out_path)
-        .arg(&in_path)
-        .status()
-        .context("spawning flac — install the 'flac' package")?;
+    .args(["--silent", "--force", "-o"])
+    .arg(&out_path)
+    .arg(&in_path)
+    .status()
+    .context("spawning flac — install the 'flac' package")?;
 
     let result = if status.success() {
         std::fs::read(&out_path)
-            .with_context(|| format!("reading {}", out_path.display()))
+        .with_context(|| format!("reading {}", out_path.display()))
     } else {
         Err(anyhow::anyhow!("flac exited with {}", status))
     };
@@ -475,9 +584,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
 fn now_iso8601() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    .duration_since(UNIX_EPOCH)
+    .map(|d| d.as_secs() as i64)
+    .unwrap_or(0);
     let days = secs.div_euclid(86400);
     let rem = secs.rem_euclid(86400);
     let (h, m, s) = (rem / 3600, (rem / 60) % 60, rem % 60);
@@ -530,10 +639,10 @@ impl ArchiveReader {
         let path = path.as_ref().to_path_buf();
         let (prefix, manifest) = read_manifest_at(&path)?;
         let index: HashMap<String, Entry> = manifest
-            .entries
-            .iter()
-            .map(|e| (e.path.clone(), e.clone()))
-            .collect();
+        .entries
+        .iter()
+        .map(|e| (e.path.clone(), e.clone()))
+        .collect();
         Ok(ArchiveReader {
             path,
             prefix,
@@ -551,7 +660,7 @@ impl ArchiveReader {
         let mut guard = self.zip.lock().unwrap();
         if guard.is_none() {
             let file = File::open(&self.path)
-                .with_context(|| format!("reopening {}", self.path.display()))?;
+            .with_context(|| format!("reopening {}", self.path.display()))?;
             *guard = Some(zip::ZipArchive::new(file)?);
         }
         f(guard.as_mut().unwrap())
@@ -566,8 +675,8 @@ impl AssetSource for ArchiveReader {
         let zip_rel = format!("{}{}", self.prefix, rel);
         self.with_zip(|zip| {
             let mut entry = zip
-                .by_name(&zip_rel)
-                .with_context(|| format!("entry {}", zip_rel))?;
+            .by_name(&zip_rel)
+            .with_context(|| format!("entry {}", zip_rel))?;
             let mut buf = Vec::with_capacity(entry.size() as usize);
             entry.read_to_end(&mut buf)?;
             Ok(Some(buf))
@@ -581,16 +690,16 @@ impl AssetSource for ArchiveReader {
             format!("{}/", prefix)
         };
         let mut out: Vec<String> = self
-            .index
-            .keys()
-            .filter(|k| k.starts_with(&prefix))
-            .filter(|k| !k[prefix.len()..].contains('/'))
-            .filter(|k| match ext {
-                Some(want) => k.rsplit('.').next() == Some(want),
+        .index
+        .keys()
+        .filter(|k| k.starts_with(&prefix))
+        .filter(|k| !k[prefix.len()..].contains('/'))
+        .filter(|k| match ext {
+            Some(want) => k.rsplit('.').next() == Some(want),
                 None => true,
-            })
-            .cloned()
-            .collect();
+        })
+        .cloned()
+        .collect();
         out.sort();
         out
     }
@@ -602,11 +711,11 @@ impl AssetSource for ArchiveReader {
             format!("{}/", prefix)
         };
         let mut out: Vec<String> = self
-            .index
-            .keys()
-            .filter(|k| k.starts_with(&prefix))
-            .cloned()
-            .collect();
+        .index
+        .keys()
+        .filter(|k| k.starts_with(&prefix))
+        .cloned()
+        .collect();
         out.sort();
         out
     }
@@ -629,13 +738,13 @@ impl AssetSource for ArchiveReader {
     fn describe(&self) -> String {
         format!(
             "{} ({} entries{})",
-            self.path.display(),
-            self.manifest.entries.len(),
-            if self.prefix.is_empty() {
-                String::new()
-            } else {
-                format!(", prefix {:?}", self.prefix)
-            },
+                self.path.display(),
+                self.manifest.entries.len(),
+                if self.prefix.is_empty() {
+                    String::new()
+                } else {
+                    format!(", prefix {:?}", self.prefix)
+                },
         )
     }
 }
@@ -644,11 +753,11 @@ pub fn read_manifest_at(path: &Path) -> Result<(String, Manifest)> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut zip = zip::ZipArchive::new(file).context("not a zip archive")?;
     let prefix = detect_prefix(&mut zip)
-        .context("not a trackscript archive (no manifest.json)")?;
+    .context("not a trackscript archive (no manifest.json)")?;
     let zip_path = format!("{}{}", prefix, MANIFEST_PATH);
     let mut entry = zip
-        .by_name(&zip_path)
-        .with_context(|| format!("opening {} inside archive", zip_path))?;
+    .by_name(&zip_path)
+    .with_context(|| format!("opening {} inside archive", zip_path))?;
     let mut text = String::new();
     entry.read_to_string(&mut text)?;
     let manifest: Manifest = serde_json::from_str(&text).context("parsing manifest.json")?;
@@ -658,7 +767,7 @@ pub fn read_manifest_at(path: &Path) -> Result<(String, Manifest)> {
     if manifest.version > FORMAT_VERSION {
         bail!(
             "archive version {} is newer than this build supports ({})",
-            manifest.version, FORMAT_VERSION
+              manifest.version, FORMAT_VERSION
         );
     }
     Ok((prefix, manifest))

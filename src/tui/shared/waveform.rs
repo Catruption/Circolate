@@ -1,35 +1,172 @@
-//! Braille waveform rasterisers.  `render_envelope` draws a min/max
-//! envelope scaled to a rectangle; `render_waveform` computes the
-//! envelope from a source `Sample` first; `synth_waveform` does the
-//! same for a live scope snapshot.  All three return one `Vec<Span>`
-//! per terminal row, ready to splat into a `Line`.
+//! Braille waveform rasterisers.
 //!
-//! The playhead column, if any, is rendered as a hard vertical bar that
-//! replaces whatever would otherwise be in that cell — including blank
-//! cells — so the marker stays visible over rests and quiet samples.
+//! `rasterize_time_x` and `rasterize_time_y` are the shared primitives:
+//! both take a `[(f32, f32)]` envelope, auto-scale it to fill `[-1, 1]`,
+//! and return a `[h_dots][w_dots]` matrix of lit dots. The two differ
+//! only in which axis time runs along:
+//!
+//! * `rasterize_time_x` — time on X, amplitude on Y. The vertical view
+//!   and any standalone sample-preview widget use this.
+//! * `rasterize_time_y` — time on Y, amplitude on X. The horizontal
+//!   tracker uses this so waveforms sit *behind* the note text as
+//!   horizontal bands per row.
+//!
+//! `render_envelope` is a convenience wrapper over `rasterize_time_x`
+//! that packs dots into braille characters and applies styles. The
+//! horizontal view can't use it directly because it needs to composite
+//! waveform dots with note text on the same cell, so it calls
+//! `rasterize_time_y` and does its own packing.
 
 use ratatui::style::Style;
 use ratatui::text::Span;
 
-use crate::player::envelope::whole_sample_envelope;
+use crate::player::envelope::{synth_envelope_live, whole_sample_envelope};
 use crate::player::Sample;
 
 use super::braille::{braille_char, dot_bit};
 
-/// Glyph used for the playhead column.  A heavy vertical bar reads as
-/// "we are here" through any waveform, including silence.
 const PLAYHEAD_GLYPH: char = '┃';
+const AUTO_SCALE_MAX: f32 = 1000.0;
+const AUTO_SCALE_FLOOR: f32 = 1e-5;
 
-/// Rasterise a pre-computed min/max envelope.
+/// Normalize an envelope so its peak fills `[-1, 1]`.
+///
+/// A VST channel the picker attenuated to 0.058 gain has a raw
+/// envelope peak around 0.001; without scaling it renders as a
+/// sub-pixel strip. Skipped below `AUTO_SCALE_FLOOR` so a genuinely
+/// silent channel stays flat instead of amplifying noise.
+pub fn auto_scale(env: &mut [(f32, f32)]) {
+    let mut peak = 0.0f32;
+    for &(lo, hi) in env.iter() {
+        let m = lo.abs().max(hi.abs());
+        if m > peak {
+            peak = m;
+        }
+    }
+    if !peak.is_finite() || peak < AUTO_SCALE_FLOOR {
+        return;
+    }
+    let scale = (1.0 / peak).min(AUTO_SCALE_MAX);
+    if scale <= 1.05 {
+        return;
+    }
+    for (lo, hi) in env.iter_mut() {
+        *lo = (*lo * scale).clamp(-1.0, 1.0);
+        *hi = (*hi * scale).clamp(-1.0, 1.0);
+    }
+}
+
+/// Map a value interval `[lo, hi]` in `[-1, 1]` to a contiguous range
+/// of dot rows `[d0, d1]` on a grid of `total_dots` rows. Handles the
+/// sub-dot-width case (single sample, DC run) by snapping to the
+/// nearest dot.
+fn dot_range(lo: f32, hi: f32, total_dots: usize) -> (i64, i64) {
+    if !lo.is_finite() || !hi.is_finite() || lo > hi {
+        return (1, 0);
+    }
+    let t = total_dots.max(1) as f64;
+    let lo = (lo as f64).clamp(-1.0, 1.0);
+    let hi = (hi as f64).clamp(-1.0, 1.0);
+    let top = (1.0 - hi) / 2.0;
+    let bot = (1.0 - lo) / 2.0;
+    let mut d0 = (top * t).ceil() as i64;
+    let mut d1 = (bot * t).floor() as i64;
+    if d0 > d1 {
+        let mid = ((top + bot) * 0.5 * t).round() as i64;
+        d0 = mid;
+        d1 = mid;
+    }
+    let last = total_dots.max(1) as i64 - 1;
+    (d0.clamp(0, last), d1.clamp(0, last))
+}
+
+/// Rasterize a min/max envelope into a dot matrix, time on X.
+///
+/// `env[k]` is the (lo, hi) pair for dot-column `k`. Return value is
+/// `dots[y][x]`, `true` = lit. Envelope is auto-scaled first.
+pub fn rasterize_time_x(
+    env: &[(f32, f32)],
+                        w_dots: usize,
+                        h_dots: usize,
+) -> Vec<Vec<bool>> {
+    let mut dots = vec![vec![false; w_dots.max(1)]; h_dots.max(1)];
+    if w_dots == 0 || h_dots == 0 {
+        return dots;
+    }
+    let mut scaled = env.to_vec();
+    auto_scale(&mut scaled);
+
+    for x in 0..w_dots {
+        let (lo, hi) = scaled.get(x).copied().unwrap_or((0.0, 0.0));
+        let (d0, d1) = dot_range(lo, hi, h_dots);
+        if d0 > d1 {
+            continue;
+        }
+        let d0 = d0.max(0) as usize;
+        let d1 = (d1 as usize).min(h_dots - 1);
+        for d in d0..=d1 {
+            dots[d][x] = true;
+        }
+    }
+    dots
+}
+
+/// Rasterize a min/max envelope into a dot matrix, time on Y.
+///
+/// `env[y]` is the (lo, hi) pair for dot-row `y`. The amplitude range
+/// `[lo, hi]` maps to a contiguous run of dot columns centred on the
+/// middle of the matrix, so `lo = hi = 0` gives a single dot in the
+/// centre and `lo = -1, hi = +1` fills the whole row. Envelope is
+/// auto-scaled first.
+pub fn rasterize_time_y(
+    env: &[(f32, f32)],
+                        w_dots: usize,
+                        h_dots: usize,
+) -> Vec<Vec<bool>> {
+    let mut dots = vec![vec![false; w_dots.max(1)]; h_dots.max(1)];
+    if w_dots == 0 || h_dots == 0 {
+        return dots;
+    }
+    let mut scaled = env.to_vec();
+    auto_scale(&mut scaled);
+
+    let half = w_dots as f32 / 2.0;
+    let last = (w_dots as isize) - 1;
+
+    for y in 0..h_dots.min(scaled.len()) {
+        let (lo, hi) = scaled[y];
+        if !lo.is_finite() || !hi.is_finite() || lo > hi {
+            continue;
+        }
+        let lo = lo.clamp(-1.0, 1.0);
+        let hi = hi.clamp(-1.0, 1.0);
+        // Clamp both ends to the valid pixel range. `lo = hi = +1.0`
+        // used to produce `px_lo = px_hi = w_dots`, one past the last
+        // valid column, so positive peaks at exactly full scale fell
+        // off the edge and rendered as nothing. Clamping both ends
+        // here means a full-scale peak draws on the last column
+        // instead of skipping it.
+        let px_lo = ((half + lo * half).round() as isize).clamp(0, last) as usize;
+        let px_hi = ((half + hi * half).round() as isize).clamp(0, last) as usize;
+        let (px_lo, px_hi) = if px_lo <= px_hi { (px_lo, px_hi) } else { (px_hi, px_lo) };
+        for px in px_lo..=px_hi {
+            dots[y][px] = true;
+        }
+    }
+    dots
+}
+
+/// Pack a dot matrix into a `Vec<Vec<Span>>` of braille characters.
+/// Playhead column, if any, is drawn as a solid bar over that column.
 pub fn render_envelope(
     env: &[(f32, f32)],
-    w: usize,
-    h: usize,
-    base_style: Style,
-    playhead_col: Option<usize>,
-    playhead_style: Style,
+                       w: usize,
+                       h: usize,
+                       base_style: Style,
+                       playhead_col: Option<usize>,
+                       playhead_style: Style,
 ) -> Vec<Vec<Span<'static>>> {
-    let total_dots = (4 * h).max(1);
+    let dots = rasterize_time_x(env, w * 2, h * 4);
 
     let mut out: Vec<Vec<Span<'static>>> = Vec::with_capacity(h);
     for y in 0..h {
@@ -39,25 +176,22 @@ pub fn render_envelope(
                 row.push(Span::styled(PLAYHEAD_GLYPH.to_string(), playhead_style));
                 continue;
             }
-            let i0 = 2 * x;
-            let i1 = 2 * x + 1;
-            let (lo0, hi0) = env.get(i0).copied().unwrap_or((0.0, 0.0));
-            let (lo1, hi1) = env.get(i1).copied().unwrap_or((0.0, 0.0));
-
-            let lit = |lo: f32, hi: f32, frac: f64| -> bool {
-                let top = (1.0 - hi as f64) / 2.0;
-                let bot = (1.0 - lo as f64) / 2.0;
-                frac >= top && frac <= bot
-            };
-
             let mut bits = 0u8;
-            for py in 0..4 {
-                let dot = y * 4 + py;
-                let frac = dot as f64 / total_dots as f64;
-                if lit(lo0, hi0, frac) { bits |= dot_bit(0, py); }
-                if lit(lo1, hi1, frac) { bits |= dot_bit(1, py); }
+            for ly in 0..4 {
+                let dy = y * 4 + ly;
+                if dy >= h * 4 {
+                    continue;
+                }
+                for lx in 0..2 {
+                    let dx = x * 2 + lx;
+                    if dx >= w * 2 {
+                        continue;
+                    }
+                    if dots[dy][dx] {
+                        bits |= dot_bit(lx, ly);
+                    }
+                }
             }
-
             let ch = if bits == 0 { ' ' } else { braille_char(bits) };
             row.push(Span::styled(ch.to_string(), base_style));
         }
@@ -86,49 +220,9 @@ pub fn synth_waveform(
     playhead_col: Option<usize>,
     playhead_style: Style,
 ) -> Vec<Vec<Span<'static>>> {
-    let n = snapshot.len();
-    if n == 0 {
-        return vec![vec![Span::styled(" ".to_string(), base_style); w]; h];
+    let mut env = synth_envelope_live(snapshot, w * 2);
+    if env.is_empty() {
+        env = vec![(0.0, 0.0); w * 2];
     }
-    let px_w = w * 2;
-    let total_dots = (4 * h).max(1);
-
-    let mut out: Vec<Vec<Span<'static>>> = Vec::with_capacity(h);
-    for y in 0..h {
-        let mut row: Vec<Span<'static>> = Vec::with_capacity(w);
-        for x in 0..w {
-            if Some(x) == playhead_col {
-                row.push(Span::styled(PLAYHEAD_GLYPH.to_string(), playhead_style));
-                continue;
-            }
-            let mut bits = 0u8;
-            for px in [2 * x, 2 * x + 1] {
-                let a = ((px as f64 / px_w as f64) * n as f64) as usize;
-                let b = ((((px + 1) as f64) / px_w as f64) * n as f64) as usize;
-                let a = a.min(n.saturating_sub(1));
-                let b = b.max(a + 1).min(n);
-                let mut lo = f32::INFINITY;
-                let mut hi = f32::NEG_INFINITY;
-                for &s in &snapshot[a..b] {
-                    if s < lo { lo = s; }
-                    if s > hi { hi = s; }
-                }
-                if !lo.is_finite() { continue; }
-                let top = (1.0 - hi as f64) / 2.0;
-                let bot = (1.0 - lo as f64) / 2.0;
-                for py in 0..4 {
-                    let dot = y * 4 + py;
-                    let frac = dot as f64 / total_dots as f64;
-                    if frac >= top && frac <= bot {
-                        let bit = if px == 2 * x { 0 } else { 1 };
-                        bits |= dot_bit(bit, py);
-                    }
-                }
-            }
-            let ch = if bits == 0 { ' ' } else { braille_char(bits) };
-            row.push(Span::styled(ch.to_string(), base_style));
-        }
-        out.push(row);
-    }
-    out
+    render_envelope(&env, w, h, base_style, playhead_col, playhead_style)
 }

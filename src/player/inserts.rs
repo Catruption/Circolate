@@ -14,6 +14,15 @@
 //!
 //! Channels not listed route to master (no chain).
 //!
+//! ## Insert fader
+//!
+//! Each `.instrument` sidecar carries a `Volume:` line for the mixer
+//! insert fader that owns this slot. `load_chains` copies it from the
+//! first-loaded slot of each insert into `InsertChain::volume`, and
+//! `process()` applies it once at the tail of the chain. Currently the
+//! converter writes unity (see `convert/flp/extract.rs::insert_volume`)
+//! — the plumbing is in place, the parser is the follow-up.
+//!
 //! ## State blobs
 //!
 //! The sidecar carries a `State:` path pointing at the original FL
@@ -40,6 +49,13 @@ pub struct InsertSlot {
 pub struct InsertChain {
     pub insert: u8,
     pub slots: Vec<InsertSlot>,
+    /// Mixer-insert fader, applied *after* every slot in `slots` has
+    /// processed. Unity is 1.0. Sourced from the `Volume:` line in the
+    /// `.instrument` sidecars (all slots of an insert carry the same
+    /// value; the first loaded wins). Remains 1.0 until the FLP parser
+    /// exposes the fader position — see
+    /// `convert/flp/extract.rs::insert_volume`.
+    pub volume: f32,
 }
 
 impl InsertChain {
@@ -47,7 +63,8 @@ impl InsertChain {
         self.slots.is_empty()
     }
 
-    /// Run every slot in-place on the given stereo buffer.
+    /// Run every slot in-place on the given stereo buffer, then apply
+    /// the insert fader.
     pub fn process(&mut self, l: &mut [f32], r: &mut [f32]) {
         let n = l.len().min(r.len());
         for slot in &mut self.slots {
@@ -57,6 +74,12 @@ impl InsertChain {
                     l[i] *= slot.gain;
                     r[i] *= slot.gain;
                 }
+            }
+        }
+        if (self.volume - 1.0).abs() > 1e-4 {
+            for i in 0..n {
+                l[i] *= self.volume;
+                r[i] *= self.volume;
             }
         }
     }
@@ -72,6 +95,7 @@ struct Sidecar {
     path: String,
     state: Option<String>,
     gain: f32,
+    volume: f32,
     unresolved: bool,
     is_fallback: bool,
 }
@@ -84,6 +108,7 @@ fn parse_sidecar(path: &Path) -> Option<Sidecar> {
         path: String::new(),
         state: None,
         gain: 1.0,
+        volume: 1.0,
         unresolved: false,
         is_fallback: false,
     };
@@ -100,6 +125,7 @@ fn parse_sidecar(path: &Path) -> Option<Sidecar> {
             "Path" => s.path = v,
             "State" => s.state = Some(v),
             "Gain" => s.gain = v.parse().unwrap_or(1.0),
+            "Volume" => s.volume = v.parse().unwrap_or(1.0),
             "Unresolved" => s.unresolved = v.eq_ignore_ascii_case("true"),
             "Fallback" => s.is_fallback = v.eq_ignore_ascii_case("true"),
             _ => {}
@@ -175,8 +201,17 @@ pub fn load_chains(inserts_dir: &Path, sample_rate: u32) -> BTreeMap<u8, InsertC
                  insert_idx, slot_idx, side.plugin, tag
         );
 
+        // `or_insert_with` runs only on the first slot of each insert
+        // (files sort by slot index), so `chain.volume` is populated
+        // from slot 0 — which is where `extract.rs` writes the insert
+        // fader. All slots carry the same `Volume:` value; any of them
+        // would do, but slot 0 is the obvious source.
         out.entry(insert_idx)
-        .or_insert_with(|| InsertChain { insert: insert_idx, slots: Vec::new() })
+        .or_insert_with(|| InsertChain {
+            insert: insert_idx,
+            slots: Vec::new(),
+                        volume: side.volume,
+        })
         .slots
         .push(InsertSlot {
             name: side.plugin,

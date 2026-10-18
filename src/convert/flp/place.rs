@@ -17,6 +17,15 @@ use crate::formats::flp::{Note, Project};
 use super::{debug_on, hex, FL_C5_KEY, MAX_NOTE_TICKS};
 use super::slicex;
 
+/// A pitch glide attached to a note, from an FL slide note that overlaps it.
+/// Tick offsets are relative to the carrier note's start.
+#[derive(Clone)]
+pub(super) struct Bend {
+    pub(super) at_ticks: u32,
+    pub(super) len_ticks: u32,
+    pub(super) key: u16,
+}
+
 #[derive(Clone)]
 pub(super) struct Placed {
     pub(super) abs: u32,
@@ -32,6 +41,13 @@ pub(super) struct Placed {
     /// float at byte 52 of the playlist record; 1.0 = no change).  1.0 for
     /// pattern notes.
     pub(super) clip_gain: f32,
+    /// For audio clips: fade-in / fade-out lengths in milliseconds
+    /// (0.0 = none).  0.0 for pattern notes.
+    pub(super) clip_fade_in_ms: f32,
+    pub(super) clip_fade_out_ms: f32,
+    /// Slide-note glides on this note (Slicex channels only).  Empty for
+    /// everything else.
+    pub(super) bends: Vec<Bend>,
 }
 
 /// FL "slide" notes (flag bit 3) are not voices of their own: they tell the
@@ -42,53 +58,73 @@ pub(super) struct Placed {
 /// the carrier's original end.  A slide that starts together with its carrier
 /// just retargets the carrier's key.  Slides with no carrier are dropped.
 ///
-/// For **Slicex** channels this treatment is wrong.  A Slicex key selects a
-/// *slice*, not a pitch, so retargeting the carrier to the slide's key would
-/// swap to a different slice mid-note — audible as a phantom slice change
-/// that isn't present in FL.  Slides on Slicex channels are therefore dropped
-/// outright: the carrier plays its full duration at its original slice.
+/// For **Slicex** channels a key selects a *slice*, not a pitch, so
+/// retargeting the carrier would swap to a different slice mid-note (a phantom
+/// slice change that isn't present in FL).  Instead the carrier keeps its
+/// slice and the slide is recorded as a `Bend`: a pitch glide to the slide's
+/// key, rendered as a pitch waypoint.
 ///
 /// `FLP_NO_SLIDE=1` restores the old behaviour for comparison.
-fn resolve_slides(notes: &[Note], slicex_channels: &HashSet<u16>) -> Vec<Note> {
+fn resolve_slides(
+    notes: &[Note],
+    slicex_channels: &HashSet<u16>,
+) -> Vec<(Note, Vec<Bend>)> {
     const FLAG_SLIDE: u16 = 0x08;
     if std::env::var_os("FLP_NO_SLIDE").is_some() {
-        return notes.to_vec();
+        return notes.iter().cloned().map(|n| (n, Vec::new())).collect();
     }
-    let mut out: Vec<Note> = notes
-        .iter()
-        .filter(|n| n.flags & FLAG_SLIDE == 0)
-        .cloned()
-        .collect();
+    let mut out: Vec<(Note, Vec<Bend>)> = notes
+    .iter()
+    .filter(|n| n.flags & FLAG_SLIDE == 0)
+    .cloned()
+    .map(|n| (n, Vec::new()))
+    .collect();
     let mut slides: Vec<&Note> = notes
-        .iter()
-        .filter(|n| n.flags & FLAG_SLIDE != 0 && !slicex_channels.contains(&n.channel))
-        .collect();
+    .iter()
+    .filter(|n| n.flags & FLAG_SLIDE != 0)
+    .collect();
     slides.sort_by_key(|n| n.position);
 
+    let mut bent = 0usize;
     for s in slides {
         // Carrier: same channel, latest start at or before the slide, still sounding.
         let mut best: Option<usize> = None;
-        for (i, n) in out.iter().enumerate() {
+        for (i, (n, _)) in out.iter().enumerate() {
             if n.channel == s.channel
                 && n.position <= s.position
                 && s.position < n.position.saturating_add(n.length)
-                && best.map_or(true, |b| n.position > out[b].position)
-            {
-                best = Some(i);
-            }
+                && best.map_or(true, |b| n.position > out[b].0.position)
+                {
+                    best = Some(i);
+                }
         }
         let Some(i) = best else { continue };
-        if out[i].position == s.position {
-            out[i].key = s.key;
+
+        if slicex_channels.contains(&s.channel) {
+            let start = out[i].0.position;
+            out[i].1.push(Bend {
+                at_ticks: s.position - start,
+                len_ticks: s.length,
+                key: s.key,
+            });
+            bent += 1;
+            continue;
+        }
+
+        if out[i].0.position == s.position {
+            out[i].0.key = s.key;
         } else {
-            let end = out[i].position.saturating_add(out[i].length);
-            let mut tail = out[i].clone();
+            let end = out[i].0.position.saturating_add(out[i].0.length);
+            let mut tail = out[i].0.clone();
             tail.position = s.position;
             tail.length = end - s.position;
             tail.key = s.key;
-            out[i].length = s.position - out[i].position;
-            out.push(tail);
+            out[i].0.length = s.position - out[i].0.position;
+            out.push((tail, Vec::new()));
         }
+    }
+    if debug_on() && bent > 0 {
+        eprintln!("flp: {bent} Slicex slide note(s) kept as pitch bends");
     }
     out
 }
@@ -100,22 +136,22 @@ pub(super) fn place_notes(prj: &Project) -> (HashMap<u16, Vec<Placed>>, bool, us
     let mut pats: HashMap<u16, &crate::formats::flp::Pattern> = HashMap::new();
     for p in &prj.patterns {
         pats.entry(p.iid)
-            .and_modify(|old| {
-                if p.notes.len() > old.notes.len() {
-                    *old = p;
-                }
-            })
-            .or_insert(p);
+        .and_modify(|old| {
+            if p.notes.len() > old.notes.len() {
+                *old = p;
+            }
+        })
+        .or_insert(p);
     }
 
     // Channels switched off in the channel rack.  `enabled == None` means
     // the flag was absent, which is treated as enabled.
     let disabled: HashSet<u16> = prj
-        .channels
-        .iter()
-        .filter(|c| c.enabled == Some(false))
-        .map(|c| c.iid)
-        .collect();
+    .channels
+    .iter()
+    .filter(|c| c.enabled == Some(false))
+    .map(|c| c.iid)
+    .collect();
     if debug_on() && !disabled.is_empty() {
         let mut v: Vec<u16> = disabled.iter().copied().collect();
         v.sort_unstable();
@@ -124,15 +160,15 @@ pub(super) fn place_notes(prj: &Project) -> (HashMap<u16, Vec<Placed>>, bool, us
 
     // Slicex channels get slide notes dropped, not merged into carriers.
     let slicex_channels: HashSet<u16> = prj
-        .channels
-        .iter()
-        .filter(|c| {
-            c.plugin
-                .as_ref()
-                .map_or(false, |p| slicex::is_slicex(p))
-        })
-        .map(|c| c.iid)
-        .collect();
+    .channels
+    .iter()
+    .filter(|c| {
+        c.plugin
+        .as_ref()
+        .map_or(false, |p| slicex::is_slicex(p))
+    })
+    .map(|c| c.iid)
+    .collect();
     if debug_on() && !slicex_channels.is_empty() {
         let mut v: Vec<u16> = slicex_channels.iter().copied().collect();
         v.sort_unstable();
@@ -145,31 +181,31 @@ pub(super) fn place_notes(prj: &Project) -> (HashMap<u16, Vec<Placed>>, bool, us
 
     if debug_on() {
         let on_playlist: HashSet<u16> = prj
-            .playlist
-            .iter()
-            .filter(|i| i.kind == "pattern")
-            .map(|i| i.ref_id)
-            .collect();
+        .playlist
+        .iter()
+        .filter(|i| i.kind == "pattern")
+        .map(|i| i.ref_id)
+        .collect();
         eprintln!(
             "flp: {} patterns total; {} unique pattern refs on playlist",
             prj.patterns.len(),
-            on_playlist.len()
+                  on_playlist.len()
         );
         for target in [4u16, 6, 10, 5] {
             let pats: Vec<u16> = prj
-                .patterns
-                .iter()
-                .filter(|p| p.notes.iter().any(|n| n.channel == target))
-                .map(|p| p.iid)
-                .collect();
+            .patterns
+            .iter()
+            .filter(|p| p.notes.iter().any(|n| n.channel == target))
+            .map(|p| p.iid)
+            .collect();
             let on_pl: Vec<u16> = pats
-                .iter()
-                .copied()
-                .filter(|i| on_playlist.contains(i))
-                .collect();
+            .iter()
+            .copied()
+            .filter(|i| on_playlist.contains(i))
+            .collect();
             eprintln!(
                 "flp: chan {:>3} notes in patterns {:?} (on playlist: {:?})",
-                target, pats, on_pl
+                      target, pats, on_pl
             );
         }
     }
@@ -195,7 +231,7 @@ pub(super) fn place_notes(prj: &Project) -> (HashMap<u16, Vec<Placed>>, bool, us
         let mut kept = 0usize;
 
         let notes = resolve_slides(&pat.notes, &slicex_channels);
-        for n in &notes {
+        for (n, bends) in &notes {
             if disabled.contains(&n.channel) {
                 continue;
             }
@@ -227,10 +263,13 @@ pub(super) fn place_notes(prj: &Project) -> (HashMap<u16, Vec<Placed>>, bool, us
             kept += 1;
             placed.entry(n.channel).or_default().push(Placed {
                 abs: item.position.saturating_add(n.position - win_start),
-                note,
-                clip_offset_ms: None,
-                clip_end_ms: None,
-                clip_gain: 1.0,
+                                                      note,
+                                                      clip_offset_ms: None,
+                                                      clip_end_ms: None,
+                                                      clip_gain: 1.0,
+                                                      clip_fade_in_ms: 0.0,
+                                                      clip_fade_out_ms: 0.0,
+                                                      bends: bends.clone(),
             });
         }
         if debug_on() {
@@ -251,7 +290,7 @@ pub(super) fn place_notes(prj: &Project) -> (HashMap<u16, Vec<Placed>>, bool, us
     if !used_playlist {
         for pat in &prj.patterns {
             let notes = resolve_slides(&pat.notes, &slicex_channels);
-            for n in &notes {
+            for (n, bends) in &notes {
                 if disabled.contains(&n.channel) {
                     continue;
                 }
@@ -259,7 +298,7 @@ pub(super) fn place_notes(prj: &Project) -> (HashMap<u16, Vec<Placed>>, bool, us
                     if debug_on() && dropped < 20 {
                         eprintln!(
                             "flp: dropped note (no playlist) chan {} pos {} len {} key {}",
-                            n.channel, n.position, n.length, n.key
+                                  n.channel, n.position, n.length, n.key
                         );
                     }
                     dropped += 1;
@@ -268,9 +307,12 @@ pub(super) fn place_notes(prj: &Project) -> (HashMap<u16, Vec<Placed>>, bool, us
                 placed.entry(n.channel).or_default().push(Placed {
                     abs: n.position,
                     note: n.clone(),
-                    clip_offset_ms: None,
-                    clip_end_ms: None,
-                    clip_gain: 1.0,
+                                                          clip_offset_ms: None,
+                                                          clip_end_ms: None,
+                                                          clip_gain: 1.0,
+                                                          clip_fade_in_ms: 0.0,
+                                                          clip_fade_out_ms: 0.0,
+                                                          bends: bends.clone(),
                 });
             }
         }
@@ -301,11 +343,11 @@ pub(super) fn place_notes(prj: &Project) -> (HashMap<u16, Vec<Placed>>, bool, us
             continue;
         }
         let clip_gain = item
-            .raw
-            .get(52..56)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .filter(|g| g.is_finite() && *g > 0.0 && *g < 16.0)
-            .unwrap_or(1.0);
+        .raw
+        .get(52..56)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .filter(|g| g.is_finite() && *g > 0.0 && *g < 16.0)
+        .unwrap_or(1.0);
         placed.entry(item.ref_id).or_default().push(Placed {
             abs: item.position,
             note: Note {
@@ -324,8 +366,11 @@ pub(super) fn place_notes(prj: &Project) -> (HashMap<u16, Vec<Placed>>, bool, us
             },
             // The file stores -1.0 for "no trim"; clamp it to 0.
             clip_offset_ms: Some(item.start_offset_ms.max(0.0)),
-            clip_end_ms: Some(item.end_offset_ms),
-            clip_gain,
+                                                    clip_end_ms: Some(item.end_offset_ms),
+                                                    clip_gain,
+                                                    clip_fade_in_ms: item.fade_in_ms,
+                                                    clip_fade_out_ms: item.fade_out_ms,
+                                                    bends: Vec::new(),
         });
     }
 
@@ -342,20 +387,20 @@ pub(super) fn notes_in_measure<'a>(
     m_end: u32,
 ) -> Vec<&'a Placed> {
     placed
-        .get(&iid)
-        .map(|v| {
-            v.iter()
-                .filter(|p| m_start <= p.abs && p.abs < m_end)
-                .collect()
-        })
-        .unwrap_or_default()
+    .get(&iid)
+    .map(|v| {
+        v.iter()
+        .filter(|p| m_start <= p.abs && p.abs < m_end)
+        .collect()
+    })
+    .unwrap_or_default()
 }
 
 pub(super) fn end_tick_of(placed: &HashMap<u16, Vec<Placed>>, iid: u16) -> u32 {
     placed.get(&iid).map_or(0, |v| {
         v.iter()
-            .map(|p| p.abs.saturating_add(p.note.length))
-            .max()
-            .unwrap_or(0)
+        .map(|p| p.abs.saturating_add(p.note.length))
+        .max()
+        .unwrap_or(0)
     })
 }

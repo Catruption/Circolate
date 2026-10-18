@@ -1,23 +1,17 @@
 // src/sources/flp.rs
 //! FL Studio project (.flp) reader — Rust port of flp_parser.py.
-//!
-//! Reads the FLP event stream and groups it into project info, channels,
-//! plugins (with their saved-state blobs kept opaque), patterns with notes,
-//! mixer inserts, and the playlist.  Does not run or emulate any plugin.
-//!
-//! A truncated final event is treated as a warning, not an error: the
-//! file is still useful up to the truncation point.  Only a missing
-//! FLhd/FLdt header is fatal.
 
 use anyhow::{anyhow, bail, Result};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-// ── event ids (only the ones this parser acts on) ──────────────────────
+// ── event ids ──────────────────────────────────────────────────────────
 
 const EV_CHAN_ENABLED: u8 = 0;
 const EV_CHAN_TYPE: u8 = 21;
+const EV_CHAN_SAMPLE_START: u8 = 67;
+const EV_CHAN_SAMPLE_END: u8 = 68;
 const EV_CHAN_ROOT_NOTE: u8 = 135;
 const EV_CHAN_FINE_TUNE: u8 = 142;
 const EV_CHAN_SAMPLER_FLAGS: u8 = 143;
@@ -123,22 +117,22 @@ fn decode_env_lfo(b: &[u8]) -> Option<EnvelopeLfo> {
     }
     Some(EnvelopeLfo {
         flags: i32le(b, 0),
-        env_enabled: i32le(b, 4),
-        env_predelay: i32le(b, 8),
-        env_attack: i32le(b, 12),
-        env_hold: i32le(b, 16),
-        env_decay: i32le(b, 20),
-        env_sustain: i32le(b, 24),
-        env_release: i32le(b, 28),
-        env_amount: i32le(b, 32),
-        lfo_predelay: u32le(b, 36),
-        lfo_attack: u32le(b, 40),
-        lfo_amount: i32le(b, 44),
-        lfo_speed: u32le(b, 48),
-        lfo_shape: i32le(b, 52),
-        env_attack_tension: i32le(b, 56),
-        env_decay_tension: i32le(b, 60),
-        env_release_tension: i32le(b, 64),
+         env_enabled: i32le(b, 4),
+         env_predelay: i32le(b, 8),
+         env_attack: i32le(b, 12),
+         env_hold: i32le(b, 16),
+         env_decay: i32le(b, 20),
+         env_sustain: i32le(b, 24),
+         env_release: i32le(b, 28),
+         env_amount: i32le(b, 32),
+         lfo_predelay: u32le(b, 36),
+         lfo_attack: u32le(b, 40),
+         lfo_amount: i32le(b, 44),
+         lfo_speed: u32le(b, 48),
+         lfo_shape: i32le(b, 52),
+         env_attack_tension: i32le(b, 56),
+         env_decay_tension: i32le(b, 60),
+         env_release_tension: i32le(b, 64),
     })
 }
 
@@ -148,11 +142,11 @@ fn decode_levels(b: &[u8]) -> Option<Levels> {
     }
     Some(Levels {
         pan: i32le(b, 0),
-        volume: u32le(b, 4),
-        pitch_shift: i32le(b, 8),
-        filter_mod_x: u32le(b, 12),
-        filter_mod_y: u32le(b, 16),
-        filter_type: u32le(b, 20),
+         volume: u32le(b, 4),
+         pitch_shift: i32le(b, 8),
+         filter_mod_x: u32le(b, 12),
+         filter_mod_y: u32le(b, 16),
+         filter_type: u32le(b, 20),
     })
 }
 
@@ -162,9 +156,9 @@ fn decode_tracking(b: &[u8]) -> Option<Tracking> {
     }
     Some(Tracking {
         middle_value: u32le(b, 0),
-        pan: i32le(b, 4),
-        mod_x: i32le(b, 8),
-        mod_y: i32le(b, 12),
+         pan: i32le(b, 4),
+         mod_x: i32le(b, 8),
+         mod_y: i32le(b, 12),
     })
 }
 
@@ -174,9 +168,9 @@ fn decode_level_adjusts(b: &[u8]) -> Option<LevelAdjusts> {
     }
     Some(LevelAdjusts {
         pan: i32le(b, 0),
-        volume: u32le(b, 4),
-        mod_x: i32le(b, 12),
-        mod_y: i32le(b, 16),
+         volume: u32le(b, 4),
+         mod_x: i32le(b, 12),
+         mod_y: i32le(b, 16),
     })
 }
 
@@ -237,6 +231,8 @@ pub struct Channel {
     pub tracking: Vec<Tracking>,
     pub level_adjusts: Option<LevelAdjusts>,
     pub sampler_flags: Option<u32>,
+    pub sample_start: Option<u32>,
+    pub sample_end: Option<u32>,
     pub root_note: Option<u32>,
     pub fine_tune: Option<i32>,
 }
@@ -257,6 +253,8 @@ impl Channel {
             tracking: Vec::new(),
             level_adjusts: None,
             sampler_flags: None,
+            sample_start: None,
+            sample_end: None,
             root_note: None,
             fine_tune: None,
         }
@@ -276,13 +274,6 @@ impl Channel {
         0.0
     }
 
-    /// Channel volume as a linear scale factor.
-    ///
-    /// 12800 is PyFLP's documented max for `Channel.volume`; the default
-    /// in FL is 10000, which maps to 0.781 here.  The scale is nonlinear
-    /// in FL's UI, so this is an approximation, but it is not wrong.
-    /// Do not "fix" the divisor without a project whose raw `Levels.volume`
-    /// you can cross-check against FL's displayed percentage.
     pub fn volume_scale(&self) -> f64 {
         if let Some(l) = &self.levels {
             if l.volume == 0 {
@@ -319,6 +310,15 @@ pub struct PlaylistItem {
     pub start_offset_ms: f32,
     pub end_offset_ms: f32,
     pub clip_start_ticks: u32,
+    /// Audio-clip fade-in / fade-out lengths in milliseconds (FL21+ 60-byte
+    /// records, bytes 36..40 and 44..48).  0 = none.  Only filled for
+    /// audio clips (`kind == "channel"`).
+    pub fade_in_ms: f32,
+    pub fade_out_ms: f32,
+    /// Fade curve/tension values (bytes 40..44 and 48..52).  Read for
+    /// completeness; the converter currently emits linear fades.
+    pub fade_in_curve: f32,
+    pub fade_out_curve: f32,
     #[serde(skip)]
     pub raw: Vec<u8>,
 }
@@ -347,19 +347,12 @@ pub struct Project {
     pub samples: Vec<String>,
     #[serde(skip)]
     pub events: Vec<(u8, Vec<u8>)>,
-    /// Non-fatal issues encountered while parsing (e.g. a truncated
-    /// final event).  Callers may surface these in `check` output.
     #[serde(default)]
     pub parse_warnings: Vec<String>,
 }
 
 // ── event stream ───────────────────────────────────────────────────────
 
-/// Read the FLP event stream.
-///
-/// Returns `(ppq, events, warnings)`.  A truncated event at the end of
-/// the file is not fatal — the parser stops cleanly and records a
-/// warning.  Missing `FLhd` / `FLdt` headers are still errors.
 fn read_events(data: &[u8]) -> Result<(u16, Vec<(u8, Vec<u8>)>, Vec<String>)> {
     if data.len() < 14 || &data[0..4] != b"FLhd" {
         bail!("not an FL Studio project (missing FLhd)");
@@ -372,7 +365,7 @@ fn read_events(data: &[u8]) -> Result<(u16, Vec<(u8, Vec<u8>)>, Vec<String>)> {
         bail!("missing FLdt data chunk");
     }
     let length =
-        u32::from_le_bytes([data[p + 4], data[p + 5], data[p + 6], data[p + 7]]) as usize;
+    u32::from_le_bytes([data[p + 4], data[p + 5], data[p + 6], data[p + 7]]) as usize;
     p += 8;
     let end = (p + length).min(data.len());
 
@@ -391,7 +384,6 @@ fn read_events(data: &[u8]) -> Result<(u16, Vec<(u8, Vec<u8>)>, Vec<String>)> {
         } else if ev < 192 {
             4
         } else {
-            // 7-bit varint length.
             let mut size: usize = 0;
             let mut shift: u32 = 0;
             loop {
@@ -417,11 +409,10 @@ fn read_events(data: &[u8]) -> Result<(u16, Vec<(u8, Vec<u8>)>, Vec<String>)> {
         };
 
         if p + size > end {
-            // Truncated final event — accept the partial parse.
             let have = end.saturating_sub(p);
             warnings.push(format!(
                 "truncated event {:#04x} at offset {:#x}: needs {} byte(s), {} available; stopping parse",
-                ev, ev_off, size, have
+                                  ev, ev_off, size, have
             ));
             return Ok((ppq, events, warnings));
         }
@@ -430,15 +421,13 @@ fn read_events(data: &[u8]) -> Result<(u16, Vec<(u8, Vec<u8>)>, Vec<String>)> {
         p += size;
     }
 
-    // If we consumed the whole event stream, p == end.  Anything else
-    // means we mis-sized at least one event and silently drifted.
     if p != end {
         warnings.push(format!(
             "event stream ended at offset {:#x}, expected {:#x} ({} bytes unread); \
-             event sizes are likely misparsed",
-            p,
-            end,
-            end.saturating_sub(p)
+event sizes are likely misparsed",
+p,
+end,
+end.saturating_sub(p)
         ));
     }
 
@@ -457,17 +446,12 @@ fn decode_utf16le(raw: &[u8]) -> String {
         n += 2;
     }
     let units: Vec<u16> = (0..n)
-        .step_by(2)
-        .map(|i| u16::from_le_bytes([raw[i], raw[i + 1]]))
-        .collect();
+    .step_by(2)
+    .map(|i| u16::from_le_bytes([raw[i], raw[i + 1]]))
+    .collect();
     String::from_utf16_lossy(&units)
 }
 
-/// Heuristic: UTF-16LE text has a BOM, or has mostly-zero odd bytes
-/// because it is ASCII-range text.  The original code keyed off byte
-/// length being even, which mangled any even-length ASCII string with
-/// trailing NULs — the overwhelmingly common case for FLP sample paths
-/// and plugin names.
 fn looks_like_utf16le(raw: &[u8]) -> bool {
     if raw.len() < 4 || raw.len() % 2 != 0 {
         return false;
@@ -647,6 +631,36 @@ fn decode_playlist(raw: &[u8], major: Option<u32>) -> Vec<PlaylistItem> {
             0
         };
 
+        // Audio-clip fades (FL21+ records only).  Stored in milliseconds,
+        // like the start/end offsets above.
+        let f32_at = |o: usize| -> f32 {
+            if size >= o + 4 {
+                f32::from_le_bytes([rec[o], rec[o + 1], rec[o + 2], rec[o + 3]])
+            } else {
+                0.0
+            }
+        };
+        let fade_ms = |o: usize| -> f32 {
+            let v = f32_at(o);
+            if kind == "channel" && v.is_finite() && v > 0.0 && v < 600_000.0 {
+                v
+            } else {
+                0.0
+            }
+        };
+        let curve = |o: usize| -> f32 {
+            let v = f32_at(o);
+            if kind == "channel" && v.is_finite() {
+                v
+            } else {
+                0.0
+            }
+        };
+        let fade_in_ms = fade_ms(36);
+        let fade_in_curve = curve(40);
+        let fade_out_ms = fade_ms(44);
+        let fade_out_curve = curve(48);
+
         items.push(PlaylistItem {
             position: pos,
             length,
@@ -657,6 +671,10 @@ fn decode_playlist(raw: &[u8], major: Option<u32>) -> Vec<PlaylistItem> {
             start_offset_ms,
             end_offset_ms,
             clip_start_ticks,
+            fade_in_ms,
+            fade_out_ms,
+            fade_in_curve,
+            fade_out_curve,
             raw: rec.to_vec(),
         });
         i += size;
@@ -693,8 +711,6 @@ pub fn parse(data: &[u8]) -> Result<Project> {
     let mut chan_idx: Option<usize> = None;
     let mut pat_idx: Option<usize> = None;
     let mut plug_ref: Option<PluginRef> = None;
-    // FL writes the default-plugin name (201) *before* NewPlugin (212) for
-    // channels, so hold it until the plugin exists.
     let mut pending_def_plugin: Option<String> = None;
     let mut pending_fx_names: Vec<String> = Vec::new();
 
@@ -731,7 +747,7 @@ pub fn parse(data: &[u8]) -> Result<Project> {
             EV_COLOR if raw.len() == 4 && pat_idx.is_none() => {
                 if let Some(i) = chan_idx {
                     prj.channels[i].color =
-                        Some(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]));
+                    Some(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]));
                 }
             }
             EV_TEXT_CHAN_NAME => {
@@ -783,6 +799,16 @@ pub fn parse(data: &[u8]) -> Result<Project> {
                     prj.channels[i].sampler_flags = Some(u32le(raw, 0));
                 }
             }
+            EV_CHAN_SAMPLE_START if raw.len() == 4 => {
+                if let Some(i) = chan_idx {
+                    prj.channels[i].sample_start = Some(u32le(raw, 0));
+                }
+            }
+            EV_CHAN_SAMPLE_END if raw.len() == 4 => {
+                if let Some(i) = chan_idx {
+                    prj.channels[i].sample_end = Some(u32le(raw, 0));
+                }
+            }
             EV_CHAN_ROOT_NOTE if raw.len() == 4 => {
                 if let Some(i) = chan_idx {
                     prj.channels[i].root_note = Some(u32le(raw, 0));
@@ -820,7 +846,7 @@ pub fn parse(data: &[u8]) -> Result<Project> {
                     let ins = prj.inserts.entry(owner).or_insert_with(|| Insert {
                         index: owner,
                         name: String::new(),
-                        plugins: Vec::new(),
+                                                                      plugins: Vec::new(),
                     });
                     ins.plugins.push(blank);
                     let j = ins.plugins.len() - 1;
@@ -829,19 +855,16 @@ pub fn parse(data: &[u8]) -> Result<Project> {
             }
             EV_TEXT_DEF_PLUGIN => {
                 let s = text(*ev, raw);
-                // Older ordering (201 after 212): the target plugin is brand
-                // new and still blank, so assign directly.  Otherwise the name
-                // belongs to the plugin the next NewPlugin creates.
                 let mut assigned = false;
                 if let Some(pr) = plug_ref {
                     if let Some(p) = pr.get_mut(&mut prj) {
                         if p.internal_name.is_empty()
                             && p.display_name.is_empty()
                             && p.state.is_empty()
-                        {
-                            p.internal_name = s.clone();
-                            assigned = true;
-                        }
+                            {
+                                p.internal_name = s.clone();
+                                assigned = true;
+                            }
                     }
                 }
                 pending_def_plugin = if assigned { None } else { Some(s) };
@@ -877,7 +900,7 @@ pub fn parse(data: &[u8]) -> Result<Project> {
                 prj.patterns.push(Pattern {
                     iid,
                     name: String::new(),
-                    notes: Vec::new(),
+                                  notes: Vec::new(),
                 });
                 pat_idx = Some(prj.patterns.len() - 1);
                 chan_idx = None;
@@ -888,22 +911,16 @@ pub fn parse(data: &[u8]) -> Result<Project> {
                     prj.patterns[i].name = text(*ev, raw);
                 }
             }
-            // Keep only the *first* `PAT_NOTES` event per pattern, matching
-            // PyFLP (`self.events.first(PatternID.Notes)`).  Concatenating
-            // multiple events was producing extra notes on one channel in
-            // projects where FL emits duplicate notes events — the second
-            // event carries a stale or partial batch that must not be
-            // merged with the first.
             EV_PAT_NOTES => {
                 if let Some(i) = pat_idx {
                     let notes = decode_notes(raw);
                     if std::env::var_os("FLP_DEBUG").is_some() {
                         eprintln!(
                             "flp: PAT_NOTES pat_idx={} iid={} {} note(s) (existing: {})",
-                            i,
-                            prj.patterns[i].iid,
-                            notes.len(),
-                            prj.patterns[i].notes.len()
+                                  i,
+                                  prj.patterns[i].iid,
+                                  notes.len(),
+                                  prj.patterns[i].notes.len()
                         );
                     }
                     if prj.patterns[i].notes.is_empty() {
@@ -911,18 +928,14 @@ pub fn parse(data: &[u8]) -> Result<Project> {
                     }
                 }
             }
-            // Some FL versions split a large playlist across several
-            // EV_PLAYLIST events.  Extend instead of overwriting so the
-            // earlier batches survive.
             EV_PLAYLIST => {
                 prj.playlist
-                    .extend(decode_playlist(raw, version_major(&prj.version)));
+                .extend(decode_playlist(raw, version_major(&prj.version)));
             }
             _ => {}
         }
     }
 
-    // Attach pending fx names to inserts in sorted key order.
     let keys: Vec<u32> = prj.inserts.keys().copied().collect();
     for (key, name) in keys.into_iter().zip(pending_fx_names.into_iter()) {
         if let Some(ins) = prj.inserts.get_mut(&key) {

@@ -33,6 +33,13 @@ pub(super) struct Classified<'a> {
     pub(super) envelope_only: Vec<(u16, String, usize)>,
 }
 
+/// What happened when we tried to handle an SF2 channel.
+enum Sf2Outcome {
+    Done(String),
+    PresetMissing(String),
+    Skip(String),
+}
+
 pub(super) fn classify_channels<'a>(
     prj: &'a flp_src::Project,
     placed: &HashMap<u16, Vec<Placed>>,
@@ -52,6 +59,7 @@ pub(super) fn classify_channels<'a>(
     let mut envelope_only: Vec<(u16, String, usize)> = Vec::new();
     let mut sf2_copied: HashMap<PathBuf, String> = HashMap::new();
     let mut sidecar_path: HashMap<u16, String> = HashMap::new();
+    let mut sf2_preset_cache: HashMap<PathBuf, Option<Vec<(u16, u16)>>> = HashMap::new();
 
     for chan in &prj.channels {
         if !chan.enabled.unwrap_or(true) {
@@ -86,6 +94,48 @@ pub(super) fn classify_channels<'a>(
 
         match chan.channel_type.as_str() {
             "sampler" | "instrument" => {
+                // FL often wraps Slicex channels as "instrument" rather than
+                // "native" depending on the FL version or how the project was
+                // saved. Check for Slicex here first, so we parse the slice
+                // points instead of copying the raw WAV and ignoring them.
+                if let Some(plugin) = chan.plugin.as_ref() {
+                    if slicex::is_slicex(plugin) {
+                        match slicex::convert(chan, plugin, placed, aux_files, &mut warnings) {
+                            Ok(out) => {
+                                let (lo, hi) = (out.base_key, out.base_key + out.slices as u32);
+                                let mut stray_keys: Vec<u32> =
+                                placed.get(&chan.iid).map_or_else(Vec::new, |v| {
+                                    v.iter()
+                                    .map(|p| p.note.key as u32)
+                                    .filter(|&k| k < lo || k >= hi)
+                                    .collect()
+                                });
+                                let stray = stray_keys.len();
+                                stray_keys.sort_unstable();
+                                stray_keys.dedup();
+                                if stray > 0 {
+                                    warnings.push(format!(
+                                        "[{:2}] Slicex: {} note(s) outside slice keys {}..{} will be silent (keys: {})",
+                                                          chan.iid,
+                                                          stray,
+                                                          lo,
+                                                          hi - 1,
+                                                          stray_keys
+                                                          .iter()
+                                                          .map(|k| k.to_string())
+                                                          .collect::<Vec<_>>()
+                                                          .join(", ")
+                                    ));
+                                }
+                                sidecar_path.insert(chan.iid, out.instrument_rel);
+                                usable_sf2.push(chan);
+                            }
+                            Err(e) => skipped.push((chan, format!("Slicex: {e}"))),
+                        }
+                        continue;
+                    }
+                }
+
                 if chan.sample_path.is_empty() {
                     skipped.push((chan, "no sample path".into()));
                     continue;
@@ -123,10 +173,11 @@ pub(super) fn classify_channels<'a>(
                     }
                 }
 
-                // 0. Slicex?
+                // 0. Slicex? (redundant if it was already caught above, but
+                // some truly native channels might still be Slicex).
                 if let Some(plugin) = chan.plugin.as_ref() {
                     if slicex::is_slicex(plugin) {
-                        match slicex::convert(chan, plugin, aux_files, &mut warnings) {
+                        match slicex::convert(chan, plugin, placed, aux_files, &mut warnings) {
                             Ok(out) => {
                                 let (lo, hi) = (out.base_key, out.base_key + out.slices as u32);
                                 let mut stray_keys: Vec<u32> =
@@ -163,13 +214,6 @@ pub(super) fn classify_channels<'a>(
                 }
 
                 // 1. SoundFont player?
-                //
-                //    Gated on the plugin's declared identity, not just on
-                //    whether its state blob contains the bytes ".sf2".
-                //    Synths like Serum, FLEX, DirectWave, and any plugin
-                //    with a preset name or path fragment containing
-                //    ".sf2" were being fed to the state parser and either
-                //    silently classified wrong or dropped.
                 if let Some(plugin) = chan.plugin.as_ref() {
                     let is_sf2_plugin = sf2::is_sf2_player(plugin);
                     let has_sf2_marker = plugin
@@ -198,20 +242,29 @@ pub(super) fn classify_channels<'a>(
                         && has_sf2_marker
                         {
                             if let Some(sf) = sf2::parse_sf2_state(&plugin.state) {
-                                if let Some(rel) = handle_sf2(
+                                match handle_sf2(
                                     chan,
                                     &sf,
                                     opts,
                                     flp_dir,
                                     &mut sf2_copied,
+                                    &mut sf2_preset_cache,
                                     aux_files,
                                     &mut warnings,
-                                    &mut skipped,
                                 ) {
-                                    sidecar_path.insert(chan.iid, rel);
-                                    usable_sf2.push(chan);
+                                    Sf2Outcome::Done(rel) => {
+                                        sidecar_path.insert(chan.iid, rel);
+                                        usable_sf2.push(chan);
+                                        continue;
+                                    }
+                                    Sf2Outcome::PresetMissing(reason) => {
+                                        warnings.push(format!("[{:2}] {}", chan.iid, reason));
+                                    }
+                                    Sf2Outcome::Skip(reason) => {
+                                        skipped.push((chan, reason));
+                                        continue;
+                                    }
                                 }
-                                continue;
                             }
                         }
                 }
@@ -224,7 +277,7 @@ pub(super) fn classify_channels<'a>(
                     }
                 }
 
-                // 3. VST — resolve to installed plugin, fallback, or warn.
+                // 3. VST
                 let has_state = chan.plugin.as_ref().map_or(false, |p| !p.state.is_empty());
                 if !has_state {
                     skipped.push((chan, "native channel without saved state".into()));
@@ -353,16 +406,16 @@ pub(super) fn classify_channels<'a>(
 
 // ── SF2 handling ───────────────────────────────────────────────────────
 
-fn handle_sf2<'a>(
-    chan: &'a Channel,
+fn handle_sf2(
+    chan: &Channel,
     sf: &SfState,
     opts: &ConvertOptions,
     flp_dir: &Path,
     sf2_copied: &mut HashMap<PathBuf, String>,
-    aux_files: &mut Vec<AuxFile>,
-    warnings: &mut Vec<String>,
-    skipped: &mut Vec<(&'a Channel, String)>,
-) -> Option<String> {
+    preset_cache: &mut HashMap<PathBuf, Option<Vec<(u16, u16)>>>,
+              aux_files: &mut Vec<AuxFile>,
+              warnings: &mut Vec<String>,
+) -> Sf2Outcome {
     let want = sf
     .path
     .rsplit(|c| c == '\\' || c == '/')
@@ -395,8 +448,7 @@ fn handle_sf2<'a>(
     }
 
     let Some(src) = sf2::find_sf2(Some(sf), &chan.name, &dirs) else {
-        skipped.push((chan, format!("SF2 not found: {}", want)));
-        return None;
+        return Sf2Outcome::Skip(format!("SF2 not found: {}", want));
     };
     if debug_on() {
         eprintln!(
@@ -408,6 +460,23 @@ fn handle_sf2<'a>(
         );
     }
 
+    match sf2_presets_of(&src, preset_cache) {
+        Some(presets) => {
+            let bank_u16 = sf.bank as u16;
+            let preset_u16 = sf.preset as u16;
+            if !presets.iter().any(|(b, p)| *b == bank_u16 && *p == preset_u16) {
+                return Sf2Outcome::PresetMissing(format!(
+                    "{}: SF2 preset ({}, {}) not in {} — routing to fallback",
+                                                         if chan.name.is_empty() { &chan.channel_type } else { &chan.name },
+                                                             sf.bank,
+                                                         sf.preset,
+                                                         src.display(),
+                ));
+            }
+        }
+        None => {}
+    }
+
     let base_raw = if chan.name.is_empty() {
         format!("Ch{:02}", chan.iid)
     } else {
@@ -415,7 +484,7 @@ fn handle_sf2<'a>(
     };
     let base = identifier(&base_raw);
 
-    write_sf2_sidecar(
+    match write_sf2_sidecar(
         chan,
         &base,
         &src,
@@ -424,11 +493,39 @@ fn handle_sf2<'a>(
         warnings,
         sf.bank,
         sf.preset,
-    )
+    ) {
+        Some(rel) => Sf2Outcome::Done(rel),
+        None => Sf2Outcome::Skip(format!(
+            "SF2 sidecar write failed for {}",
+            src.display()
+        )),
+    }
 }
 
-fn write_sf2_sidecar<'a>(
-    chan: &'a Channel,
+fn sf2_presets_of(
+    path: &Path,
+    cache: &mut HashMap<PathBuf, Option<Vec<(u16, u16)>>>,
+) -> Option<Vec<(u16, u16)>> {
+    if let Some(cached) = cache.get(path) {
+        return cached.clone();
+    }
+    let result = (|| {
+        let mut engine = crate::hosting::sf2::engine::Sf2Engine::new(44100);
+        engine.load(path).ok()?;
+        Some(
+            engine
+            .list_presets()
+            .into_iter()
+            .map(|(b, p, _)| (b, p))
+            .collect(),
+        )
+    })();
+    cache.insert(path.to_path_buf(), result.clone());
+    result
+}
+
+fn write_sf2_sidecar(
+    chan: &Channel,
     base: &str,
     src: &Path,
     sf2_copied: &mut HashMap<PathBuf, String>,

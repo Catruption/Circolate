@@ -320,6 +320,8 @@ fn install_sf2_engines(
     project: &player::Project,
     sf2_override: Option<&Path>,
 ) {
+    let sf2_debug = std::env::var_os("FLP_DEBUG").is_some();
+    let default_gain = crate::hosting::sf2::engine::DEFAULT_GAIN;
     for (name, spec) in &project.sf2_engine_specs {
         let path = sf2_override.unwrap_or(&spec.sf2_path);
 
@@ -329,12 +331,19 @@ fn install_sf2_engines(
                 "sf2 [{}]: failed to load {}: {:#}",
                 name,
                 path.display(),
-                e,
+                      e,
             );
             continue;
         }
         sf2.set_preset(spec.bank, spec.preset);
-        sf2.set_gain(crate::hosting::sf2::engine::DEFAULT_GAIN * spec.gain);
+        let effective = default_gain * spec.gain;
+        if sf2_debug {
+            eprintln!(
+                "  sf2 [iid={:>3}] {:<44} DEFAULT_GAIN={:.3} spec.gain={:.3} effective={:.3}",
+                spec.iid, name, default_gain, spec.gain, effective
+            );
+        }
+        sf2.set_gain(effective);
         engine.install_sf2_engine(spec.iid, sf2);
     }
 }

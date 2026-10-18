@@ -1,65 +1,74 @@
-//! Plugin registry: single source of truth for what substitutes for what.
-//!
-//! Data flow:
-//!   share/registry.json              (shipped defaults)
-//!   ~/.config/circolate/registry.json (user overrides)
-//!   search_paths -> PluginIndex
+//! Resolution facade.
 
-mod load;
-mod paths;
-mod schema;
+pub mod paths;
+pub mod schema;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub use schema::{
-    Acquire, FallbackTarget, Mapping, MatchField, MatchRule,
-    MasterEntry, MissingPolicy, Registry, SearchPaths,
+    Acquire, FallbackTarget, Mapping, MasterEntry, MissingPolicy,
 };
-pub use paths::{install_root, user_config_dir};
+pub use paths::install_root;
 
+use crate::deps::fallbacks::{FallbacksTable, FALLBACKS_FILENAME};
 use crate::deps::index::PluginIndex;
-
-// ── resolved answer ────────────────────────────────────────────────────
+use crate::deps::inventory::{PluginInventory, INVENTORY_FILENAME};
 
 #[derive(Debug, Clone)]
 pub enum Resolution {
     Exact { name: String, path: PathBuf },
-    Fallback { name: String, path: PathBuf, replaces: String, gain: f32 },
+    Fallback {
+        name: String,
+        path: PathBuf,
+        replaces: String,
+        gain: f32,
+        via_default: bool,
+        state: Option<PathBuf>, // <--- NEW
+    },
     FallbackMissing { name: String, replaces: String },
     NoMatch,
     Skipped { note: String },
-    /// A native-effect artifact (LUT, IR, or filter coefficients) was
-    /// found under `share/native_fx/`.
     NativeArtifact {
         name: String,
         path: PathBuf,
         replaces: String,
         gain: f32,
     },
-    /// A native effect was named but its artifact hasn't been profiled
-    /// yet.
     NativeMissing {
         name: String,
         replaces: String,
     },
 }
 
-// ── table ──────────────────────────────────────────────────────────────
-
 pub struct RegistryTable {
-    registry: Registry,
+    fallbacks: FallbacksTable,
+    inventory: Option<PluginInventory>,
     search_paths: Vec<PathBuf>,
 }
 
 impl RegistryTable {
     pub fn load() -> anyhow::Result<Self> {
-        let registry = load::load()?;
-        let search_paths = paths::resolve_all(&registry.search_paths);
-        Ok(RegistryTable { registry, search_paths })
+        let root = paths::install_root()
+        .unwrap_or_else(|| PathBuf::from("."));
+        let share = root.join("share");
+
+        let fb_path = share.join(FALLBACKS_FILENAME);
+        let fallbacks = FallbacksTable::load(&fb_path)
+        .ok_or_else(|| anyhow::anyhow!(
+            "{} missing or malformed", fb_path.display()
+        ))?;
+
+        let inv_path = share.join(INVENTORY_FILENAME);
+        let inv = PluginInventory::load(&inv_path);
+        let inventory = if inv.is_empty() { None } else { Some(inv) };
+
+        let search_paths = paths::resolve_all(&fallbacks.search_paths);
+
+        Ok(RegistryTable { fallbacks, inventory, search_paths })
     }
 
     pub fn on_missing(&self) -> MissingPolicy {
-        self.registry.on_missing
+        self.fallbacks.on_missing
     }
 
     pub fn search_paths(&self) -> &[PathBuf] {
@@ -67,34 +76,34 @@ impl RegistryTable {
     }
 
     pub fn master_chain(&self) -> &[MasterEntry] {
-        &self.registry.master
+        &self.fallbacks.master
     }
 
-    /// Iterate every mapping (instruments first, then effects).
     pub fn entries(&self) -> impl Iterator<Item = &Mapping> {
-        self.registry.instruments.iter()
-        .chain(self.registry.effects.iter())
+        self.fallbacks.effects.iter()
     }
-
-    // ── resolution (with a PluginIndex) ────────────────────────────────
 
     pub fn resolve_instrument(&self, index: &PluginIndex, name: &str) -> Resolution {
         if let Some(p) = index.find_any(name) {
             return Resolution::Exact { name: name.to_string(), path: p.clone() };
         }
-        if let Some(m) = find_mapping(&self.registry.instruments, name) {
-            if !m.is_skip() {
-                return self.install_fallback(&m.fallback, name, index);
+        if let Some(inv) = &self.inventory {
+            if let Some(picked) = self.fallbacks.pick(name, index, inv) {
+                return Resolution::Fallback {
+                    name: picked.name,
+                    path: picked.path,
+                    replaces: name.to_string(),
+                    gain: picked.computed_gain,
+                    via_default: picked.via_default,
+                    state: picked.state_path, // <--- NEW
+                };
             }
-        }
-        if let Some(fb) = &self.registry.default_instrument {
-            return self.install_fallback(fb, name, index);
         }
         Resolution::NoMatch
     }
 
     pub fn resolve_effect(&self, index: &PluginIndex, internal_name: &str) -> Resolution {
-        if let Some(m) = find_mapping(&self.registry.effects, internal_name) {
+        if let Some(m) = find_mapping(&self.fallbacks.effects, internal_name) {
             if m.is_skip() {
                 return Resolution::Skipped {
                     note: if m.note.is_empty() {
@@ -106,41 +115,21 @@ impl RegistryTable {
             }
             return self.install_fallback(&m.fallback, internal_name, index);
         }
-        if let Some(fb) = &self.registry.default_effect {
-            return self.install_fallback(fb, internal_name, index);
-        }
         Resolution::NoMatch
     }
 
-    // ── index-free lookups (fetch / requires / check) ──────────────────
-
-    pub fn lookup_instrument(&self, name: &str) -> Option<&FallbackTarget> {
-        if let Some(m) = find_mapping(&self.registry.instruments, name) {
-            if !m.is_skip() {
-                return Some(&m.fallback);
-            }
-        }
-        self.registry.default_instrument.as_ref()
-    }
-
     pub fn lookup_effect(&self, internal_name: &str) -> Option<&FallbackTarget> {
-        if let Some(m) = find_mapping(&self.registry.effects, internal_name) {
+        if let Some(m) = find_mapping(&self.fallbacks.effects, internal_name) {
             if !m.is_skip() {
                 return Some(&m.fallback);
             }
             return None;
         }
-        self.registry.default_effect.as_ref()
+        None
     }
 
-    /// Cross-table lookup.  Returns the mapping and its fallback target.
     pub fn lookup_any(&self, name: &str) -> Option<(&Mapping, &FallbackTarget)> {
-        if let Some(m) = find_mapping(&self.registry.instruments, name) {
-            if !m.is_skip() {
-                return Some((m, &m.fallback));
-            }
-        }
-        if let Some(m) = find_mapping(&self.registry.effects, name) {
+        if let Some(m) = find_mapping(&self.fallbacks.effects, name) {
             if !m.is_skip() {
                 return Some((m, &m.fallback));
             }
@@ -148,15 +137,12 @@ impl RegistryTable {
         None
     }
 
-    // ── internals ──────────────────────────────────────────────────────
-
     fn install_fallback(
         &self,
         fb: &FallbackTarget,
         replaces: &str,
         index: &PluginIndex,
     ) -> Resolution {
-        // Native effect: artifact lives under share/native_fx/.
         if fb.kind == "native" {
             let Some(dir) = paths::native_fx_dir() else {
                 return Resolution::NativeMissing {
@@ -180,7 +166,6 @@ impl RegistryTable {
             };
         }
 
-        // VST substitute: existing behaviour.
         if !fb.path.is_empty() {
             let p = PathBuf::from(&fb.path);
             if p.exists() {
@@ -189,6 +174,8 @@ impl RegistryTable {
                     path: p,
                     replaces: replaces.to_string(),
                     gain: fb.gain,
+                    via_default: false,
+                    state: None, // <--- NEW
                 };
             }
         }
@@ -198,6 +185,8 @@ impl RegistryTable {
                 path: p.clone(),
                 replaces: replaces.to_string(),
                 gain: fb.gain,
+                via_default: false,
+                state: None, // <--- NEW
             };
         }
         Resolution::FallbackMissing {
@@ -205,8 +194,8 @@ impl RegistryTable {
             replaces: replaces.to_string(),
         }
     }
-
 }
+
 fn find_mapping<'a>(table: &'a [Mapping], name: &str) -> Option<&'a Mapping> {
     let key = name.to_ascii_lowercase();
     table.iter().find(|m| {

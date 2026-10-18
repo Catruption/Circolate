@@ -164,6 +164,7 @@ fn interpolate(smp: &Sample, pos: f64, _step: f64, raw_pos: f64) -> (f32, f32) {
 // ── envelope phase boundaries ──────────────────────────────────────────
 
 struct EnvState {
+    delay_sec: f64,
     attack_end: f64,
     hold_end: f64,
     decay_end: f64,
@@ -196,6 +197,10 @@ fn env_level_at(state: &EnvState, t_sec: f64) -> f32 {
 
 #[inline]
 fn env_sustain_level(state: &EnvState, t_sec: f64) -> f32 {
+    if t_sec < state.delay_sec {
+        return 0.0;
+    }
+    let t_sec = t_sec - state.delay_sec;
     if t_sec < state.attack_end {
         if state.attack_end <= 0.0 {
             return state.peak;
@@ -385,6 +390,7 @@ impl Engine {
         let sr = self.sr;
         let note_dur_sec = ((v.end - v.start) as f64 / sr).max(0.0);
 
+        let delay_sec = env.delay_sec.max(0.0) as f64;
         let attack_end = env.attack_sec as f64;
         let hold_end = attack_end + env.hold_sec as f64;
         let decay_end = hold_end + env.decay_sec as f64;
@@ -400,6 +406,7 @@ impl Engine {
         let sustain = peak * env.sustain_fraction.clamp(0.0, 1.0);
 
         Some(EnvState {
+            delay_sec,
             attack_end,
             hold_end,
             decay_end,
@@ -853,6 +860,12 @@ impl Engine {
                 host.process(&mut tl[..chunk_len], &mut tr[..chunk_len]);
 
                 let gain = vst_gains.get(iid).copied().unwrap_or(1.0);
+                super::scope::scope_push_block(
+                    *iid as usize,
+                    &tl[..chunk_len],
+                    &tr[..chunk_len],
+                    gain,
+                );
                 let insert = channel_to_insert.get(iid).copied();
 
                 match insert.and_then(|ins| insert_scratch.get_mut(&ins)) {
@@ -883,6 +896,12 @@ impl Engine {
                 for s in sl[..chunk_len].iter_mut() { *s = 0.0; }
                 for s in sr[..chunk_len].iter_mut() { *s = 0.0; }
                 eng.process(&mut sl[..chunk_len], &mut sr[..chunk_len]);
+                super::scope::scope_push_block(
+                    *iid as usize,
+                    &sl[..chunk_len],
+                    &sr[..chunk_len],
+                    1.0,
+                );
 
                 let insert = channel_to_insert.get(iid).copied();
                 match insert.and_then(|ins| insert_scratch.get_mut(&ins)) {

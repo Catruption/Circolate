@@ -83,19 +83,51 @@ pub fn whole_sample_envelope(sample: &Sample, pixel_rows: usize) -> Vec<(f32, f3
     out
 }
 
-pub fn synth_envelope_live(snapshot: &[f32], pixel_rows: usize) -> Vec<(f32, f32)> {
-    if pixel_rows == 0 || snapshot.is_empty() {
+/// Scope samples shown per envelope bin.  The ring buffer holds
+/// `SCOPE_LEN` (4096) samples, which is far too many to squeeze into a
+/// column a few dozen rows tall — dozens of unsynchronised cycles
+/// alias into noise.  Showing only the newest `bins * this` samples
+/// zooms in to a handful of readable cycles.  Raise it to zoom out.
+pub const SCOPE_SAMPLES_PER_BIN: usize = 4;
+
+/// Min/max envelope of the live scope snapshot in `bins` bins.
+///
+/// Three things make this readable, compared with plain binning:
+/// * only the newest `bins * SCOPE_SAMPLES_PER_BIN` samples are used;
+/// * the start is snapped to a rising zero crossing, so a steady note
+///   holds roughly still instead of scrolling randomly each frame;
+/// * every bin also includes the first sample of the next bin, so
+///   adjacent bins always touch and steep edges draw as a connected
+///   line rather than isolated dots.
+pub fn synth_envelope_live(snapshot: &[f32], bins: usize) -> Vec<(f32, f32)> {
+    if bins == 0 || snapshot.is_empty() {
         return Vec::new();
     }
     let n = snapshot.len();
-    let mut out = Vec::with_capacity(pixel_rows);
-    for py in 0..pixel_rows {
-        let s0 = (py as f64 / pixel_rows as f64) * n as f64;
-        let s1 = ((py + 1) as f64 / pixel_rows as f64) * n as f64;
-        let a = (s0.floor() as usize).min(n.saturating_sub(1));
-        let b = (s1.ceil() as usize).max(a + 1).min(n);
+    let w = n.min(bins.saturating_mul(SCOPE_SAMPLES_PER_BIN)).max(1);
+    let slack = n - w;
+
+    // Trigger: look for a rising zero crossing in the older part of the
+    // buffer; fall back to the newest window if there isn't one.
+    let mut start = slack;
+    let search_from = slack.saturating_sub(w.min(slack)).max(1);
+    for i in search_from..slack {
+        if snapshot[i - 1] <= 0.0 && snapshot[i] > 0.0 {
+            start = i;
+            break;
+        }
+    }
+
+    let mut out = Vec::with_capacity(bins);
+    for k in 0..bins {
+        let a = (start + (k * w) / bins).min(n - 1);
+        let b = (start + ((k + 1) * w) / bins).max(a + 1);
+        let e = (b + 1).min(n);
         let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-        for &s in &snapshot[a..b] {
+        for &s in &snapshot[a..e] {
+            if !s.is_finite() {
+                continue;
+            }
             if s < lo {
                 lo = s;
             }
@@ -103,10 +135,10 @@ pub fn synth_envelope_live(snapshot: &[f32], pixel_rows: usize) -> Vec<(f32, f32
                 hi = s;
             }
         }
-        if !lo.is_finite() {
-            out.push((0.0, 0.0));
-        } else {
+        if lo.is_finite() && hi.is_finite() {
             out.push((lo, hi));
+        } else {
+            out.push((0.0, 0.0));
         }
     }
     out

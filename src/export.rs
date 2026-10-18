@@ -30,8 +30,8 @@ pub fn run(argv: &[String]) -> Result<()> {
             }
             "--pitch" => {
                 let v = it
-                    .next()
-                    .ok_or_else(|| anyhow!("--pitch needs a value"))?;
+                .next()
+                .ok_or_else(|| anyhow!("--pitch needs a value"))?;
                 opts.pitch_mode = match v.as_str() {
                     "names" => PitchMode::Names,
                     "hz" => PitchMode::Hz,
@@ -40,16 +40,16 @@ pub fn run(argv: &[String]) -> Result<()> {
             }
             "--subdivisions" => {
                 opts.subdivisions = it
-                    .next()
-                    .ok_or_else(|| anyhow!("--subdivisions needs a value"))?
-                    .parse()?;
+                .next()
+                .ok_or_else(|| anyhow!("--subdivisions needs a value"))?
+                .parse()?;
             }
             "--samples-dir" => {
                 opts.samples_dir = Some(PathBuf::from(
                     it.next().ok_or_else(|| anyhow!("--samples-dir needs a path"))?,
                 ));
             }
-                        "--sf2" => {
+            "--sf2" => {
                 opts.sf2_path = Some(PathBuf::from(
                     it.next().ok_or_else(|| anyhow!("--sf2 needs a path"))?,
                 ));
@@ -74,7 +74,7 @@ pub fn run(argv: &[String]) -> Result<()> {
     let src = src.ok_or_else(|| {
         anyhow!(
             "usage: trackscript-player export <file> [-o DIR] [--archive] \
-             [--include-plugins[=free|all]] [--pitch names|hz]"
+[--include-plugins[=free|all]] [--pitch names|hz]"
         )
     })?;
 
@@ -100,15 +100,15 @@ fn write_directory_output(
     out_dir: Option<&Path>,
 ) -> Result<()> {
     let out = out_dir
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| convert::default_out_dir(src));
+    .map(|p| p.to_path_buf())
+    .unwrap_or_else(|| convert::default_out_dir(src));
 
     std::fs::create_dir_all(&out)
-        .with_context(|| format!("creating {}", out.display()))?;
+    .with_context(|| format!("creating {}", out.display()))?;
 
     let ts_path = out.join(format!("{}.trackscript", stem));
     std::fs::write(&ts_path, &conv.trackscript)
-        .with_context(|| format!("writing {}", ts_path.display()))?;
+    .with_context(|| format!("writing {}", ts_path.display()))?;
 
     for s in &conv.samples {
         let p = out.join(&s.rel_path);
@@ -116,7 +116,7 @@ fn write_directory_output(
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&p, &s.wav)
-            .with_context(|| format!("writing {}", p.display()))?;
+        .with_context(|| format!("writing {}", p.display()))?;
     }
 
     for a in &conv.aux {
@@ -125,19 +125,33 @@ fn write_directory_output(
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&p, &a.bytes)
-            .with_context(|| format!("writing {}", p.display()))?;
+        .with_context(|| format!("writing {}", p.display()))?;
     }
 
     if !conv.samples_json.is_empty() {
         let sj = out.join("samples.json");
         std::fs::write(&sj, &conv.samples_json)
-            .with_context(|| format!("writing {}", sj.display()))?;
+        .with_context(|| format!("writing {}", sj.display()))?;
     }
 
-    if let Some((name, bytes)) = find_cover_for_source(src) {
-        let dest = out.join(&name);
-        let _ = std::fs::write(&dest, &bytes);
+    let cover = find_cover_for_source(src);
+    if let Some((name, bytes)) = &cover {
+        let dest = out.join(name);
+        let _ = std::fs::write(&dest, bytes);
     }
+
+    let title = src.file_stem().and_then(|s| s.to_str()).unwrap_or(stem);
+    let cover_arg = cover.as_ref().map(|(n, b)| (n.as_str(), b.as_slice()));
+    let entry_path = format!("{}.trackscript", stem);
+
+    archive::write_manifest_and_requires(
+        &out,
+        conv,
+        &entry_path,
+        title,
+        44100,
+        cover_arg,
+    )?;
 
     println!("wrote {}", ts_path.display());
     Ok(())
@@ -158,14 +172,14 @@ fn write_archive_output(
                 p.to_path_buf()
             } else {
                 std::fs::create_dir_all(p)
-                    .with_context(|| format!("creating {}", p.display()))?;
+                .with_context(|| format!("creating {}", p.display()))?;
                 p.join(format!("{}.{}", stem, archive::EXTENSION))
             }
         }
         None => {
             let dir = convert::default_out_dir(src);
             std::fs::create_dir_all(&dir)
-                .with_context(|| format!("creating {}", dir.display()))?;
+            .with_context(|| format!("creating {}", dir.display()))?;
             dir.join(format!("{}.{}", stem, archive::EXTENSION))
         }
     };
@@ -197,25 +211,25 @@ fn write_archive_output(
     )?;
 
     let plugin_entries = manifest
-        .entries
-        .iter()
-        .filter(|e| matches!(e.kind, archive::EntryKind::Plugin { .. }))
-        .count();
+    .entries
+    .iter()
+    .filter(|e| matches!(e.kind, archive::EntryKind::Plugin { .. }))
+    .count();
 
     if plugin_entries > 0 {
         println!(
             "wrote {} ({} entries, {} format, {} plugin files embedded)",
-            out_path.display(),
-            manifest.entries.len(),
-            manifest.sample_format,
-            plugin_entries,
+                 out_path.display(),
+                 manifest.entries.len(),
+                 manifest.sample_format,
+                 plugin_entries,
         );
     } else {
         println!(
             "wrote {} ({} entries, {} format)",
-            out_path.display(),
-            manifest.entries.len(),
-            manifest.sample_format,
+                 out_path.display(),
+                 manifest.entries.len(),
+                 manifest.sample_format,
         );
     }
     Ok(())
@@ -243,15 +257,15 @@ fn find_cover_for_source(src: &Path) -> Option<(String, Vec<u8>)> {
 
     let rd = std::fs::read_dir(parent).ok()?;
     let mut matches: Vec<PathBuf> = rd
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_file())
-        .filter(|p| {
-            p.file_stem()
-                .and_then(|s| s.to_str())
-                .map_or(false, |s| s.eq_ignore_ascii_case("cover"))
-        })
-        .collect();
+    .flatten()
+    .map(|e| e.path())
+    .filter(|p| p.is_file())
+    .filter(|p| {
+        p.file_stem()
+        .and_then(|s| s.to_str())
+        .map_or(false, |s| s.eq_ignore_ascii_case("cover"))
+    })
+    .collect();
     matches.sort();
     for path in matches {
         let name = path.file_name().and_then(|s| s.to_str())?.to_string();

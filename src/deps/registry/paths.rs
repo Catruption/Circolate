@@ -8,7 +8,7 @@
 //!                  containing `share/`), so a `plugins/` folder next
 //!                  to the shipped binary is found automatically.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use super::schema::SearchPaths;
 

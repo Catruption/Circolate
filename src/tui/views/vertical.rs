@@ -103,7 +103,6 @@ pub fn draw(
     let synth = state.settings.synesthesia;
     let labels_cfg = state.settings.labels;
     let min_wave_rows = state.settings.layout.min_wave_rows;
-    let max_wave_rows = state.settings.layout.max_wave_rows;
     let part_gap = state.settings.layout.part_gap;
     let max_event_lines = state.settings.layout.max_event_lines;
 
@@ -425,7 +424,27 @@ pub fn draw(
 
     let available = inner_h.saturating_sub(total_fixed);
     let per_wave = if included == 0 { 0 } else { available / included };
-    let wave_rows = per_wave.clamp(min_wave_rows, max_wave_rows);
+    // Greedy fill: waveforms use their full fair share of leftover
+    // vertical space. The previous `clamp(_, max_wave_rows)` capped this
+    // at a small default (often 4-6), so on any terminal taller than a
+    // dozen rows the waveform could never grow past that ceiling and
+    // looked thin even when there was plenty of space to fill.
+    let wave_rows = per_wave.max(min_wave_rows);
+    // right after `let wave_rows = ...`
+    if std::env::var_os("FLP_DEBUG").is_some() {
+        use std::io::Write;
+        let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/vertical_debug.log")
+        .map(|mut f| {
+            let _ = writeln!(
+                f,
+                "vertical: inner_h={} total_fixed={} included={} available={} per_wave={} wave_rows={}",
+                inner_h, total_fixed, included, available, per_wave, wave_rows
+            );
+        });
+    }
 
     // ── pass 3: emit lines and hit-test rows ──────────────────────
     let mut lines: Vec<Line> = Vec::with_capacity(inner_h);

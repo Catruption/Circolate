@@ -1,19 +1,73 @@
 //! `trackscript-player vst-smoke <plugin.vst3>` — load one VST3, send a
 //! note, render two seconds, report peak level.  Smoke test for the shim.
+//!
+//! Also exposes `render_stats()`, used by `measure.rs`. The point of
+//! sharing is consistency: if `vst-smoke` says a plugin plays,
+//! `measure` must agree, and vice versa. Two separate render loops
+//! inevitably diverge — the previous version of `measure` used
+//! `process_inplace()` (the *effect* entry point) on instrument plugins,
+//! so every synth measured `-inf` while `vst-smoke` saw audio.
 
 use anyhow::{bail, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::hosting::vst::ffi::VstHost;
 
 const SR: u32 = 44100;
 const BLOCK: usize = 512;
-const SECONDS: usize = 2;
+
+#[derive(Debug, Clone, Copy)]
+pub struct RenderStats {
+    pub peak: f32,
+    pub rms: f32,
+    pub duration_secs: f32,
+}
+
+/// Render a single note through a VST3 and report linear peak/RMS.
+///
+/// `path` is the plugin bundle, `state` is the serialized plugin state
+/// (empty for a default-patch measurement). `note` is a MIDI note
+/// number, `velocity` is 0..=127. The note is held for half the render
+/// window, then released. Peak and RMS are measured over the entire
+/// buffer (attack, sustain, release).
+pub fn render_stats(
+    path: &Path,
+    state: &[u8],
+    duration_secs: f32,
+    note: u8,
+    velocity: u8,
+) -> Result<RenderStats> {
+    let path_str = path.to_str()
+    .ok_or_else(|| anyhow::anyhow!("non-UTF8 plugin path"))?;
+    let mut host = VstHost::load(path_str, state, SR)?;
+
+    let total = (SR as f32 * duration_secs) as usize;
+    let mut l = vec![0f32; total];
+    let mut r = vec![0f32; total];
+
+    host.note_on(note, velocity);
+    let blocks = total / BLOCK;
+    let release_block = blocks / 2;
+    for b in 0..blocks {
+        if b == release_block {
+            host.note_off(note);
+        }
+        let off = b * BLOCK;
+        host.process(&mut l[off..off + BLOCK], &mut r[off..off + BLOCK]);
+    }
+
+    let peak = l.iter().chain(r.iter()).fold(0f32, |a, &b| a.max(b.abs()));
+    let rms = (l.iter().chain(r.iter()).map(|&s| s * s).sum::<f32>()
+    / (2 * total) as f32).sqrt();
+
+    Ok(RenderStats { peak, rms, duration_secs })
+}
 
 pub fn run(argv: &[String]) -> Result<()> {
     let Some(path) = argv.first() else {
         bail!("usage: trackscript-player vst-smoke <plugin.vst3> [state.file]");
     };
+    let path = PathBuf::from(path);
     let state_path: Option<PathBuf> = argv.get(1).map(PathBuf::from);
     let state: Vec<u8> = match &state_path {
         Some(p) => std::fs::read(p)?,
@@ -32,34 +86,11 @@ pub fn run(argv: &[String]) -> Result<()> {
         }
     }
 
-    println!("loading {path}");
-    let mut host = VstHost::load(path, &state, SR)?;
+    println!("loading {}", path.display());
+    let stats = render_stats(&path, &state, 2.0, 60, 100)?;
 
-    let total = SR as usize * SECONDS;
-    let mut l = vec![0f32; total];
-    let mut r = vec![0f32; total];
-
-    host.note_on(60, 100);
-    let blocks = total / BLOCK;
-    for b in 0..blocks {
-        // Release the note around the one-second mark.
-        if b == SR as usize / BLOCK {
-            host.note_off(60);
-        }
-        let off = b * BLOCK;
-        host.process(&mut l[off..off + BLOCK], &mut r[off..off + BLOCK]);
-    }
-
-    let peak = l
-        .iter()
-        .chain(r.iter())
-        .fold(0f32, |a, &b| a.max(b.abs()));
-    let rms = (l.iter().chain(r.iter()).map(|&s| s * s).sum::<f32>()
-    / (2 * total) as f32)
-    .sqrt();
-
-    println!("peak: {peak:.4}   rms: {rms:.4}");
-    if peak < 1e-4 {
+    println!("peak: {:.4}   rms: {:.4}", stats.peak, stats.rms);
+    if stats.peak < 1e-4 {
         eprintln!("SILENT — plugin loaded but produced no audio");
         eprintln!("check: bus activation, class selection, state format");
     } else {

@@ -1,54 +1,11 @@
-//! Serde types for `share/registry.json` and `~/.config/circolate/registry.json`.
+//! Serde types for the effect, master-chain, and search-path sections
+//! of `share/fallbacks.json`.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Registry {
-    #[serde(default = "one")]
-    pub version: u32,
-
-    #[serde(default)]
-    pub instruments: Vec<Mapping>,
-    #[serde(default)]
-    pub effects: Vec<Mapping>,
-
-    #[serde(default)]
-    pub default_instrument: Option<FallbackTarget>,
-    #[serde(default)]
-    pub default_effect: Option<FallbackTarget>,
-
-    #[serde(default)]
-    pub master: Vec<MasterEntry>,
-
-    #[serde(default)]
-    pub search_paths: SearchPaths,
-
-    #[serde(default)]
-    pub on_missing: MissingPolicy,
-}
-
-fn one() -> u32 { 1 }
-
-impl Default for Registry {
-    fn default() -> Self {
-        Registry {
-            version: 1,
-            instruments: Vec::new(),
-            effects: Vec::new(),
-            default_instrument: None,
-                default_effect: None,
-                    master: Vec::new(),
-                    search_paths: SearchPaths::default(),
-                    on_missing: MissingPolicy::Warn,
-        }
-    }
-}
-
 // ── matching ───────────────────────────────────────────────────────────
 
-/// `match` may be either a flat string (`"Serum"`) or a structured object
-/// (`{"vst_basename": "Zenology.vst", "display_name": "ZENOLOGY"}`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum MatchField {
@@ -61,7 +18,6 @@ impl Default for MatchField {
 }
 
 impl MatchField {
-    /// Every string this rule wants to match against.
     pub fn candidates(&self) -> Vec<&str> {
         match self {
             MatchField::Flat(s) => {
@@ -110,7 +66,6 @@ pub struct FallbackTarget {
     #[serde(default = "default_gain")]
     pub gain: f32,
 
-    // Distribution metadata
     #[serde(default)]
     pub license: String,
     #[serde(default)]
@@ -134,9 +89,6 @@ pub struct Mapping {
 }
 
 impl Mapping {
-    /// A mapping with no `name` in its fallback is a "skip" marker
-    /// (e.g. Patcher).  Used by the effect resolver to say
-    /// `Resolution::Skipped` rather than treating it as a match.
     pub fn is_skip(&self) -> bool {
         self.fallback.name.is_empty()
     }

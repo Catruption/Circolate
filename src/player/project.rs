@@ -16,7 +16,8 @@ use crate::timing::TempoMap;
 use super::cache::{fingerprint, hash_part};
 use super::lines::{resolve_line, tempo_shims_to_events, LineCall, LineInfo};
 use super::types::{
-    build_sf2_instrument, MultiSampleInstrument, Sf2EngineSpec, Sf2Instrument, VstInstrument,
+    build_sf2_instrument, MultiSampleInstrument, Sf2EngineSpec, Sf2Instrument,
+    Sf2InstrumentOverrides, VstInstrument,
 };
 
 pub(crate) use super::cache::Cache;
@@ -24,6 +25,17 @@ pub(crate) use super::loader::Loader;
 pub(crate) use super::types::{Sample, Sf2VoiceEnvelope};
 
 const TAIL_SECONDS: f64 = 0.05;
+
+/// Level trim applied to every VST instrument, so plugin output (which
+/// arrives near full scale, with no headroom) sits at the same level as
+/// SF2 and sample parts.  Tune by ear: lower = quieter synths.
+const VST_TRIM: f32 = 0.6;
+
+/// Extra trim for a *fallback* plugin (the one actually loaded isn't the
+/// instrument the song was written for, e.g. Surge XT standing in for
+/// Kontakt).  The channel volume was set against the real plugin's level,
+/// so a stand-in's level is arbitrary; this pulls it down further.
+const FALLBACK_VST_TRIM: f32 = 0.7;
 
 // ── cover image ────────────────────────────────────────────────────────
 
@@ -76,6 +88,50 @@ fn find_cover_path(source: &dyn AssetSource) -> Option<PathBuf> {
     Some(path)
 }
 
+/// `share/cover` — the pool of fallback covers for songs that ship none.
+/// Tried relative to the working directory first, then by walking up
+/// from the executable (so `target/release/...` finds the repo's
+/// `share/`), the same way `trackscripts/` is found for `play`.
+fn fallback_cover_dir() -> Option<PathBuf> {
+    let rel = Path::new("share").join("cover");
+    if rel.is_dir() {
+        return Some(rel);
+    }
+    let exe = std::env::current_exe().ok()?;
+    let mut d = exe.parent().map(Path::to_path_buf);
+    while let Some(p) = d {
+        let candidate = p.join("share").join("cover");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        d = p.parent().map(Path::to_path_buf);
+    }
+    None
+}
+
+/// A random image from `share/cover`, for a song with no cover of its
+/// own.  The pick is remembered per song for the life of the process,
+/// so a hot reload of the same song keeps its image instead of
+/// re-rolling; a different song gets its own roll.
+fn fallback_cover_path(source: &dyn AssetSource) -> Option<PathBuf> {
+    use std::sync::{Mutex, OnceLock};
+    static PICKS: OnceLock<Mutex<HashMap<String, Option<PathBuf>>>> = OnceLock::new();
+
+    let key = source
+    .cache_key()
+    .unwrap_or_else(|| source.describe().to_string());
+    let mut picks = PICKS.get_or_init(Default::default).lock().ok()?;
+    if let Some(prev) = picks.get(&key) {
+        if prev.as_ref().map_or(true, |p| p.is_file()) {
+            return prev.clone();
+        }
+    }
+    let pick = fallback_cover_dir()
+    .and_then(|d| crate::tui::widgets::cover::random_image_in(&d));
+    picks.insert(key, pick.clone());
+    pick
+}
+
 // ── embedded plugin cache ──────────────────────────────────────────────
 
 fn plugins_cache_dir() -> PathBuf {
@@ -108,7 +164,7 @@ fn extract_embedded_plugins(
                 std::fs::create_dir_all(p)?;
             }
             std::fs::write(&dest, &bytes)
-                .with_context(|| format!("writing {}", dest.display()))?;
+            .with_context(|| format!("writing {}", dest.display()))?;
         }
     }
 
@@ -161,7 +217,7 @@ fn materialize_sf2_file(source: &dyn AssetSource, rel: &str) -> Result<Option<Pa
         std::fs::create_dir_all(p)?;
     }
     std::fs::write(&dest, &bytes)
-        .with_context(|| format!("writing {}", dest.display()))?;
+    .with_context(|| format!("writing {}", dest.display()))?;
 
     Ok(Some(dest))
 }
@@ -209,7 +265,7 @@ fn materialize_sf2_reference(
             std::fs::create_dir_all(p)?;
         }
         std::fs::write(&dest, &bytes)
-            .with_context(|| format!("writing {}", dest.display()))?;
+        .with_context(|| format!("writing {}", dest.display()))?;
     }
 
     let abs = dest.canonicalize().unwrap_or(dest);
@@ -363,9 +419,9 @@ impl Project {
 
     pub(crate) fn line_part_names(&self, i: usize) -> Vec<&str> {
         self.lines
-            .get(i)
-            .map(|l| l.parts.iter().map(|c| c.name.as_str()).collect())
-            .unwrap_or_default()
+        .get(i)
+        .map(|l| l.parts.iter().map(|c| c.name.as_str()).collect())
+        .unwrap_or_default()
     }
 
     pub(crate) fn line_calls(&self, i: usize) -> &[LineCall] {
@@ -376,11 +432,11 @@ impl Project {
     /// Composite blocks can resolve to several parts, all sharing this title.
     pub(crate) fn line_block_title(&self, i: usize, part_name: &str) -> Option<&str> {
         self.lines
-            .get(i)?
-            .parts
-            .iter()
-            .find(|call| call.name == part_name)
-            .map(|call| call.block_title.as_str())
+        .get(i)?
+        .parts
+        .iter()
+        .find(|call| call.name == part_name)
+        .map(|call| call.block_title.as_str())
     }
 
     pub(crate) fn line_start_row(&self, li: usize) -> f64 {
@@ -453,14 +509,14 @@ pub(crate) fn load_project_from_source(
     title_hint: Option<&str>,
 ) -> Result<(Arc<Project>, Cache)> {
     let ts_text = source
-        .read_text(ENTRY_KEY)
-        .context("reading trackscript")?
-        .ok_or_else(|| anyhow::anyhow!("source has no trackscript: {}", source.describe()))?;
+    .read_text(ENTRY_KEY)
+    .context("reading trackscript")?
+    .ok_or_else(|| anyhow::anyhow!("source has no trackscript: {}", source.describe()))?;
     let parsed = parse_str(&ts_text)?;
     let cfg = &parsed.config;
 
     let source_dir = PathBuf::new();
-    let cover_path = find_cover_path(source);
+    let cover_path = find_cover_path(source).or_else(|| fallback_cover_path(source));
 
     let fidelity: Option<Fidelity> = match source.read_text(FIDELITY_FILENAME)? {
         Some(text) => match Fidelity::from_json(&text) {
@@ -469,7 +525,7 @@ pub(crate) fn load_project_from_source(
                     println!(
                         "  fidelity: {} channels, {} automation lanes, {} playlist items, {} insert buses, {} multi-sample groups",
                         f.channels.len(), f.channel_automation.len(),
-                        f.playlist.len(), f.inserts.len(), f.multi_sample.len(),
+                             f.playlist.len(), f.inserts.len(), f.multi_sample.len(),
                     );
                 }
                 Some(f)
@@ -507,7 +563,7 @@ pub(crate) fn load_project_from_source(
     match source.read_text("samples.json")? {
         Some(text) if !text.trim().is_empty() => {
             let lib: SampleLibrary =
-                serde_json::from_str(&text).context("parsing samples.json")?;
+            serde_json::from_str(&text).context("parsing samples.json")?;
             for s in lib.samples {
                 let Some(rel) = s.file else { continue };
                 let Some(bytes) = source.read_bytes(&rel)? else { continue };
@@ -526,10 +582,10 @@ pub(crate) fn load_project_from_source(
                 let right = if stereo { chans.pop().unwrap() } else { Vec::new() };
                 let left = chans.pop().unwrap_or_default();
                 let loop_pts = s
-                    .loops
-                    .main
-                    .filter(|l| l.end > l.start)
-                    .map(|l| (l.start as i64, l.end as i64));
+                .loops
+                .main
+                .filter(|l| l.end > l.start)
+                .map(|l| (l.start as i64, l.end as i64));
                 let smp = Sample { left, right, stereo, rate, loop_pts };
                 fps.insert(s.id, fingerprint(&smp));
                 samples.insert(s.id, Arc::new(smp));
@@ -551,16 +607,16 @@ pub(crate) fn load_project_from_source(
 
     // Multi-sample instruments.
     let mut multi_sample_instruments: HashMap<String, Arc<MultiSampleInstrument>> =
-        HashMap::new();
+    HashMap::new();
     if let Some(fid) = &fidelity {
         for (_iid_str, ms) in &fid.multi_sample {
             if ms.files.is_empty() { continue; }
             if let Some(inst) =
                 MultiSampleInstrument::new(&ms.files, &ms.root_keys, &path_to_id)
-            {
-                let primary = ms.files[0].clone();
-                multi_sample_instruments.insert(primary, Arc::new(inst));
-            }
+                {
+                    let primary = ms.files[0].clone();
+                    multi_sample_instruments.insert(primary, Arc::new(inst));
+                }
         }
     }
     if !quiet && !multi_sample_instruments.is_empty() {
@@ -588,18 +644,18 @@ pub(crate) fn load_project_from_source(
         };
         let Ok(inst) = crate::deps::instruments::parse(&text, &rel) else { continue };
         let stem = rel
-            .rsplit('/')
-            .next()
-            .and_then(|n| n.strip_suffix(".instrument"))
-            .unwrap_or("instrument");
+        .rsplit('/')
+        .next()
+        .and_then(|n| n.strip_suffix(".instrument"))
+        .unwrap_or("instrument");
         let sidecar_rel = format!("instruments/{}.instrument", stem);
 
         if inst.is_sf2() {
             let sf2_rel = inst
-                .sf2_path
-                .to_string_lossy()
-                .trim_start_matches("./")
-                .to_string();
+            .sf2_path
+            .to_string_lossy()
+            .trim_start_matches("./")
+            .to_string();
 
             // Materialize the SF2 to disk for the native engine.
             // `build_sf2_instrument` below reads from the in-memory
@@ -628,19 +684,41 @@ pub(crate) fn load_project_from_source(
                 inst.sf2_preset as u16,
                 next_sf2_id,
                 &mut samples,
+                if inst.slicex {
+                    Some(Sf2InstrumentOverrides {
+                        pan: inst.slicex_pan as f64,
+                        gain: inst.slicex_gain,
+                        tune_cents: inst.slicex_tune_cents,
+                        env: Sf2VoiceEnvelope {
+                            peak: 1.0,
+                            delay_sec: inst.slicex_delay_sec,
+                            attack_sec: inst.slicex_attack_sec,
+                            hold_sec: inst.slicex_hold_sec,
+                            decay_sec: inst.slicex_decay_sec,
+                            sustain_fraction: inst.slicex_sustain_fraction,
+                            release_sec: inst.slicex_release_sec,
+                        },
+                    })
+                } else {
+                    None
+                },
             ) {
                 next_sf2_id += obj.zone_count_hint() + 1;
                 sf2_instruments.insert(sidecar_rel.clone(), Arc::new(obj));
             }
 
-            // New engine spec.
+            // Route every SF2 through the native SF2 engine.  Slicex is
+            // represented as a generated SF2 with one single-key zone per
+            // slice; routing it through the internal sample renderer changes
+            // resampling, envelope, voice lifetime, and insert-FX behavior.
+            // Apply the Slicex channel-volume multiplier at engine level.
             sf2_engine_specs.insert(
                 sidecar_rel,
                 Sf2EngineSpec {
                     sf2_path: sf2_on_disk,
                     bank: inst.sf2_bank as u8,
                     preset: inst.sf2_preset as u8,
-                    gain: inst.gain,
+                    gain: inst.gain * if inst.slicex { inst.slicex_gain } else { 1.0 },
                     iid: inst.source_channel,
                 },
             );
@@ -651,14 +729,14 @@ pub(crate) fn load_project_from_source(
 
             let embedded = embedded_plugins.get(&inst.plugin).cloned();
             let plugin_path = embedded
-                .clone()
-                .unwrap_or_else(|| PathBuf::from(&inst.vst_path));
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(&inst.vst_path));
 
             if !plugin_path.exists() {
                 if !quiet {
                     eprintln!(
                         "  (VST sidecar points at missing file: {})",
-                        plugin_path.display()
+                              plugin_path.display()
                     );
                 }
                 continue;
@@ -668,10 +746,10 @@ pub(crate) fn load_project_from_source(
                 Vec::new()
             } else {
                 let name = inst
-                    .state_path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("");
+                .state_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
                 let state_rel = format!("instruments/{}", name);
                 source.read_bytes(&state_rel)?.unwrap_or_default()
             };
@@ -693,11 +771,43 @@ pub(crate) fn load_project_from_source(
                 Arc::new(VstInstrument {
                     iid: inst.source_channel,
                     name: inst.plugin.clone(),
-                    plugin_path,
-                    state_bytes,
-                    fallback: inst.fallback,
-                    gain: inst.gain,
+                         plugin_path,
+                         state_bytes,
+                         fallback: inst.fallback,
+                         gain: inst.gain
+                         * VST_TRIM
+                         * if inst.fallback { FALLBACK_VST_TRIM } else { 1.0 },
                 }),
+            );
+        }
+    }
+    // Stand-in plugins sum.  Each one was balanced in the original
+    // project against a *different* plugin, so a song with fifteen of
+    // them playing at once is far louder than any one trim accounts for.
+    // Treat them as uncorrelated and scale each by 1/sqrt(count), which
+    // keeps their combined level about the same however many there are.
+    let n_fallback = vst_instruments.values().filter(|v| v.fallback).count();
+    if n_fallback > 1 {
+        let spread = 1.0 / (n_fallback as f32).sqrt();
+        for v in vst_instruments.values_mut() {
+            if !v.fallback {
+                continue;
+            }
+            let scaled = Arc::new(VstInstrument {
+                iid: v.iid,
+                name: v.name.clone(),
+                                  plugin_path: v.plugin_path.clone(),
+                                  state_bytes: v.state_bytes.clone(),
+                                  fallback: v.fallback,
+                                  gain: v.gain * spread,
+            });
+            *v = scaled;
+        }
+        if !quiet {
+            println!(
+                "  {} stand-in plugins: trimmed {:.1} dB each so they sit as backing",
+                n_fallback,
+                -20.0 * spread.log10(),
             );
         }
     }
@@ -705,8 +815,8 @@ pub(crate) fn load_project_from_source(
         println!(
             "  loaded {} sf2 instruments, {} sf2 engines, {} vst instruments",
             sf2_instruments.len(),
-            sf2_engine_specs.len(),
-            vst_instruments.len()
+                 sf2_engine_specs.len(),
+                 vst_instruments.len()
         );
     }
 
@@ -754,10 +864,10 @@ pub(crate) fn load_project_from_source(
     let total_samples = (render_end_sec * sr) as i64;
 
     let part_hash: HashMap<String, u64> = parsed
-        .parts
-        .iter()
-        .map(|(n, p)| (n.clone(), hash_part(p, &path_to_id, &fps)))
-        .collect();
+    .parts
+    .iter()
+    .map(|(n, p)| (n.clone(), hash_part(p, &path_to_id, &fps)))
+    .collect();
 
     let mut cache = Cache::new(use_cache);
     let mut lines: Vec<LineInfo> = Vec::with_capacity(resolved_lines.len());
@@ -805,7 +915,7 @@ pub(crate) fn load_project_from_source(
 
         let (min_start, max_end) = (
             (tempo.time_at_row(this_start_row) * sr) as i64,
-            (tempo.time_at_row(this_end_row.min(total_arrangement_rows)) * sr) as i64,
+                                    (tempo.time_at_row(this_end_row.min(total_arrangement_rows)) * sr) as i64,
         );
 
         lines.push(LineInfo {
@@ -829,13 +939,13 @@ pub(crate) fn load_project_from_source(
         println!(
             "  parsed {} parts, {} blocks, {} BlockList lines, {} voices",
             parsed.parts.len(), parsed.blocks.len(),
-            parsed.block_list.len(), total_voices
+                 parsed.block_list.len(), total_voices
         );
     }
 
     let title = title_hint
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "untitled".to_string());
+    .map(|s| s.to_string())
+    .unwrap_or_else(|| "untitled".to_string());
 
     let project = Project {
         parts: parsed.parts,
@@ -877,9 +987,9 @@ pub(crate) fn load_project_from_dir(
 ) -> Result<(Arc<Project>, Cache)> {
     let base = ts_path.parent().unwrap_or_else(|| Path::new("."));
     let name = ts_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("trackscript");
+    .file_name()
+    .and_then(|s| s.to_str())
+    .unwrap_or("trackscript");
     let title = ts_path.file_stem().and_then(|s| s.to_str());
     let source = DirSource::new(base.to_path_buf(), name.to_string());
     load_project_from_source(&source, sample_rate, use_cache, quiet, title)

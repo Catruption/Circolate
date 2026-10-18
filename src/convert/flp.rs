@@ -1,4 +1,3 @@
-
 // src/convert/flp.rs
 //! FLP → Trackscript converter.
 
@@ -28,9 +27,9 @@ use crate::formats::flp as flp_src;
 use classify::{classify_channels, Classified};
 use extract::{build_fidelity, extract_inserts};
 use place::{end_tick_of, notes_in_measure, place_notes};
-use render::{render_part, NoteStyle};
+use render::{render_part, NoteStyle, extract_vol_env};
 use resolve::Resolved;
-use wav::{decode_audio_to_wav, wav_sample_rate, wav_secs};
+use wav::{decode_audio_to_wav, wav_sample_rate, wav_secs, crop_wav};
 
 // ── constants shared with submodules ───────────────────────────────────
 
@@ -171,7 +170,7 @@ pub(super) fn convert(
             let target_name = format!("{:02}_{}.wav", chan.iid, safe_name(&raw_name));
             let rel = format!("samples/{}", target_name);
 
-            let bytes = match decode_audio_to_wav(src) {
+            let mut bytes = match decode_audio_to_wav(src) {
                 Ok(b) => b,
                 Err(e) => {
                     warnings.push(format!(
@@ -186,6 +185,21 @@ pub(super) fn convert(
             };
 
             let sample_rate = wav_sample_rate(&bytes).unwrap_or(44100);
+            let total_samples = (wav_secs(&bytes).unwrap_or(0.0) * sample_rate as f64) as u32;
+
+            let mut start_s = chan.sample_start.unwrap_or(0);
+            let mut end_s = chan.sample_end.unwrap_or(total_samples);
+            if end_s == 0 || end_s > total_samples {
+                end_s = total_samples;
+            }
+
+            if start_s > 0 || end_s < total_samples {
+                if let Ok(cropped) = crop_wav(&bytes, start_s, end_s) {
+                    bytes = cropped;
+                    start_s = 0; // The WAV is now physically cropped, so the offset is 0
+                }
+            }
+
             styles.insert(
                 chan.iid,
                 NoteStyle {
@@ -195,6 +209,8 @@ pub(super) fn convert(
                           vol_scale: chan.volume_scale(),
                           pan_offset: chan.pan_norm(),
                           sample_rate,
+                          sample_start: start_s,
+                          vol_env: extract_vol_env(chan),
                 },
             );
             sample_outs.push(SampleOut { rel_path: rel.clone(), wav: bytes });
@@ -230,6 +246,8 @@ pub(super) fn convert(
                           vol_scale: chan.volume_scale(),
                           pan_offset: chan.pan_norm(),
                           sample_rate,
+                          sample_start: chan.sample_start.unwrap_or(0),
+                          vol_env: extract_vol_env(chan),
                 },
             );
             sample_files.insert(chan.iid, primary_rel.clone());
@@ -505,6 +523,7 @@ pub struct FallbackUse {
     pub replaces: String,
     pub used: String,
     pub resolved: bool,
+    pub via_default: bool,
 }
 
 #[derive(Debug, Default)]
@@ -576,11 +595,15 @@ pub fn probe(src_path: &Path, opts: &ConvertOptions) -> Result<ProbeReport> {
             DepKind::Sf2
         } else if lower.contains("sample") {
             DepKind::Sample
-        } else if lower.contains("plugin") || lower.contains("vst") {
-            DepKind::Plugin
-        } else {
-            DepKind::Unknown
-        };
+        } else if lower.contains("plugin")
+            || lower.contains("vst")
+            || lower.contains("fallback")
+            || lower.contains("not installed")
+            {
+                DepKind::Plugin
+            } else {
+                DepKind::Unknown
+            };
 
         report.missing.push(MissingDep {
             channel_iid: chan.iid,
@@ -595,16 +618,16 @@ pub fn probe(src_path: &Path, opts: &ConvertOptions) -> Result<ProbeReport> {
     }
 
     for (iid, res) in &resolved_map {
-        if let Resolved::Fallback { name, path, replaces, .. } = res {
+        if let Resolved::Fallback { name, path, replaces, via_default, .. } = res {
             report.fallbacks.push(FallbackUse {
                 channel_iid: *iid,
                 replaces: replaces.clone(),
                                   used: name.clone(),
-                                  resolved: path.is_some(),
+                                  resolved: path.is_some() && !*via_default,
+                                  via_default: *via_default,
             });
         }
     }
 
     Ok(report)
 }
-
