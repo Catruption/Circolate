@@ -10,7 +10,7 @@
 //! doesn't need that, because you read one part at a time.
 //!
 //! Waveform height is greedy: leftover vertical space is split evenly
-//! between parts, clamped to `min_wave_rows..=max_wave_rows`.
+//! between parts, clamped to `min_wave_rows`.
 //!
 //! Each sample-based part's waveform carries a *sample-position*
 //! playhead — a marker at the column corresponding to the sample
@@ -105,6 +105,7 @@ pub fn draw(
     let min_wave_rows = state.settings.layout.min_wave_rows;
     let part_gap = state.settings.layout.part_gap;
     let max_event_lines = state.settings.layout.max_event_lines;
+    let lookback_lines = state.settings.layout.lookback_lines;
 
     state.tracker_hit = None;
     state.vertical_hit = None;
@@ -125,6 +126,9 @@ pub fn draw(
         return;
     };
 
+    let rpmeasure = p.rows_per_measure().max(1.0);
+    let lookback = lookback_lines.min(li);
+
     let mut by_path: HashMap<String, Vec<(String, f64, f64, f64)>> = HashMap::new();
     let mut present: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -137,19 +141,53 @@ pub fn draw(
         }
         by_path.entry(key).or_default().push((
             call.name.clone(),
-            0.0,
-            call.pattern_measure_start,
-            call.pattern_measure_len,
+                                              0.0,
+                                              call.pattern_measure_start,
+                                              call.pattern_measure_len,
         ));
+    }
+
+    for k in 1..=lookback {
+        let prev_li = li - k;
+        let offset_rows = k as f64 * rpmeasure;
+        for call in p.line_calls(prev_li) {
+            let Some(path) = p.part_path(&call.name) else { continue };
+            let subs = p.part_subs_per_beat(&call.name);
+            let measure_end = call.pattern_measure_start + call.pattern_measure_len;
+            let still_on = split_notes(
+                p.part_events(&call.name),
+                                       subs,
+                                       p.part_sample_offset_u32(&call.name),
+            )
+            .iter()
+            .any(|n| {
+                n.start_row >= call.pattern_measure_start
+                && n.start_row < measure_end
+                && (n.end_row - call.pattern_measure_start) > offset_rows
+            });
+            if !still_on {
+                continue;
+            }
+            let key = path.to_string();
+            if seen.insert(key.clone()) {
+                present.push(key.clone());
+            }
+            by_path.entry(key).or_default().push((
+                call.name.clone(),
+                                                  offset_rows,
+                                                  call.pattern_measure_start,
+                                                  call.pattern_measure_len,
+            ));
+        }
     }
 
     let present_set: HashSet<&String> = present.iter().collect();
     let mut path_order: Vec<String> = state
-        .column_order
-        .iter()
-        .filter(|path| present_set.contains(path))
-        .cloned()
-        .collect();
+    .column_order
+    .iter()
+    .filter(|path| present_set.contains(path))
+    .cloned()
+    .collect();
     for path in &present {
         if !path_order.iter().any(|m| m == path) {
             path_order.push(path.clone());
@@ -170,7 +208,6 @@ pub fn draw(
         return;
     }
 
-    let rpmeasure = p.rows_per_measure().max(1.0);
     let measure_samples = p.line_measure_samples(li).max(1);
     let line_start = p.line_start_sample(li);
     let elapsed = (pos - line_start).max(0);
@@ -199,17 +236,20 @@ pub fn draw(
         }
         let mut staged: Vec<Staged> = Vec::new();
 
-        for (name, _offset, measure_start, measure_len) in sources {
+        for (name, offset_rows, measure_start, measure_len) in sources {
             let subs = p.part_subs_per_beat(name);
+            let is_current = *offset_rows == 0.0;
             let measure_end = measure_start + measure_len;
+
             for mut note in split_notes(
                 p.part_events(name),
-                subs,
-                p.part_sample_offset_u32(name),
+                                        subs,
+                                        p.part_sample_offset_u32(name),
             ) {
                 if note.start_row < *measure_start || note.start_row >= measure_end {
                     continue;
                 }
+
                 let ms = *measure_start;
                 note.start_row -= ms;
                 note.end_row -= ms;
@@ -217,19 +257,46 @@ pub fn draw(
                 for pt in &mut note.vol_points   { pt.row -= ms; }
                 for pt in &mut note.pan_points   { pt.row -= ms; }
 
+                let active = note.end_row > *offset_rows;
+                let has_vol_waypoints = note.vol_points.len() > 1;
+                let dur_beats = note.dur_beats.unwrap_or(1.0);
+                let is_sustained = dur_beats >= 2.0;
+                let end_vol = value_at(&note.vol_points, note.end_row).unwrap_or(0.0);
+                let still_fading = has_vol_waypoints && is_sustained && end_vol > 0.01;
+
+                if !active && !still_fading {
+                    continue;
+                }
+
+                let (display_start, display_end) = if is_current {
+                    (note.start_row, note.end_row)
+                } else if active {
+                    (0.0, (note.end_row - *offset_rows).min(rpmeasure))
+                } else {
+                    (0.0, 0.0)
+                };
+
+                // If the note started in a previous measure, clamp its visual start to 0
+                // so we don't print negative positions like `<§-1/1, ...>`.
+                if !is_current {
+                    note.start_row = 0.0;
+                }
+
                 let dn = DisplayNote {
                     note,
                     subs,
-                    display_start: 0.0,
-                    display_end: 0.0,
-                    value_offset: 0.0,
+                    display_start,
+                    display_end,
+                    value_offset: *offset_rows,
                     source_name: name.clone(),
                 };
                 let text = format_event(&dn, subs);
 
-                let playing = dn.note.start_row <= current_row
-                    && current_row < dn.note.end_row;
-                let played = !playing && current_row >= dn.note.end_row;
+                let playing = dn.display_end > 0.0
+                && dn.display_start <= current_row
+                && current_row < dn.display_end;
+                let played = !playing && (dn.display_end == 0.0 || current_row >= dn.display_end);
+
                 let state_note = if playing {
                     NoteState::Playing
                 } else if played {
@@ -240,13 +307,13 @@ pub fn draw(
                     NoteState::Waiting
                 };
                 let pitch =
-                    value_at(&dn.note.pitch_points, dn.note.start_row).unwrap_or(440.0);
+                value_at(&dn.note.pitch_points, dn.note.start_row).unwrap_or(440.0);
                 let vol =
-                    value_at(&dn.note.vol_points, dn.note.start_row).unwrap_or(100.0);
+                value_at(&dn.note.vol_points, dn.note.start_row).unwrap_or(100.0);
                 let style = if col_off {
                     Style::default()
-                        .fg(theme.color(Token::MutedFg))
-                        .bg(theme.color(Token::MutedBg))
+                    .fg(theme.color(Token::MutedFg))
+                    .bg(theme.color(Token::MutedBg))
                 } else {
                     note_style(pitch, vol, state_note, &theme, &synth)
                 };
@@ -265,7 +332,9 @@ pub fn draw(
         // point at.
         let playhead_col: Option<usize> = {
             let active = staged.iter().find(|st| {
-                st.dn.note.start_row <= current_row && current_row < st.dn.note.end_row
+                st.dn.display_end > 0.0
+                && st.dn.display_start <= current_row
+                && current_row < st.dn.display_end
             });
 
             match p.preview_sample_for_part(&first_name) {
@@ -275,11 +344,14 @@ pub fn draw(
                         let nf = n as f64;
                         let ph = state.playheads.entry(path.clone()).or_default();
 
-                        let block_start_sample = p.line_start_sample(li);
+                        let lines_back = (st.dn.value_offset / rpmeasure).round() as usize;
+                        let block_line = li.saturating_sub(lines_back);
+                        let block_start_sample = p.line_start_sample(block_line);
+
                         let id = (
                             st.dn.source_name.clone(),
-                            st.dn.note.start_row,
-                            block_start_sample,
+                                  st.dn.note.start_row,
+                                  block_start_sample,
                         );
 
                         if ph.note_id.as_ref() != Some(&id) {
@@ -290,9 +362,9 @@ pub fn draw(
                             let raw_delta = pos - ph.last_audio_pos;
                             let max_delta = sr_comp as i64;
                             let audio_delta_secs =
-                                raw_delta.clamp(-max_delta, max_delta) as f64 / sr_comp;
+                            raw_delta.clamp(-max_delta, max_delta) as f64 / sr_comp;
                             let pitch = value_at(&st.dn.note.pitch_points, current_row)
-                                .unwrap_or(C5_HZ);
+                            .unwrap_or(C5_HZ);
                             let ratio = (pitch / C5_HZ).max(1e-6);
                             ph.position += audio_delta_secs * sample.rate * ratio;
                             ph.last_audio_pos = pos;
@@ -306,12 +378,9 @@ pub fn draw(
 
                         let t = (ph.position / nf).clamp(0.0, 1.0);
                         Some(((t * inner_w as f64).floor() as usize)
-                            .min(inner_w.saturating_sub(1)))
+                        .min(inner_w.saturating_sub(1)))
                     }
                     None => {
-                        // Sample-based, but nothing is currently
-                        // sounding: clear the tracker so a stale dot
-                        // doesn't linger.
                         if let Some(ph) = state.playheads.get_mut(path) {
                             ph.note_id = None;
                         }
@@ -319,8 +388,6 @@ pub fn draw(
                     }
                 },
                 _ => {
-                    // No sample (VST, or an empty sample buffer).  No
-                    // marker; also clear any stale tracker entry.
                     if let Some(ph) = state.playheads.get_mut(path) {
                         ph.note_id = None;
                     }
@@ -329,16 +396,16 @@ pub fn draw(
             }
         };
 
-        // The block is "playing" when any note it contributed has the
-        // playhead inside its body.
         let block_playing = !col_off && staged.iter().any(|st| {
-            st.dn.note.start_row <= current_row && current_row < st.dn.note.end_row
+            st.dn.display_end > 0.0
+            && st.dn.display_start <= current_row
+            && current_row < st.dn.display_end
         });
 
         let mut label = p
-            .line_block_title(li, &first_name)
-            .unwrap_or(&first_name)
-            .to_string();
+        .line_block_title(li, &first_name)
+        .unwrap_or(&first_name)
+        .to_string();
         if label.chars().count() > inner_w {
             label = label.chars().take(inner_w.saturating_sub(1)).collect();
             label.push('…');
@@ -347,9 +414,9 @@ pub fn draw(
 
         staged.sort_by(|a, b| {
             a.dn.note
-                .start_row
-                .partial_cmp(&b.dn.note.start_row)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            .start_row
+            .partial_cmp(&b.dn.note.start_row)
+            .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         let mut event_lines: Vec<EventLine> = Vec::new();
@@ -365,7 +432,7 @@ pub fn draw(
             if width > 0 && width + need > inner_w {
                 event_lines.push(EventLine {
                     line: Line::from(std::mem::take(&mut spans)),
-                    first_note: first_on_line.take(),
+                                 first_note: first_on_line.take(),
                 });
                 width = 0;
                 if event_lines.len() >= max_event_lines {
@@ -383,25 +450,25 @@ pub fn draw(
         if !spans.is_empty() && event_lines.len() < max_event_lines {
             event_lines.push(EventLine {
                 line: Line::from(spans),
-                first_note: first_on_line,
+                             first_note: first_on_line,
             });
         }
         if truncated {
             if let Some(last) = event_lines.last_mut() {
                 last.line.spans.push(Span::styled(
                     "…".to_string(),
-                    Style::default().fg(theme.color(Token::MutedFg)),
+                                                  Style::default().fg(theme.color(Token::MutedFg)),
                 ));
             }
         }
 
         blocks.push(PartBlock {
             path: path.clone(),
-            first_name,
-            label_spans,
-            event_lines,
-            col_off,
-            playhead_col,
+                    first_name,
+                    label_spans,
+                    event_lines,
+                    col_off,
+                    playhead_col,
         });
     }
 
@@ -410,10 +477,10 @@ pub fn draw(
     let mut included = 0usize;
     for (i, b) in blocks.iter().enumerate() {
         let this_fixed = 1
-            + b.event_lines.len()
-            + if i > 0 { part_gap } else { 0 };
+        + b.event_lines.len()
+        + if i > 0 { part_gap } else { 0 };
         let projected =
-            total_fixed + this_fixed + (included + 1) * min_wave_rows;
+        total_fixed + this_fixed + (included + 1) * min_wave_rows;
         if projected > inner_h {
             break;
         }
@@ -424,27 +491,7 @@ pub fn draw(
 
     let available = inner_h.saturating_sub(total_fixed);
     let per_wave = if included == 0 { 0 } else { available / included };
-    // Greedy fill: waveforms use their full fair share of leftover
-    // vertical space. The previous `clamp(_, max_wave_rows)` capped this
-    // at a small default (often 4-6), so on any terminal taller than a
-    // dozen rows the waveform could never grow past that ceiling and
-    // looked thin even when there was plenty of space to fill.
     let wave_rows = per_wave.max(min_wave_rows);
-    // right after `let wave_rows = ...`
-    if std::env::var_os("FLP_DEBUG").is_some() {
-        use std::io::Write;
-        let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/vertical_debug.log")
-        .map(|mut f| {
-            let _ = writeln!(
-                f,
-                "vertical: inner_h={} total_fixed={} included={} available={} per_wave={} wave_rows={}",
-                inner_h, total_fixed, included, available, per_wave, wave_rows
-            );
-        });
-    }
 
     // ── pass 3: emit lines and hit-test rows ──────────────────────
     let mut lines: Vec<Line> = Vec::with_capacity(inner_h);
@@ -469,8 +516,8 @@ pub fn draw(
                     y,
                     VerticalRow::Event {
                         path: block.path.clone(),
-                        block_line: bl,
-                        start_row: sr,
+                               block_line: bl,
+                               start_row: sr,
                     },
                 ));
             }
@@ -479,53 +526,53 @@ pub fn draw(
 
         let base_style = if block.col_off {
             Style::default()
-                .fg(theme.color(Token::MutedFg))
-                .bg(theme.color(Token::MutedBg))
+            .fg(theme.color(Token::MutedFg))
+            .bg(theme.color(Token::MutedBg))
         } else {
             Style::default().fg(Color::Rgb(180, 180, 180))
         };
         let ph_style = if block.col_off {
             Style::default()
-                .fg(theme.color(Token::MutedFg))
-                .bg(theme.color(Token::MutedBg))
+            .fg(theme.color(Token::MutedFg))
+            .bg(theme.color(Token::MutedBg))
         } else {
             Style::default().fg(theme.color(Token::Playhead))
         };
         let ph_col = if block.col_off { None } else { block.playhead_col };
 
         let wave: Vec<Vec<Span<'static>>> =
-            if let Some(sample) = p.preview_sample_for_part(&block.first_name) {
-                render_waveform(
-                    &sample,
+        if let Some(sample) = p.preview_sample_for_part(&block.first_name) {
+            render_waveform(
+                &sample,
+                inner_w,
+                wave_rows,
+                base_style,
+                ph_col,
+                ph_style,
+            )
+        } else if let Some(iid) = p.iid_for_part(&block.first_name) {
+            scope_snapshot(iid as usize, &mut state.snapshot);
+            if state.snapshot.is_empty() {
+                vec![
+                    vec![Span::styled(" ".to_string(), base_style); inner_w];
+                    wave_rows
+                ]
+            } else {
+                synth_waveform(
+                    &state.snapshot,
                     inner_w,
                     wave_rows,
                     base_style,
                     ph_col,
                     ph_style,
                 )
-            } else if let Some(iid) = p.iid_for_part(&block.first_name) {
-                scope_snapshot(iid as usize, &mut state.snapshot);
-                if state.snapshot.is_empty() {
-                    vec![
-                        vec![Span::styled(" ".to_string(), base_style); inner_w];
-                        wave_rows
-                    ]
-                } else {
-                    synth_waveform(
-                        &state.snapshot,
-                        inner_w,
-                        wave_rows,
-                        base_style,
-                        ph_col,
-                        ph_style,
-                    )
-                }
-            } else {
-                vec![
-                    vec![Span::styled(" ".to_string(), base_style); inner_w];
-                    wave_rows
-                ]
-            };
+            }
+        } else {
+            vec![
+                vec![Span::styled(" ".to_string(), base_style); inner_w];
+                wave_rows
+            ]
+        };
 
         for row in wave {
             if y >= inner_h as u16 { break; }
@@ -534,7 +581,7 @@ pub fn draw(
                 y,
                 VerticalRow::Waveform {
                     path: block.path.clone(),
-                    line: li,
+                           line: li,
                 },
             ));
             y += 1;
