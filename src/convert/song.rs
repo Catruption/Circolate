@@ -20,8 +20,6 @@
 //!         ]
 //!         ;
 //!     }
-//!
-//! No more `ZENOLOGY02` suffixes, no more `|4/4[...]` per measure.
 
 use std::collections::HashMap;
 
@@ -47,7 +45,15 @@ pub(super) struct Call {
 
 pub(super) struct MeasureLine {
     pub(super) calls: Vec<Call>,
-    /// Shim events, tempo lines, etc.  Written after the calls.
+    /// Parallel to `calls`: `extra[i]` is the shim suffix appended to
+    /// `calls[i]` before its terminating `;`.  Empty string means no
+    /// shim for that call.  `write()` indexes with `extra.get(ci)`, so
+    /// a line may have fewer entries than calls (missing = no shim);
+    /// this is how `it.rs` leaves shims off every call.
+    ///
+    /// Entries past `calls.len()` are not emitted — standalone shims
+    /// (own BlockList line) must be authored in the file directly, not
+    /// produced via this struct.
     pub(super) extra: Vec<String>,
 }
 
@@ -69,10 +75,6 @@ pub(super) struct Song {
 
     pub(super) post_comments: Vec<String>,
 
-    /// Value for the `SoundFont:` config key.  `None` omits the key.
-    /// `Some("ask".into())` marks this trackscript as "prompt at play
-    /// time"; `run.sh` greps for it.  `Some("'path'")` (with the quotes
-    /// baked in) pins a specific SF2.
     pub(super) soundfont: Option<String>,
 }
 
@@ -85,9 +87,9 @@ impl Song {
         tempo: f64,
         subs: u32,
         time_signature: (u32, u32),
-        song_volume_pct: f64,
-        panning_law: &'static str,
-        pitch_default: &'static str,
+                      song_volume_pct: f64,
+                      panning_law: &'static str,
+                      pitch_default: &'static str,
     ) -> Self {
         Song {
             title: title.to_string(),
@@ -114,8 +116,8 @@ impl Song {
         let idx = self.parts.len();
         self.parts.push(Part {
             name: name.to_string(),
-            source_arg,
-            sections: Vec::new(),
+                        source_arg,
+                        sections: Vec::new(),
         });
         self.part_index.insert(name.to_string(), idx);
         idx
@@ -162,18 +164,15 @@ impl Song {
         out.push_str("}\n\n");
 
         // ── BlockList ─────────────────────────────────────────────
-        //
-        // Each line is a call to one measure of one part, written as
-        // `ƒname(N);` where N is the 1-based measure index.
         out.push_str("BlockList()\n{\n");
         for line in &self.measures {
-            if line.calls.is_empty() && line.extra.is_empty() {
+            if line.calls.is_empty() {
                 out.push_str("    ;\n");
                 continue;
             }
             out.push_str("    ");
             let mut first = true;
-            for c in &line.calls {
+            for (ci, c) in line.calls.iter().enumerate() {
                 if !first {
                     out.push(' ');
                 }
@@ -185,31 +184,24 @@ impl Song {
                 if let Some(ov) = &c.overrides {
                     out.push_str(ov);
                 }
-                out.push_str(");");
-            }
-            for extra in &line.extra {
-                if !first {
-                    out.push(' ');
+                out.push(')');
+                if let Some(suffix) = line.extra.get(ci) {
+                    out.push_str(suffix);
                 }
-                first = false;
-                out.push_str(extra);
+                out.push(';');
             }
             out.push('\n');
         }
         out.push_str("}\n\n");
 
         // ── BlockArray ────────────────────────────────────────────
-        //
-        // A part is `ƒname(<|4/4, ƒ'path'>)[ measures ] ;` where each
-        // measure is one line of the body.  The frame `|4/4` lives
-        // inside the header args, not in per-measure section headers.
         out.push_str("BlockArray()\n{\n");
-        let frame = spec::section_frame(num, self.subs); // "|4/4"
+        let frame = spec::section_frame(num, self.subs);
         for part in &self.parts {
-             out.push_str(&format!(
-                 "    ƒ{}(<{}, {}>)[\n",
-                 part.name, frame, part.source_arg
-             ));
+            out.push_str(&format!(
+                "    ƒ{}(<{}, {}>)[\n",
+                                  part.name, frame, part.source_arg
+            ));
             for section in &part.sections {
                 out.push_str(section);
                 out.push('\n');
@@ -217,7 +209,6 @@ impl Song {
             out.push_str("    ]\n");
             out.push_str("    ;\n\n");
         }
-        // Drop the final blank line before the closing brace.
         if out.ends_with("\n\n") {
             out.pop();
         }

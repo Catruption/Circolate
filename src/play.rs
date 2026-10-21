@@ -44,7 +44,7 @@ mod silence {
                 }
                 let devnull = libc::open(
                     b"/dev/null\0".as_ptr() as *const libc::c_char,
-                    libc::O_WRONLY,
+                                         libc::O_WRONLY,
                 );
                 if devnull < 0 {
                     libc::close(saved_out);
@@ -92,8 +92,6 @@ struct Args {
     skip_native: bool,
     no_master_fx: bool,
     no_watch: bool,
-    /// `--sf2 PATH`: override whatever SF2 the sidecars reference.  Used
-    /// by `run.sh` when the user picks a bonus SoundFont.
     sf2_override: Option<PathBuf>,
 }
 
@@ -118,15 +116,15 @@ fn parse_args(argv: &[String]) -> Result<Args> {
             }
             "--rate" => {
                 rate = it
-                    .next()
-                    .ok_or_else(|| anyhow!("--rate needs a value"))?
-                    .parse()?
+                .next()
+                .ok_or_else(|| anyhow!("--rate needs a value"))?
+                .parse()?
             }
             "--start" => {
                 start = it
-                    .next()
-                    .ok_or_else(|| anyhow!("--start needs seconds"))?
-                    .parse()?
+                .next()
+                .ok_or_else(|| anyhow!("--start needs seconds"))?
+                .parse()?
             }
             "--samples-dir" => {
                 samples_dir = Some(PathBuf::from(
@@ -149,8 +147,8 @@ fn parse_args(argv: &[String]) -> Result<Args> {
     }
     Ok(Args {
         song, render, rate, start, no_cache, verify,
-        samples_dir, skip_native, no_master_fx, no_watch,
-        sf2_override,
+       samples_dir, skip_native, no_master_fx, no_watch,
+       sf2_override,
     })
 }
 
@@ -158,8 +156,8 @@ fn parse_args(argv: &[String]) -> Result<Args> {
 
 fn is_archive(path: &Path) -> bool {
     path.extension()
-        .and_then(|s| s.to_str())
-        .map_or(false, |e| e.eq_ignore_ascii_case(archive::EXTENSION))
+    .and_then(|s| s.to_str())
+    .map_or(false, |e| e.eq_ignore_ascii_case(archive::EXTENSION))
 }
 
 fn resolve_song(name: &str) -> Result<PathBuf> {
@@ -215,9 +213,9 @@ struct TempBundle {
 impl TempBundle {
     fn new(tag: &str) -> Result<Self> {
         let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
         let mut dir = std::env::temp_dir();
         dir.push(format!("circolate-{}-{}-{}", tag, std::process::id(), nanos));
         std::fs::create_dir_all(&dir)?;
@@ -308,13 +306,6 @@ fn install_vst_hosts(engine: &mut Engine, project: &player::Project) {
     }
 }
 
-/// Install a native SF2 engine for every `Sf2EngineSpec` in the project.
-/// `sf2_override` (from `--sf2`) replaces the SF2 each spec references;
-/// the spec's bank/patch/gain are preserved either way.
-///
-/// The engine must be `.load()`ed with the file path before
-/// `install_sf2_engine` hands it to the mixer.  Constructing the engine,
-/// setting a preset, and installing it without loading leaves it silent.
 fn install_sf2_engines(
     engine: &mut Engine,
     project: &player::Project,
@@ -329,9 +320,7 @@ fn install_sf2_engines(
         if let Err(e) = sf2.load(&path) {
             eprintln!(
                 "sf2 [{}]: failed to load {}: {:#}",
-                name,
-                path.display(),
-                      e,
+                name, path.display(), e,
             );
             continue;
         }
@@ -359,6 +348,284 @@ fn install_master_fx(engine: &mut Engine, project: &player::Project, disabled: b
     }
 }
 
+fn find_share_dir() -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        let mut d = exe.parent().map(Path::to_path_buf);
+        while let Some(p) = d {
+            let candidate = p.join("share");
+            if candidate.is_dir() && candidate.join("fallbacks.json").is_file() {
+                return Some(candidate);
+            }
+            d = p.parent().map(Path::to_path_buf);
+        }
+    }
+    let cwd_share = Path::new("share");
+    if cwd_share.is_dir() && cwd_share.join("fallbacks.json").is_file() {
+        return Some(cwd_share.to_path_buf());
+    }
+    None
+}
+
+fn normalize_slug(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push('_');
+        }
+    }
+    out
+}
+
+/// Resolve a shim target through `share/fallbacks.json` → `effects[]` →
+/// `fallback.name` → `share/plugins_inventory.json` → `plugins[name].path`.
+///
+/// VST3 on Linux/macOS is a bundle *directory*; the check accepts both.
+fn resolve_effect_path(target: &str, share_dir: &Path) -> Option<PathBuf> {
+    let debug = std::env::var_os("SHIM_DEBUG").is_some();
+    let target_norm = normalize_slug(target);
+
+    let fallback_path = share_dir.join("fallbacks.json");
+    let fallback_text = match std::fs::read_to_string(&fallback_path) {
+        Ok(t) => t,
+        Err(e) => {
+            if debug {
+                eprintln!("shim-debug: cannot read {:?}: {:#}", fallback_path, e);
+            }
+            return None;
+        }
+    };
+    let fallback_json: serde_json::Value = match serde_json::from_str(&fallback_text) {
+        Ok(j) => j,
+        Err(e) => {
+            if debug {
+                eprintln!("shim-debug: parse {}: {:#}", fallback_path.display(), e);
+            }
+            return None;
+        }
+    };
+    let Some(effects) = fallback_json.get("effects").and_then(|v| v.as_array()) else {
+        if debug {
+            eprintln!("shim-debug: no `effects` array in {:?}", fallback_path);
+        }
+        return None;
+    };
+    if debug {
+        eprintln!(
+            "shim-debug: target={:?} norm={:?} effects_count={}",
+            target, target_norm, effects.len()
+        );
+    }
+
+    let matched = effects.iter().find(|e| {
+        e.get("match")
+        .and_then(|v| v.as_str())
+        .map(|m| normalize_slug(m) == target_norm)
+        .unwrap_or(false)
+    });
+    let Some(matched) = matched else {
+        if debug {
+            eprintln!("shim-debug: no effects[] entry matches {:?}", target_norm);
+        }
+        return None;
+    };
+
+    let Some(display_name) = matched
+    .get("fallback")
+    .and_then(|f| f.get("name"))
+    .and_then(|v| v.as_str())
+    else {
+        if debug {
+            eprintln!(
+                "shim-debug: matched {:?} but fallback.name is absent (empty substitute)",
+                      target_norm
+            );
+        }
+        return None;
+    };
+    if debug {
+        eprintln!("shim-debug: matched {:?} → {:?}", target_norm, display_name);
+    }
+
+    let inventory_path = share_dir.join("plugins_inventory.json");
+    let inventory_text = match std::fs::read_to_string(&inventory_path) {
+        Ok(t) => t,
+        Err(e) => {
+            if debug {
+                eprintln!("shim-debug: cannot read {:?}: {:#}", inventory_path, e);
+            }
+            return None;
+        }
+    };
+    let inventory_json: serde_json::Value = match serde_json::from_str(&inventory_text) {
+        Ok(j) => j,
+        Err(e) => {
+            if debug {
+                eprintln!("shim-debug: parse {}: {:#}", inventory_path.display(), e);
+            }
+            return None;
+        }
+    };
+    let Some(plugins) = inventory_json.get("plugins").and_then(|v| v.as_object()) else {
+        if debug {
+            eprintln!("shim-debug: no `plugins` object in {:?}", inventory_path);
+        }
+        return None;
+    };
+    let Some(entry) = plugins.get(display_name) else {
+        if debug {
+            eprintln!(
+                "shim-debug: inventory missing {:?} (available: {:?})",
+                      display_name, plugins.keys().collect::<Vec<_>>()
+            );
+        }
+        return None;
+    };
+    let Some(path_str) = entry.get("path").and_then(|v| v.as_str()) else {
+        if debug {
+            eprintln!("shim-debug: inventory entry {:?} has no path", display_name);
+        }
+        return None;
+    };
+    let p = PathBuf::from(path_str);
+    if p.is_dir() || p.is_file() {
+        if debug {
+            eprintln!("shim-debug: resolved {:?} -> {:?}", display_name, p);
+        }
+        Some(p)
+    } else {
+        if debug {
+            eprintln!(
+                "shim-debug: inventory path not on disk: {:?} (is_dir={}, is_file={})",
+                      p, p.is_dir(), p.is_file()
+            );
+        }
+        None
+    }
+}
+
+/// Install one VST3 host per unique `(target, params, mix, gain, pan)`.
+/// Every BlockList line routes through the same insert chain, so the
+/// raw shim list has hundreds of duplicates; deduping by key collapses
+/// them to one host each.  Params are applied via
+/// `VstHost::set_param_by_index` before the host is installed, so the
+/// DSP is in the desired state on the first audio block.
+fn install_shims(
+    engine: &mut Engine,
+    project: &player::Project,
+    share_dir: Option<&Path>,
+) {
+    use std::collections::HashMap;
+
+    if project.shims.is_empty() {
+        return;
+    }
+    let debug = std::env::var_os("SHIM_DEBUG").is_some();
+    let Some(share_dir) = share_dir else {
+        eprintln!(
+            "  shims: share/ not found; {} shim(s) skipped",
+                  project.shims.len()
+        );
+        return;
+    };
+    if debug {
+        eprintln!(
+            "shim-debug: share_dir={:?} ({} shim(s) to attach)",
+                  share_dir, project.shims.len()
+        );
+    }
+
+    type ShimKey = (String, Vec<(u32, u64)>, u64, u64, u64);
+    let mut hosts_by_key: HashMap<ShimKey, u32> = HashMap::new();
+    let mut resolved_paths: HashMap<String, Option<PathBuf>> = HashMap::new();
+    let mut next_shim_id: u32 = 0;
+    let total_shims = project.shims.len();
+    let mut attached = 0u32;
+    let mut skipped = 0u32;
+
+    for shim in &project.shims {
+        let mut params_key: Vec<(u32, u64)> = shim
+        .params
+        .iter()
+        .map(|p| (p.slot, p.value.to_bits()))
+        .collect();
+        params_key.sort();
+
+        let key: ShimKey = (
+            shim.target.clone(),
+                            params_key,
+                            shim.mix.to_bits(),
+                            shim.gain.to_bits(),
+                            shim.pan.to_bits(),
+        );
+
+        if let Some(&existing_id) = hosts_by_key.get(&key) {
+            engine.attach_shim_line(shim.line as u32, existing_id);
+            attached += 1;
+            continue;
+        }
+
+        let path_opt = resolved_paths
+        .entry(shim.target.clone())
+        .or_insert_with(|| resolve_effect_path(&shim.target, share_dir));
+
+        let Some(path) = path_opt.as_ref() else {
+            skipped += 1;
+            continue;
+        };
+
+        let mut host = match VstHost::load(path.to_str().unwrap_or(""), &[], project.sample_rate) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("  shim: failed to load '{}': {:#}", shim.target, e);
+                skipped += 1;
+                continue;
+            }
+        };
+
+        // Apply shim parameters before installing the host.  Slot 1 is
+        // parameter index 0, slot 2 is index 1, etc.  Values are treated
+        // as percent (0..100 → 0.0..1.0 normalized).
+        for param in &shim.params {
+            if param.slot == 0 {
+                continue;
+            }
+            let index = (param.slot - 1) as u32;
+            let normalized = (param.value / 100.0).clamp(0.0, 1.0);
+            let ok = host.set_param_by_index(index, normalized);
+            if debug {
+                eprintln!(
+                    "shim-debug: set_param({} idx={} val={:.3}) = {}",
+                          shim.target, index, normalized, ok
+                );
+            }
+        }
+
+        let id = next_shim_id;
+        next_shim_id += 1;
+        engine.install_shim(
+            id,
+            host,
+            shim.mix,
+            (shim.gain / 100.0).clamp(0.0, 4.0),
+                            shim.pan,
+        );
+        engine.attach_shim_line(shim.line as u32, id);
+        hosts_by_key.insert(key, id);
+        attached += 1;
+        eprintln!(
+            "  shim {:02}: loaded '{}' (from {})",
+                  id, shim.target, path.display(),
+        );
+    }
+
+    eprintln!(
+        "  shims: {} attachment(s), {} skipped, {} unique VST3 host(s) (from {} shim event(s))",
+              attached, skipped, next_shim_id, total_shims,
+    );
+}
+
 // ── live-reload watcher ────────────────────────────────────────────────
 
 struct ReloadSlot {
@@ -374,21 +641,21 @@ fn watch_for_changes(
     mut last_hashes: std::collections::HashMap<String, u64>,
 ) {
     let mut last_mtime = std::fs::metadata(&path)
-        .and_then(|m| m.modified())
-        .ok();
+    .and_then(|m| m.modified())
+    .ok();
 
     while !tp.stop.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(400));
         let mtime = std::fs::metadata(&path)
-            .and_then(|m| m.modified())
-            .ok();
+        .and_then(|m| m.modified())
+        .ok();
         if mtime == last_mtime {
             continue;
         }
         std::thread::sleep(Duration::from_millis(300));
         let settled = std::fs::metadata(&path)
-            .and_then(|m| m.modified())
-            .ok();
+        .and_then(|m| m.modified())
+        .ok();
         if settled != mtime {
             continue;
         }
@@ -477,31 +744,31 @@ fn worker(
                 && tp.speed.load(Ordering::Relaxed) == 1
                 && total > 0
                 && pos + tail_margin >= total
-            {
-                let tail = loader.load_due(i64::MAX);
-                if !(tail.samples.is_empty() && tail.vsts.is_empty()) {
-                    let msg = Msg::Batch {
+                {
+                    let tail = loader.load_due(i64::MAX);
+                    if !(tail.samples.is_empty() && tail.vsts.is_empty()) {
+                        let msg = Msg::Batch {
+                            epoch,
+                            samples: tail.samples,
+                            vsts: tail.vsts,
+                        };
+                        if tx.send(msg).is_err() {
+                            break;
+                        }
+                    }
+                    epoch += 1;
+                    let first = loader.seek(0, lookahead);
+                    let wrap = Msg::Seek {
                         epoch,
-                        samples: tail.samples,
-                        vsts: tail.vsts,
+                        pos: 0,
+                        samples: first.samples,
+                        vsts: first.vsts,
                     };
-                    if tx.send(msg).is_err() {
+                    if wrap_tx.send(wrap).is_err() {
                         break;
                     }
+                    wrap_ready = true;
                 }
-                epoch += 1;
-                let first = loader.seek(0, lookahead);
-                let wrap = Msg::Seek {
-                    epoch,
-                    pos: 0,
-                    samples: first.samples,
-                    vsts: first.vsts,
-                };
-                if wrap_tx.send(wrap).is_err() {
-                    break;
-                }
-                wrap_ready = true;
-            }
         }
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -528,7 +795,7 @@ fn verify_cache(args: &Args, song: &Path) -> Result<()> {
     } else {
         bail!(
             "cache check FAILED: {} differing samples (lengths {} vs {})",
-            n, a_l.len(), b_l.len()
+              n, a_l.len(), b_l.len()
         )
     }
 }
@@ -553,8 +820,8 @@ fn play_one(
 ) -> Result<Outcome> {
     let host = cpal::default_host();
     let device = host
-        .default_output_device()
-        .ok_or_else(|| anyhow!("no default output device"))?;
+    .default_output_device()
+    .ok_or_else(|| anyhow!("no default output device"))?;
     let device_config = device.default_output_config()?;
     if device_config.sample_format() != cpal::SampleFormat::F32 {
         bail!(
@@ -563,27 +830,19 @@ fn play_one(
         );
     }
 
-    // Prefer 48000 Hz when the device supports it.  PipeWire's house
-    // clock is 48000 on almost every modern desktop, and every stream
-    // we open at 44100 gets resampled at the graph boundary.  Chiptune
-    // (square waves, high harmonics) is the worst case for that: the
-    // resampler's lowpass aliases content the ear reads as buzz.
-    // cpal's ALSA backend on a pipewire-alsa system reports 44100 from
-    // the default PCM, so we override here rather than trusting the
-    // device default.
     let mut stream_config: cpal::StreamConfig = device_config.clone().into();
     let preferred = cpal::SampleRate(48000);
     let supports_preferred = device
-        .supported_output_configs()
-        .map(|cfgs| {
-            cfgs.into_iter().any(|c| {
-                c.channels() == stream_config.channels
-                    && c.sample_format() == cpal::SampleFormat::F32
-                    && c.min_sample_rate() <= preferred
-                    && preferred <= c.max_sample_rate()
-            })
+    .supported_output_configs()
+    .map(|cfgs| {
+        cfgs.into_iter().any(|c| {
+            c.channels() == stream_config.channels
+            && c.sample_format() == cpal::SampleFormat::F32
+            && c.min_sample_rate() <= preferred
+            && preferred <= c.max_sample_rate()
         })
-        .unwrap_or(false);
+    })
+    .unwrap_or(false);
 
     if supports_preferred && device_config.sample_rate() != preferred {
         stream_config.sample_rate = preferred;
@@ -593,7 +852,7 @@ fn play_one(
 
     let is_watchable_trackscript = song.map_or(false, |p| {
         !is_archive(p)
-            && matches!(SourceKind::from_path(p), Ok(SourceKind::Trackscript))
+        && matches!(SourceKind::from_path(p), Ok(SourceKind::Trackscript))
     });
 
     let (project, cache, project_path, _guard) = match song {
@@ -617,14 +876,14 @@ fn play_one(
         if let Some(name) = song
             .and_then(|p| p.file_stem())
             .and_then(|s| s.to_str())
-        {
-            let row = queue.cursor.row.min(queue.lines.len().saturating_sub(1));
-            if queue.lines.get(row).map_or(false, |l| l.is_blank()) {
-                let text: String = name.chars().take(queue::TEXT_W as usize).collect();
-                queue.lines[row].text = text;
-                queue.start_at(row);
+            {
+                let row = queue.cursor.row.min(queue.lines.len().saturating_sub(1));
+                if queue.lines.get(row).map_or(false, |l| l.is_blank()) {
+                    let text: String = name.chars().take(queue::TEXT_W as usize).collect();
+                    queue.lines[row].text = text;
+                    queue.start_at(row);
+                }
             }
-        }
     }
 
     let total = project.total_samples;
@@ -633,15 +892,15 @@ fn play_one(
 
     let transport = Arc::new(Transport {
         speed: AtomicI64::new(initial_speed),
-        seek_to: AtomicI64::new(start),
-        position: AtomicI64::new(start),
-        done: AtomicBool::new(false),
-        stop: AtomicBool::new(false),
-        active_voices: AtomicI64::new(0),
-        loaded_lines: AtomicI64::new(0),
-        reload_count: AtomicI64::new(0),
-        loop_next: AtomicBool::new(false),
-        loop_wraps: AtomicI64::new(0),
+                             seek_to: AtomicI64::new(start),
+                             position: AtomicI64::new(start),
+                             done: AtomicBool::new(false),
+                             stop: AtomicBool::new(false),
+                             active_voices: AtomicI64::new(0),
+                             loaded_lines: AtomicI64::new(0),
+                             reload_count: AtomicI64::new(0),
+                             loop_next: AtomicBool::new(false),
+                             loop_wraps: AtomicI64::new(0),
     });
 
     let reload_slot = if is_watchable_trackscript && !args.no_watch {
@@ -683,6 +942,7 @@ fn play_one(
     install_vst_hosts(&mut engine, &project);
     install_sf2_engines(&mut engine, &project, args.sf2_override.as_deref());
     install_master_fx(&mut engine, &project, args.no_master_fx);
+    install_shims(&mut engine, &project, find_share_dir().as_deref());
 
     let tp = Arc::clone(&transport);
     let mut left = vec![0f32; 4096];
@@ -693,7 +953,6 @@ fn play_one(
     let stream = device.build_output_stream(
         &stream_config,
         move |data: &mut [f32], _| {
-            // ── Ingest ─────────────────────────────────────────────
             while let Ok(m) = rx.try_recv() {
                 if let Msg::Seek { epoch, .. } = &m {
                     cur_epoch = *epoch;
@@ -712,7 +971,6 @@ fn play_one(
             let speed = tp.speed.load(Ordering::Relaxed);
             let loop_next = tp.loop_next.load(Ordering::Acquire);
 
-            // ── End-of-song fallback ───────────────────────────────
             if !engine.ready && speed == 1 && loop_next && pending_wrap.is_some() {
                 if let Some(m) = pending_wrap.take() {
                     if let Msg::Seek { epoch, .. } = &m {
@@ -724,7 +982,6 @@ fn play_one(
                 tp.done.store(false, Ordering::Release);
             }
 
-            // ── Normal readiness check ─────────────────────────────
             if !engine.ready {
                 data.fill(0.0);
                 return;
@@ -744,7 +1001,6 @@ fn play_one(
             }
             tp.done.store(false, Ordering::Release);
 
-            // ── Render ─────────────────────────────────────────────
             let frames = data.len() / channels;
             if left.len() < frames {
                 left.resize(frames, 0.0);
@@ -793,18 +1049,18 @@ fn play_one(
     stream.play()?;
 
     let notes: Vec<String> = project
-        .requires
-        .as_ref()
-        .map(|r| crate::deps::requires::report_lines(r))
-        .unwrap_or_default();
+    .requires
+    .as_ref()
+    .map(|r| crate::deps::requires::report_lines(r))
+    .unwrap_or_default();
 
     let (request, queue) = tui::run_against(
         term,
         Arc::clone(&transport),
-        Arc::clone(&project),
-        sample_rate,
-        queue,
-        settings,
+                                            Arc::clone(&project),
+                                            sample_rate,
+                                            queue,
+                                            settings,
     )?;
     transport.stop.store(true, Ordering::Relaxed);
     drop(stream);
@@ -822,20 +1078,20 @@ pub fn run(argv: &[String]) -> Result<()> {
 
     if args.verify {
         let song = args
-            .song
-            .as_ref()
-            .ok_or_else(|| anyhow!("--verify-cache needs a song file"))?;
+        .song
+        .as_ref()
+        .ok_or_else(|| anyhow!("--verify-cache needs a song file"))?;
         return verify_cache(&args, song);
     }
 
     if let Some(out) = &args.render {
         let song = args
-            .song
-            .as_ref()
-            .ok_or_else(|| anyhow!("--render needs a song file"))?;
+        .song
+        .as_ref()
+        .ok_or_else(|| anyhow!("--render needs a song file"))?;
         let (path, _guard) = resolve_source(song, &args)?;
         let (project, cache) =
-            player::load_project(&path, args.rate, !args.no_cache, false)?;
+        player::load_project(&path, args.rate, !args.no_cache, false)?;
         let t0 = std::time::Instant::now();
         let start = (args.start * args.rate as f64) as i64;
         let (l, r, cache) = player::render_offline(
@@ -845,10 +1101,10 @@ pub fn run(argv: &[String]) -> Result<()> {
         player::write_wav(out, &l, &r, args.rate)?;
         println!(
             "  wrote {} ({:.2}s of audio in {:.1}s; {})",
-            out.display(),
-            l.len() as f64 / args.rate as f64,
-            t0.elapsed().as_secs_f64(),
-            cache.describe()
+                 out.display(),
+                 l.len() as f64 / args.rate as f64,
+                 t0.elapsed().as_secs_f64(),
+                 cache.describe()
         );
         return Ok(());
     }
@@ -865,27 +1121,27 @@ pub fn run(argv: &[String]) -> Result<()> {
 
             let msg = match &song {
                 Some(p) => format!("loading {}...", p.display()),
-                None => "no song — queue box is focused; type a name and press enter".into(),
+                  None => "no song — queue box is focused; type a name and press enter".into(),
             };
             let notes: Vec<String> = pending_notes.drain(..).collect();
             tui::show_loading(&mut term, &queue, &settings, &msg, &notes)?;
 
             match play_one(&mut term, &args, song.as_deref(), queue.clone(), settings.clone()) {
                 Ok(Outcome::Quit) => return Ok(()),
-                Ok(Outcome::Next { name, queue: q, notes: n }) => {
-                    queue = q;
-                    pending_notes = n;
-                    match resolve_song(&name) {
-                        Ok(p) => song = Some(p),
-                        Err(_) => song = None,
-                    }
-                }
-                Err(e) => {
-                    let msg = format!("load failed: {e:#}");
-                    tui::show_loading(&mut term, &queue, &settings, &msg, &[])?;
-                    std::thread::sleep(Duration::from_secs(3));
-                    song = None;
-                }
+                  Ok(Outcome::Next { name, queue: q, notes: n }) => {
+                      queue = q;
+                      pending_notes = n;
+                      match resolve_song(&name) {
+                          Ok(p) => song = Some(p),
+                  Err(_) => song = None,
+                      }
+                  }
+                  Err(e) => {
+                      let msg = format!("load failed: {e:#}");
+                      tui::show_loading(&mut term, &queue, &settings, &msg, &[])?;
+                      std::thread::sleep(Duration::from_secs(3));
+                      song = None;
+                  }
             }
         }
     })();

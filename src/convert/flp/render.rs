@@ -76,6 +76,24 @@ pub(super) fn extract_vol_env(chan: &Channel) -> Option<VolumeEnv> {
     })
 }
 
+/// Channel pitch knob (event 219, `Levels.pitch_shift`, assumed to be cents)
+/// split into whole semitones plus the leftover cents.  Values outside
+/// ±4800 cents are treated as misdecoded and ignored.
+pub(super) fn channel_pitch(chan: &Channel) -> (i32, i32) {
+    let cents = chan.levels.as_ref().map_or(0, |l| l.pitch_shift);
+    if cents == 0 || cents.abs() > 4800 {
+        return (0, 0);
+    }
+    let semis = (cents as f64 / 100.0).round() as i32;
+    (semis, cents - semis * 100)
+}
+
+/// `FLP_ENV_LEGACY=1` restores the old volume-envelope waypoints (no
+/// attack ramp, decay/release as bare waypoints).
+fn env_legacy() -> bool {
+    std::env::var_os("FLP_ENV_LEGACY").is_some()
+}
+
 fn ms_to_beats(ms: i32, bpm: f64) -> f64 {
     if ms <= 0 || bpm <= 0.0 {
         return 0.0;
@@ -193,7 +211,24 @@ pub(super) fn render_part(
 
                 // A fade-in starts the note silent; the waypoint below
                 // ramps it up to `vol` over the fade length.
-                let start_vol = if fade_in_b > 0.0 { 0.0 } else { vol };
+                // `level` is where the note settles once any attack or
+                // fade-in is over: the envelope's peak when a volume
+                // envelope is active, otherwise the plain volume.
+                let legacy = env_legacy();
+                let env_attack_b = style
+                .vol_env
+                .map_or(0.0, |e| ms_to_beats(e.attack_ms, style.bpm));
+                let level = match style.vol_env {
+                    Some(e) if !legacy => vol * e.amount,
+                    _ => vol,
+                };
+                let start_vol = if fade_in_b > 0.0 {
+                    0.0
+                } else if env_attack_b > 0.0 && !legacy {
+                    0.0
+                } else {
+                    level
+                };
                 if (start_vol - 100.0).abs() > 0.5 {
                     fields.push(format!("%{}", fmt(start_vol, 1)));
                 }
@@ -254,17 +289,45 @@ pub(super) fn render_part(
                     let peak = vol * env.amount;
                     let sus = peak * env.sustain;
 
-                    if a_b > 0.0 {
-                        wps.push((b2r(a_b), format!("%{}", fmt(peak, 1))));
-                    }
-                    if h_b > 0.0 {
-                        wps.push((b2r(a_b + h_b), format!("%{}", fmt(peak, 1))));
-                    }
-                    if d_b > 0.0 {
-                        wps.push((b2r(a_b + h_b + d_b), format!("%{}", fmt(sus, 1))));
-                    }
-                    if r_b > 0.0 {
-                        wps.push((b2r(dur_beats + r_b), "%0".to_string()));
+                    if legacy {
+                        if a_b > 0.0 {
+                            wps.push((b2r(a_b), format!("%{}", fmt(peak, 1))));
+                        }
+                        if h_b > 0.0 {
+                            wps.push((b2r(a_b + h_b), format!("%{}", fmt(peak, 1))));
+                        }
+                        if d_b > 0.0 {
+                            wps.push((b2r(a_b + h_b + d_b), format!("%{}", fmt(sus, 1))));
+                        }
+                        if r_b > 0.0 {
+                            wps.push((b2r(dur_beats + r_b), "%0".to_string()));
+                        }
+                    } else {
+                        // Same waypoint form as the clip fades: hold the
+                        // previous value until the position, then ramp to
+                        // the target over `~`.  The note starts silent when
+                        // there is an attack (see `start_vol`).  A clip
+                        // fade-in takes over from the attack ramp.
+                        if a_b > 0.0 && fade_in_b <= 0.0 {
+                            wps.push((
+                                b2r(0.0),
+                                      format!("%{},~{}", fmt(peak, 1), fmt(a_b, 3)),
+                            ));
+                        }
+                        // Hold keeps the peak; decay starts after it.
+                        if d_b > 0.0 {
+                            wps.push((
+                                b2r(a_b + h_b),
+                                      format!("%{},~{}", fmt(sus, 1), fmt(d_b, 3)),
+                            ));
+                        }
+                        // Release ramps down from the note's end.
+                        if r_b > 0.0 {
+                            wps.push((
+                                b2r(dur_beats),
+                                      format!("%0,~{}", fmt(r_b, 3)),
+                            ));
+                        }
                     }
                 }
 
@@ -274,7 +337,7 @@ pub(super) fn render_part(
                 if fade_in_b > 0.0 {
                     wps.push((
                         b2r(0.0),
-                              format!("%{},~{}", fmt(vol, 1), fmt(fade_in_b, 3)),
+                              format!("%{},~{}", fmt(level, 1), fmt(fade_in_b, 3)),
                     ));
                 }
                 if fade_out_b > 0.0 {

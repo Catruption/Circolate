@@ -23,13 +23,6 @@ pub struct RenderStats {
     pub duration_secs: f32,
 }
 
-/// Render a single note through a VST3 and report linear peak/RMS.
-///
-/// `path` is the plugin bundle, `state` is the serialized plugin state
-/// (empty for a default-patch measurement). `note` is a MIDI note
-/// number, `velocity` is 0..=127. The note is held for half the render
-/// window, then released. Peak and RMS are measured over the entire
-/// buffer (attack, sustain, release).
 pub fn render_stats(
     path: &Path,
     state: &[u8],
@@ -64,20 +57,36 @@ pub fn render_stats(
 }
 
 pub fn run(argv: &[String]) -> Result<()> {
-    let Some(path) = argv.first() else {
-        bail!("usage: trackscript-player vst-smoke <plugin.vst3> [state.file]");
+    let dump_params = argv.iter().any(|a| a == "--dump-params");
+    let args: Vec<&String> = argv.iter().filter(|a| *a != "--dump-params").collect();
+
+    let Some(path) = args.first() else {
+        bail!(
+            "usage: trackscript-player vst-smoke <plugin.vst3> [state.file] [--dump-params]"
+        );
     };
-    let path = PathBuf::from(path);
-    let state_path: Option<PathBuf> = argv.get(1).map(PathBuf::from);
+    let path = PathBuf::from(path.as_str());
+
+    if dump_params {
+        let path_str = path.to_str()
+        .ok_or_else(|| anyhow::anyhow!("non-UTF8 plugin path"))?;
+        let mut host = VstHost::load(path_str, &[], SR)?;
+        eprintln!("parameters of {} (slot N is used as `αN` / `βN` / … in the trackscript shim):", path.display());
+        let n = host.dump_params();
+        if n < 0 {
+            eprintln!("(plugin has no IEditController; no parameters)");
+        } else {
+            eprintln!("{} parameter(s)", n);
+        }
+        return Ok(());
+    }
+
+    let state_path: Option<PathBuf> = args.get(1).map(|s| PathBuf::from(s.as_str()));
     let state: Vec<u8> = match &state_path {
         Some(p) => std::fs::read(p)?,
         None    => Vec::new(),
     };
 
-    // SFLT resolves the SF2 path in its state against the process cwd
-    // at load time.  If the state file lives at <root>/instruments/X.state
-    // and the SF2 at <root>/samples/Y.sf2 (which is the layout the
-    // converter produces), chdir to <root> so `samples/Y.sf2` resolves.
     if let Some(sp) = &state_path {
         if let Some(root) = sp.parent().and_then(|p| p.parent()) {
             if root.is_dir() {

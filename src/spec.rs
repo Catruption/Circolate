@@ -55,19 +55,10 @@ pub const FIELD_MIX:        &str = "◊";
 // Bijective means no zero digit: every positive integer has exactly
 // one spelling, and no position is wasted on a placeholder.
 //
-//     1..9    α β γ δ ε ζ η θ ι
-//     10      κ
-//     11..19  αα αβ αγ αδ αε αζ αη αθ αι
-//     20      ακ
-//     21      βα
-//     100     ικ
-//     101     κα
-//
 // A parameter argument is a slot run followed by a value: `αδ6.0` is
 // slot 14, value 6.0.  The parser reads Greek letters greedily from
 // the start of an argument; the first non-Greek character ends the
-// slot and begins the value.  Values are decimal, so they can never
-// start with a Greek letter and the parse is unambiguous.
+// slot and begins the value.
 //
 // Parameter names and their slot assignment live in the plugin
 // registry (see `share/registry.json`), not in the file.
@@ -79,8 +70,7 @@ pub const GREEK_DIGITS: &[(char, u32)] = &[
 
 /// Parse a bijective-base-10 Greek-digit run into a slot number.
 /// Returns `(slot, bytes_consumed)`; slot is 0 when no digits are
-/// present.  The parser uses this to split a parameter argument into
-/// slot and value.
+/// present.
 pub fn parse_greek_slot(s: &str) -> (u32, usize) {
     let mut n: u32 = 0;
     let mut consumed = 0;
@@ -118,10 +108,6 @@ pub fn section_frame(beats: u32, subs: u32) -> String {
 ///     ƒNAME(<|N/D, ƒsource, %vol, ¶pan, ~dur>)[
 ///         events
 ///     ];
-///
-/// `events` may contain newlines; each line is indented four spaces to
-/// line up under the opening bracket.  Callers that want one event per
-/// line should join with `",\n"` rather than `", "`.
 pub fn part_definition(name: &str, args: &str, beats: u32, subs: u32, events: &str) -> String {
     let mut out = String::new();
     out.push_str(FIELD_SOURCE);
@@ -174,12 +160,6 @@ pub fn tempo_shim(pos: &str, bpm_text: &str) -> String {
 }
 
 /// `<§pos, #pitch, ~dur, %vol[, ƒsource]>`.
-///
-/// `pos` is `1/1`-style (from `convert::pos_str`), `pitch` is `C5` /
-/// `A#4` (from `convert::note_name`), `dur` is beats as a decimal
-/// string, `vol` is percent.  `source` is a pre-formatted
-/// `ƒ'path'(offset)` from `source_arg`, or empty to inherit the part's
-/// default source.
 pub fn note(pos: &str, pitch: &str, dur: &str, vol: &str, source: &str) -> String {
     let mut s = String::with_capacity(64);
     s.push('<');
@@ -199,6 +179,49 @@ pub fn note(pos: &str, pitch: &str, dur: &str, vol: &str, source: &str) -> Strin
     }
     s.push('>');
     s
+}
+
+/// `@<[§pos,] [~len,] [◊mix,] [%gain,] [¶pan,] ƒTarget(params)>;`
+/// The call-attached form is just this appended directly after a call.
+pub fn shim_event(
+    target: &str,
+    params: &[(u32, f64)],
+                  pos: Option<&str>,
+                  len: Option<&str>,
+                  mix: Option<f64>,
+                  gain: Option<f64>,
+                  pan: Option<f64>,
+) -> String {
+    let mut fields: Vec<String> = Vec::new();
+    if let Some(p) = pos { fields.push(p.to_string()); }
+    if let Some(l) = len { fields.push(format!("{}{}", FIELD_DURATION, l)); }
+    if let Some(m) = mix { fields.push(format!("{}{}", FIELD_MIX, m)); }
+    if let Some(g) = gain { fields.push(format!("{}{}", FIELD_VOLUME, g)); }
+    if let Some(p) = pan { fields.push(format!("{}{}", FIELD_PAN, p)); }
+    let mut target_str = format!("{}{}", FIELD_SOURCE, target);
+    if !params.is_empty() {
+        let param_strs: Vec<String> = params.iter()
+        .map(|(slot, val)| format!("{}{}", slot_to_greek(*slot), val))
+        .collect();
+        target_str.push('(');
+        target_str.push_str(&param_strs.join(", "));
+        target_str.push(')');
+    }
+    fields.push(target_str);
+    format!("@<{}>;", fields.join(", "))
+}
+
+/// Encode a slot number as bijective base-10 Greek.
+pub fn slot_to_greek(mut slot: u32) -> String {
+    if slot == 0 { return String::new(); }
+    let mut out = String::new();
+    while slot > 0 {
+        let digit = ((slot - 1) % 10) + 1;
+        let c = GREEK_DIGITS.iter().find(|(_, d)| *d == digit).map(|(c, _)| *c).unwrap_or('α');
+        out.insert(0, c);
+        slot = (slot - 1) / 10;
+    }
+    out
 }
 
 // ── tables ─────────────────────────────────────────────────────────────
@@ -225,25 +248,25 @@ use Status::{Implemented as Done, Planned as Plan};
 
 pub const FIELD_SYMBOLS: &[Symbol] = &[
     sym(FIELD_POSITION, "position", "`§beat/subdivision`, both 1-based; the subdivision may be fractional (`§1/1.5`). Local to the measure the part is placed in.", "1.10", Done),
-    sym(FIELD_PITCH, "pitch", "Note name (`C5`, `A#4`) or a number in Hz.", "1.10", Done),
-    sym(FIELD_DURATION, "duration", "Length in beats. May run past the end of the measure.", "1.10", Done),
-    sym(FIELD_VOLUME, "volume", "Percent. A leading `+` is tolerated.", "1.10", Done),
-    sym(FIELD_PAN, "pan", "-1 (full left) to 1 (full right).", "1.10", Done),
-    sym(FIELD_SOURCE, "source / call", "`ƒ'path'` overrides the sample. `ƒName` calls a defined part or block.", "1.10", Done),
+    sym(FIELD_PITCH, "pitch", "Note name (`C5`, `A#4`) or a number in Hz. In a shim, a pitch-shaped property for the target.", "1.10", Done),
+    sym(FIELD_DURATION, "duration", "Length in beats. May run past the end of the measure. In a shim, the effect window length; when omitted on a call-attached shim, the call's duration applies.", "1.10", Done),
+    sym(FIELD_VOLUME, "volume", "Percent. A leading `+` is tolerated. In a shim, output gain (default 100).", "1.10", Done),
+    sym(FIELD_PAN, "pan", "-1 (full left) to 1 (full right). In a shim, output pan (default 0).", "1.10", Done),
+    sym(FIELD_SOURCE, "source / call", "`ƒ'path'` overrides the sample. `ƒName` calls a defined part or block. In a shim, `ƒTarget(params)` names the effect target.", "1.10", Done),
     sym(FIELD_FINE_PITCH, "fine pitch", "Cents offset from equal temperament, as a signed delta from 0. Slides glide to the equal-tempered pitch of the target note and ignore this field.", "1.11", Done),
     sym(FIELD_RELEASE, "release", "Release velocity, as a signed delta from the engine default of 64. Shapes the amplitude envelope's release stage when the note-off fires.", "1.11", Done),
     sym(FIELD_MOD_X, "mod X", "Modulation X, as a signed delta from the engine default of 128. Routes to the plugin's X destination (filter cutoff on simple plugins).", "1.11", Done),
     sym(FIELD_MOD_Y, "mod Y", "Modulation Y, as a signed delta from the engine default of 128. Routes to the plugin's Y destination (resonance on simple plugins).", "1.11", Done),
-    sym(FIELD_MIX, "mix", "Dry/wet mix of an effect shim. 0 is fully dry, 1 is fully wet. Rampable with waypoints.", "1.11", Done),
+    sym(FIELD_MIX, "mix", "Dry/wet mix of an effect shim. 0 is fully dry, 1 is fully wet. Default 1.0 for a call-attached shim. Rampable with waypoints.", "1.11", Done),
 ];
 
 pub const EVENT_PREFIXES: &[Symbol] = &[
     sym(EV_NOTE, "note", "A note-on.", "1.10", Done),
-    sym(EV_WAYPOINT, "waypoint", "Changes properties of the preceding note at a later position instead of starting a new note. Waypoints cross section boundaries; a section header between them is a layout marker, not a break.", "1.10", Done),
+    sym(EV_WAYPOINT, "waypoint", "Changes properties of the preceding note or shim at a later position instead of starting a new note. Waypoints cross section boundaries; a section header between them is a layout marker, not a break.", "1.10", Done),
     sym(EV_UNDOC_EQ, "(undocumented)", "Recognised by the parser; its meaning is not defined in trackscript.rs.", "1.10", Done),
     sym(EV_UNDOC_TRI, "(undocumented)", "Recognised by the parser; its meaning is not defined in trackscript.rs.", "1.10", Done),
     sym(EV_UNDOC_NOTE, "(undocumented)", "Recognised by the parser; its meaning is not defined in trackscript.rs.", "1.10", Done),
-    sym(EV_SHIM, "shim", "Attaches an effect or reserved-global automation to a window. The last field of `@<...>` is `ƒName(args)`; Name is an effect function or a reserved global.", "1.11", Done),
+    sym(EV_SHIM, "shim", "Attaches an effect or reserved-global automation to a window. The last field of `@<...>` is `ƒName(args)`; Name is an effect function or a reserved global. See the *Shim targets* table for what is currently consumed.", "1.11", Done),
 ];
 
 pub fn active_event_prefix_glyphs() -> Vec<&'static str> {
@@ -299,21 +322,34 @@ duration is the sum of the durations of its selected measures; the BlockList \
 cursor advances by that amount.  Some fields with a note-shaped meaning \
 (position, pitch) have no place in a call's override block and are ignored \
 if present.",
-    status: Plan,
+    status: Done,
 },
 Context {
-    name: "shim",
-    syntax: "@<§pos, ~len, ◊mix, %gain, ¶pan, ƒName(args)>;",
-    doc: "Attaches an effect to a window of song time. The target \
-(`ƒName`) is either an effect function or a reserved global (see Shim \
-targets below). Universal shim fields are `§` start, `~` length, `◊` \
-dry/wet, `%` output gain, and `¶` output pan; waypoints (`&`) ramp any \
-of them. Effect parameters are positional: the slot index is a \
-bijective base-10 run of Greek letters (`α1` is slot 1, `αδ6.0` is \
-slot 14) followed by the value. Parameter names and slot assignments \
-live in the plugin registry, not in the file. Removing a shim is \
-abrupt unless the writer closes it with a waypoint to `◊0`.",
+    name: "shim-syntax",
+    syntax: "@<§pos, ~len, ◊mix, %gain, ¶pan, ƒName(params)>;",
+    doc: "Syntax for attaching an effect or reserved-global automation to \
+a window of song time.  Standalone form has its own BlockList line; \
+call-attached form is `ƒName(args)@<ƒTarget(params)>;` and inherits the \
+call's start position and duration when `§`/`~` are omitted.  The target \
+(`ƒName`) is either an effect function or a reserved global (see *Shim \
+targets*).  Universal shim fields are `§` start, `~` length, `◊` dry/wet, \
+`%` output gain, and `¶` output pan; waypoints (`&`) ramp any of them.  \
+Effect parameters are positional: the slot index is a bijective base-10 \
+run of Greek letters (`α1` is slot 1, `αδ6.0` is slot 14) followed by the \
+value.  Target names use the slug character set `[A-Za-z_][A-Za-z0-9_.-]*`, \
+so `Fruity Reeverb 2` is written `Fruity_Reeverb_2` — matching the \
+converter's sidecar naming.",
 status: Done,
+},
+Context {
+    name: "shim-effects",
+    syntax: "call-attached:  ƒName(args)@<ƒTarget(params)>;  (parses; effect targets are not yet consumed by the player)",
+    doc: "Effect targets on shims are parsed and stored in \
+`TrackscriptFile.shims`, but the mixer does not yet route voices through \
+them.  Only `ƒTempo` (via the legacy `Tempo { … }` section) currently \
+drives audio.  Wiring the effect path is tracked as *shim-effects*.  See \
+the *Shim targets* table below for the per-target status.",
+status: Plan,
 },
 ];
 
@@ -346,7 +382,7 @@ FieldContextUse {
     note: "this note's length, in beats",
     definition: "default length",
     call: "how long the selected measures play",
-    shim: "length of the effect window",
+    shim: "length of the effect window; inherits from the call when omitted",
 },
 FieldContextUse {
     glyph: FIELD_VOLUME, name: "volume",
@@ -409,7 +445,8 @@ FieldContextUse {
 pub const DEFAULTS_NOTE: &str =
 "A field omitted from a note inherits the definition's default for that field. \
 A field omitted from a definition falls back to the engine default: 100% volume, \
-0 pan, 1-beat duration.";
+0 pan, 1-beat duration.  A field omitted from a call-attached shim falls back to: \
+start = call's start, length = call's duration, mix = 1.0, gain = 100%, pan = 0.";
 
     pub const CALL_LENGTH_SEMANTICS: &str =
     "A call's duration is the sum of the durations of the measures it selects.  \
@@ -421,22 +458,37 @@ An empty BlockList line (`;`) advances by one measure of the song's time \
 signature.";
 
     pub const SHIM_SEMANTICS: &str =
-    "An effect shim attaches an effect to a window of song time.  Its target \
-is the last field: `ƒName(args)`, where Name is either an effect function \
-or a reserved global.  The universal shim fields are position (`§`), \
-length (`~`), dry/wet mix (`◊`), output gain (`%`), and pan (`¶`); \
-waypoints (`&`) ramp any of them, in the block's own coordinate frame.\n\
+    "**Implementation status.**  Shim *syntax* is parsed and stored in \
+`TrackscriptFile.shims`, but effect targets are **not yet consumed by the \
+player** — attaching a reverb shim currently has no audible effect.  Only \
+`ƒTempo` via the legacy `Tempo { … }` section drives audio today.  See the \
+*Shim targets* table below for per-target status.\n\
 \n\
-Effect parameters are positional.  The slot index is a run of Greek \
-letters read as bijective base-10 (α=1 … ι=9, κ=10; no zero digit), and \
-the value follows immediately after: `α1` is slot 1, `αδ6.0` is slot 14, \
-`κα8` is slot 101.  Slot names live in the plugin registry.\n\
+An effect shim attaches an effect to a window of song time.  Its target is the \
+last field: `ƒName(params)`, where Name is either an effect function or a \
+reserved global.  The universal shim fields are position (`§`), length (`~`), \
+dry/wet mix (`◊`), output gain (`%`), and pan (`¶`); waypoints (`&`) ramp any \
+of them, in the block's own coordinate frame.\n\
 \n\
-A shim placed on a BlockList line applies to the calls on that line.  A \
-shim placed on its own line applies from the cursor's current position.  \
-When a shim's window ends, its effect is removed abruptly unless the \
-writer supplies a closing waypoint to `◊0`.  There is no implicit \
-fade-out.";
+Effect parameters are positional.  The slot index is a run of Greek letters read \
+as bijective base-10 (α=1 … ι=9, κ=10; no zero digit), and the value follows \
+immediately after: `α1` is slot 1, `αδ6.0` is slot 14, `κα8` is slot 101.  Slot \
+names live in the plugin registry.\n\
+\n\
+**Call-attached form.**  A shim written on the same line as a call \
+(`ƒName(args)@<…>;`) applies to that call.  Its window defaults to the call's \
+duration, `◊` defaults to 1.0 (fully wet), and `§` defaults to the call's \
+start.  Standalone shims (own line) require `~` and `◊` defaults to 0.0 \
+(dry).  Chaining two shims (`ƒName()@<A>@<B>;`) runs A then B on the signal \
+captured from the call's voices; each shim's `◊` crossfades that stage against \
+its input, and `%`/`¶` apply to its output.\n\
+\n\
+**Target names** use `[A-Za-z_][A-Za-z0-9_.-]*`.  Spaces become underscores — \
+FL Studio's `Fruity Reeverb 2` becomes `Fruity_Reeverb_2`, matching the \
+`.instrument` sidecar filename the FLP converter writes.\n\
+\n\
+When a shim's window ends, its effect is removed abruptly unless the writer \
+supplies a closing waypoint to `◊0`.  There is no implicit fade-out.";
 
 pub const OPERATORS: &[Symbol] = &[
     sym("+", "increase", "Add `amount` each interval.", "1.11", Plan),
@@ -484,9 +536,8 @@ sum to, and the cursor advances past it.  A line's duration is the maximum \
 duration of its calls, so parallel calls line up on the same measure.  \
 An empty line (`;`) advances the cursor by one measure.  Calls may select \
 specific measures from a definition (`ƒName(1,2,3)`) and may apply per-measure \
-overrides (`ƒName(1<%50>, 2<%75>)`); see the `call` context below.  Effect \
-shims (`@<...>`) attach effects to windows of song time and may share the \
-line with the calls they modify.",
+overrides (`ƒName(1<%50>, 2<%75>)`).  Effect shims (`@<...>`) attach effects \
+to windows of song time and may share the line with the calls they modify.",
 },
 Section {
     name: "BlockArray { ... }",
@@ -545,6 +596,40 @@ pub fn shim_default(name: &str) -> Option<&'static str> {
     BUILTINS.iter().find(|b| b.name == name).map(|b| b.default)
 }
 
+// ── shim target status ────────────────────────────────────────────────
+
+pub struct ShimTarget {
+    pub pattern: &'static str,
+    pub scope: &'static str,
+    pub note: &'static str,
+    pub status: Status,
+}
+
+pub const SHIM_TARGETS: &[ShimTarget] = &[
+    ShimTarget {
+        pattern: "ƒTempo",
+        scope: "song",
+        note: "Drives tempo. Only the legacy `Tempo { … }` section currently \
+reaches the engine; a `ƒTempo` BlockList shim parses but does not \
+change tempo yet.",
+status: Done,
+    },
+ShimTarget {
+    pattern: "ƒGlobalVolume · ƒGlobalPan · ƒGlobalTuning",
+    scope: "song",
+    note: "Reserved names; parsed as `Plan` — no engine consumer.",
+    status: Plan,
+},
+ShimTarget {
+    pattern: "ƒ<EffectName>(params)",
+    scope: "part/bus",
+    note: "Effect target, e.g. `ƒFruity_Reeverb_2(α25, β5)`. Parsed and \
+stored in `TrackscriptFile.shims`. **Not yet consumed by the \
+mixer** — attaching a reverb has no audible effect today.",
+status: Plan,
+},
+];
+
 pub struct Change {
     pub version: &'static str,
     pub summary: &'static str,
@@ -571,7 +656,7 @@ engine default. \
 The 1.10 `Tempo { ... }` section becomes the `ƒTempo` shim. \
 Effect shims: `@<§pos, ~len, ◊mix, %gain, ¶pan, ƒName(args)>;` attaches \
 an effect to a window of song time.  `◊` is a new universal field for \
-dry/wet mix; `~` in a shim is the effect's length.  Effect parameters \
+dry/wet mix; `~` in a shim is the effect's length. Effect parameters \
 are positional, indexed by a bijective base-10 run of Greek letters \
 (`α1` = slot 1, `αδ6.0` = slot 14).  Parameter names live in the plugin \
 registry.",
@@ -605,30 +690,30 @@ Example { title: "Measure selection: play measure 2 only", status: Plan, src: "�
 Example { title: "Measure selection: reorder", status: Plan, src: "ƒMELODY(3,1,2);" },
 Example { title: "Measure selection: per-measure volume overrides", status: Plan, src: "ƒMELODY(1<%50>, 2<%75>);" },
 Example { title: "Measure selection: some measures overridden, some not", status: Plan, src: "ƒMELODY(1<%50>, 2, 3<%75>);" },
-Example { title: "Effect shim: reverb over a block", status: Plan, src: "@<§1/1, ~8, ◊0, ƒReverb.Hall(α1, γ8)>;\n&<§1/3, ◊0.4>;\n&<§1/8, ◊0>;" },
-Example { title: "Effect shim: paired with a call", status: Plan, src: "ƒpianoer(2);\n@<§1/1, ~8, ◊0, ƒReverb.Hall(αδ6.0)>;" },
+Example { title: "Effect shim: call-attached reverb", status: Plan, src: "ƒpianoer(2)@<ƒFruity_Reeverb_2(α25, β5)>;" },
+Example { title: "Effect shim: chained reverb + delay", status: Plan, src: "ƒpianoer(2)@<ƒFruity_Reeverb_2(α25, β5)>@<ƒFruity_Delay_3(α120)>;" },
+Example { title: "Effect shim: standalone reverb over a song", status: Plan, src: "@<§1/1,~8,◊0,ƒFruity_Reeverb_2(α25)>;\n&<§1/3,◊0.4>;\n&<§1/8,◊0>;" },
 Example { title: "Shim: reserved target (tempo)", status: Done, src: "@<§1/1,#110, ƒTempo>;" },
 ];
 
 pub fn wrap_example(src: &str) -> String {
     let trimmed = src.trim_start();
-    if trimmed.starts_with('@') || trimmed.starts_with('&') {
-        // Shim or shim waypoint: lives in the BlockList.
+    // Call-attached shim (`ƒName(args)@<…>`) is a BlockList line, not a
+    // BlockArray entry — even though it starts with `ƒ`.
+    let call_attached_shim = trimmed.starts_with('ƒ') && trimmed.contains("@<");
+    if trimmed.starts_with('@') || trimmed.starts_with('&') || call_attached_shim {
         format!(
             "BlockList()\n{{\n    {}\n}}\n\nBlockArray()\n{{\n    {}\n}}\n",
                 src,
                 part_definition("Example", &source_arg("samples/example.wav", None), 4, 4, "<§1/1,#C5>")
         )
     } else if trimmed.starts_with('ƒ') {
-        // Definition or composite: goes in BlockArray as-is, with a stub
-        // part and a stub BlockList so the file has valid structure.
         format!(
             "BlockList()\n{{\n    ƒExample();\n}}\n\nBlockArray()\n{{\n    {}\n\n    {}\n}}\n",
                 part_definition("Example", &source_arg("samples/example.wav", None), 4, 4, "<§1/1,#C5>"),
                 src
         )
     } else {
-        // Note, waypoint, or other in-body event.
         format!(
             "BlockList()\n{{\n    ƒExample();\n}}\n\nBlockArray()\n{{\n    {}\n}}\n",
                 part_definition("Example", &source_arg("samples/example.wav", None), 4, 4, src)
@@ -687,6 +772,7 @@ fn field_context_table(out: &mut String) {
 fn shim_table(out: &mut String) {
     let _ = writeln!(out, "## Shim targets\n");
     let _ = writeln!(out, "{}\n", SHIM_SEMANTICS);
+    let _ = writeln!(out, "### Reserved globals\n");
     let _ = writeln!(out, "| Target | Scope | Property | Default | Unit | Meaning |");
     let _ = writeln!(out, "|---|---|---|---|---|---|");
     for b in BUILTINS {
@@ -694,6 +780,18 @@ fn shim_table(out: &mut String) {
             out, "| `ƒ{}`{} | {} | `{}` | {} | {} | {} |",
             b.name, b.status.label(), b.scope, cell(b.property),
                          cell(b.default), cell(b.unit), cell(b.doc)
+        );
+    }
+    out.push('\n');
+    let _ = writeln!(out, "### Target support status\n");
+    let _ = writeln!(out, "| Pattern | Scope | Status | Note |");
+    let _ = writeln!(out, "|---|---|---|---|");
+    for t in SHIM_TARGETS {
+        let _ = writeln!(
+            out, "| `{}`{} | {} | {} | {} |",
+            cell(t.pattern), t.status.label(), cell(t.scope),
+                         if t.status == Status::Implemented { "implemented" } else { "not yet implemented" },
+                             cell(t.note)
         );
     }
     out.push('\n');
@@ -836,9 +934,18 @@ mod tests {
     }
 
     #[test]
+    fn greek_slot_round_trip() {
+        for slot in [1u32, 2, 9, 10, 11, 20, 100, 101, 999] {
+            let encoded = slot_to_greek(slot);
+            let (decoded, _) = parse_greek_slot(&encoded);
+            assert_eq!(slot, decoded, "round trip {} -> {:?}", slot, encoded);
+        }
+    }
+
+    #[test]
     fn call_semantics_documented() {
         let md = render_markdown();
-        assert!(md.contains("repeats the definition") || md.contains("sum of the durations"));
+        assert!(md.contains("sum of the durations"));
     }
 
     #[test]
@@ -847,6 +954,8 @@ mod tests {
         assert!(md.contains("global"));
         assert!(md.contains("GlobalVolume"));
         assert!(md.contains("dry/wet"));
+        assert!(md.contains("not yet consumed"));
+        assert!(md.contains("Call-attached form") || md.contains("call-attached form"));
     }
 
     #[test]
@@ -879,6 +988,12 @@ mod tests {
     #[test]
     fn tempo_shim_shape() {
         assert_eq!(tempo_shim("§1/1", "120"), "@<§1/1,#120, ƒTempo>;");
+    }
+
+    #[test]
+    fn shim_emitter_shape() {
+        let s = shim_event("Fruity_Reeverb_2", &[(1, 25.0), (2, 5.0)], None, None, None, None, None);
+        assert_eq!(s, "@<ƒFruity_Reeverb_2(α25, β5)>;");
     }
 
     #[test]

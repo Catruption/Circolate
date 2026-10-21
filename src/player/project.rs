@@ -10,7 +10,9 @@ use crate::asset::{AssetSource, DirSource, ENTRY_KEY};
 use crate::audio_decode::decode_audio;
 use crate::fidelity::{Fidelity, FIDELITY_FILENAME};
 use crate::deps::requires::{self, Requires};
-use crate::formats::trackscript::{parse_str, TrackscriptEvent, TrackscriptPart};
+use crate::formats::trackscript::{
+    parse_str, ShimEvent, TrackscriptEvent, TrackscriptPart,
+};
 use crate::timing::TempoMap;
 
 use super::cache::{fingerprint, hash_part};
@@ -26,15 +28,8 @@ pub(crate) use super::types::{Sample, Sf2VoiceEnvelope};
 
 const TAIL_SECONDS: f64 = 0.05;
 
-/// Level trim applied to every VST instrument, so plugin output (which
-/// arrives near full scale, with no headroom) sits at the same level as
-/// SF2 and sample parts.  Tune by ear: lower = quieter synths.
 const VST_TRIM: f32 = 0.6;
 
-/// Extra trim for a *fallback* plugin (the one actually loaded isn't the
-/// instrument the song was written for, e.g. Surge XT standing in for
-/// Kontakt).  The channel volume was set against the real plugin's level,
-/// so a stand-in's level is arbitrary; this pulls it down further.
 const FALLBACK_VST_TRIM: f32 = 0.7;
 
 // ── cover image ────────────────────────────────────────────────────────
@@ -88,10 +83,6 @@ fn find_cover_path(source: &dyn AssetSource) -> Option<PathBuf> {
     Some(path)
 }
 
-/// `share/cover` — the pool of fallback covers for songs that ship none.
-/// Tried relative to the working directory first, then by walking up
-/// from the executable (so `target/release/...` finds the repo's
-/// `share/`), the same way `trackscripts/` is found for `play`.
 fn fallback_cover_dir() -> Option<PathBuf> {
     let rel = Path::new("share").join("cover");
     if rel.is_dir() {
@@ -109,10 +100,6 @@ fn fallback_cover_dir() -> Option<PathBuf> {
     None
 }
 
-/// A random image from `share/cover`, for a song with no cover of its
-/// own.  The pick is remembered per song for the life of the process,
-/// so a hot reload of the same song keeps its image instead of
-/// re-rolling; a different song gets its own roll.
 fn fallback_cover_path(source: &dyn AssetSource) -> Option<PathBuf> {
     use std::sync::{Mutex, OnceLock};
     static PICKS: OnceLock<Mutex<HashMap<String, Option<PathBuf>>>> = OnceLock::new();
@@ -194,18 +181,6 @@ fn sf2_cache_dir() -> PathBuf {
     std::env::temp_dir().join("circolate-sf2")
 }
 
-/// Materialize an SF2 from the source into the cache and return the
-/// path on disk.  The native engine reads SF2s through the filesystem,
-/// not from memory, so archives need their samples extracted once.
-/// Materialize an SF2 from the source into the cache and return the
-/// path on disk.  The native engine reads SF2s through the filesystem,
-/// not from memory, so archives need their samples extracted once.
-///
-/// Always rewrites.  An earlier "only write when sizes differ" check
-/// was wrong: re-exporting the same project with different environment
-/// variables (e.g. `FLP_SLICEX_BASE_1`) produces a same-size SF2 with
-/// different contents, and the stale cached copy was silently used for
-/// playback.  One disk write per load is negligible.
 fn materialize_sf2_file(source: &dyn AssetSource, rel: &str) -> Result<Option<PathBuf>> {
     let Some(bytes) = source.read_bytes(rel)? else {
         return Ok(None);
@@ -222,9 +197,6 @@ fn materialize_sf2_file(source: &dyn AssetSource, rel: &str) -> Result<Option<Pa
     Ok(Some(dest))
 }
 
-/// No longer used by the main path — SFLT is gone, so we don't rewrite
-/// VST3 state blobs for it.  Kept for one release to keep old
-/// trackscripts with SFLT sidecars loadable.
 #[allow(dead_code)]
 fn materialize_sf2_reference(
     source: &dyn AssetSource,
@@ -333,6 +305,10 @@ pub(crate) struct Project {
     pub(crate) time_signature: (u32, u32),
     pub(crate) voice_count: usize,
     pub(crate) requires: Option<Requires>,
+    /// Parsed `@<...>` shim events.  Each `line` field indexes
+    /// `Project.lines`; the player resolves `target` via
+    /// `share/fallbacks.json` and installs a VST3 host per shim.
+    pub(crate) shims: Vec<ShimEvent>,
 }
 
 impl Project {
@@ -367,6 +343,7 @@ impl Project {
             time_signature: (4, 4),
             voice_count: 0,
             requires: None,
+            shims: Vec::new(),
         }
     }
 
@@ -428,8 +405,6 @@ impl Project {
         self.lines.get(i).map(|l| l.parts.as_slice()).unwrap_or(&[])
     }
 
-    /// The BlockList call that replaces a resolved part's original title tag.
-    /// Composite blocks can resolve to several parts, all sharing this title.
     pub(crate) fn line_block_title(&self, i: usize, part_name: &str) -> Option<&str> {
         self.lines
         .get(i)?
@@ -538,7 +513,6 @@ pub(crate) fn load_project_from_source(
         None => None,
     };
 
-    // ── embedded plugins ────────────────────────────────────────────
     let embedded_plugins: HashMap<String, PathBuf> = if quiet {
         extract_embedded_plugins(source).unwrap_or_default()
     } else {
@@ -555,7 +529,6 @@ pub(crate) fn load_project_from_source(
         }
     };
 
-    // ── samples ─────────────────────────────────────────────────────
     let mut samples: HashMap<u32, Arc<Sample>> = HashMap::new();
     let mut fps: HashMap<u32, u64> = HashMap::new();
     let mut path_to_id: HashMap<String, u32> = HashMap::new();
@@ -605,7 +578,6 @@ pub(crate) fn load_project_from_source(
         println!("  loaded {} samples", samples.len());
     }
 
-    // Multi-sample instruments.
     let mut multi_sample_instruments: HashMap<String, Arc<MultiSampleInstrument>> =
     HashMap::new();
     if let Some(fid) = &fidelity {
@@ -623,16 +595,12 @@ pub(crate) fn load_project_from_source(
         println!("  multi-sample: {} instrument(s)", multi_sample_instruments.len());
     }
 
-    // Instrument sidecars.
     let mut sf2_instruments: HashMap<String, Arc<Sf2Instrument>> = HashMap::new();
     let mut sf2_engine_specs: HashMap<String, Sf2EngineSpec> = HashMap::new();
     let mut vst_instruments: HashMap<String, Arc<VstInstrument>> = HashMap::new();
     let mut next_sf2_id: u32 = 10_000;
 
     for entry in source.list("instruments", Some("instrument")) {
-        // `list()` may return entries relative to the requested
-        // directory or relative to the source root.  Normalise to the
-        // root-relative form that `read_text` expects.
         let rel = if entry.starts_with("instruments/") || entry.starts_with("./instruments/") {
             entry.trim_start_matches("./").to_string()
         } else {
@@ -657,9 +625,6 @@ pub(crate) fn load_project_from_source(
             .trim_start_matches("./")
             .to_string();
 
-            // Materialize the SF2 to disk for the native engine.
-            // `build_sf2_instrument` below reads from the in-memory
-            // bytes; only the engine needs the on-disk path.
             let Some(sf2_bytes) = source.read_bytes(&sf2_rel)? else {
                 if !quiet { eprintln!("  (SF2 {} not in source)", sf2_rel); }
                 continue;
@@ -676,8 +641,6 @@ pub(crate) fn load_project_from_source(
                 }
             };
 
-            // Old internal renderer: still built for waveform preview
-            // and as a fallback if the engine fails to install.
             if let Ok(obj) = build_sf2_instrument(
                 &sf2_bytes,
                 inst.sf2_bank as u16,
@@ -707,11 +670,6 @@ pub(crate) fn load_project_from_source(
                 sf2_instruments.insert(sidecar_rel.clone(), Arc::new(obj));
             }
 
-            // Route every SF2 through the native SF2 engine.  Slicex is
-            // represented as a generated SF2 with one single-key zone per
-            // slice; routing it through the internal sample renderer changes
-            // resampling, envelope, voice lifetime, and insert-FX behavior.
-            // Apply the Slicex channel-volume multiplier at engine level.
             sf2_engine_specs.insert(
                 sidecar_rel,
                 Sf2EngineSpec {
@@ -754,10 +712,6 @@ pub(crate) fn load_project_from_source(
                 source.read_bytes(&state_rel)?.unwrap_or_default()
             };
 
-            // Legacy: old trackscripts may still carry SFLT VST3
-            // sidecars with a state blob.  Materialize their referenced
-            // SF2 so at least the plugin can find it — the engine
-            // doesn't see these anymore.
             if inst.plugin == "SFLT" && !state_bytes.is_empty() {
                 if let Err(e) = materialize_sf2_reference(source, &mut state_bytes) {
                     if !quiet {
@@ -781,11 +735,6 @@ pub(crate) fn load_project_from_source(
             );
         }
     }
-    // Stand-in plugins sum.  Each one was balanced in the original
-    // project against a *different* plugin, so a song with fifteen of
-    // them playing at once is far louder than any one trim accounts for.
-    // Treat them as uncorrelated and scale each by 1/sqrt(count), which
-    // keeps their combined level about the same however many there are.
     let n_fallback = vst_instruments.values().filter(|v| v.fallback).count();
     if n_fallback > 1 {
         let spread = 1.0 / (n_fallback as f32).sqrt();
@@ -820,7 +769,6 @@ pub(crate) fn load_project_from_source(
         );
     }
 
-    // Requires sidecar.
     let requires: Option<Requires> = match source.read_text(requires::FILENAME)? {
         Some(text) => match requires::parse(&text) {
             Ok(r) => Some(r),
@@ -834,7 +782,6 @@ pub(crate) fn load_project_from_source(
         None => None,
     };
 
-    // ── measure resolution ─────────────────────────────────────────
     let sr = sample_rate as f64;
     let rows_per_measure = cfg.time_signature.0 as f64 * cfg.subdivisions.max(1) as f64;
 
@@ -973,6 +920,7 @@ pub(crate) fn load_project_from_source(
         cover_path,
         fidelity,
         requires,
+        shims: parsed.shims,
     };
     Ok((Arc::new(project), cache))
 }

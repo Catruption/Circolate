@@ -19,6 +19,10 @@ const EV_CHAN_ENV_LFO: u8 = 218;
 const EV_CHAN_LEVELS: u8 = 219;
 const EV_CHAN_TRACKING: u8 = 228;
 const EV_CHAN_LEVEL_ADJUSTS: u8 = 229;
+/// Mixer insert for a channel.  0 = master (no per-channel effects),
+/// 1..=127 = user insert index (matches the key in `prj.inserts`).
+/// Verified against pyflp: `EventID.Channel_MixerTrack = 178`.
+const EV_CHAN_MIXER_TRACK: u8 = 178;
 
 const EV_NEW_CHAN: u8 = 64;
 const EV_NEW_PAT: u8 = 65;
@@ -54,6 +58,11 @@ fn i32le(b: &[u8], o: usize) -> i32 {
 #[inline]
 fn u32le(b: &[u8], o: usize) -> u32 {
     u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+}
+
+#[inline]
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{:02x}", x)).collect::<Vec<_>>().join(" ")
 }
 
 // ── channel substructures ──────────────────────────────────────────────
@@ -225,6 +234,10 @@ pub struct Channel {
     pub sample_path: String,
     pub plugin: Option<Plugin>,
 
+    /// Mixer insert the channel feeds.  0 = master, 1..=127 = user
+    /// insert index (matches the key in `Project.inserts`).
+    pub insert: u16,
+
     pub enabled: Option<bool>,
     pub levels: Option<Levels>,
     pub envelopes: Vec<EnvelopeLfo>,
@@ -247,6 +260,7 @@ impl Channel {
             color: None,
             sample_path: String::new(),
             plugin: None,
+            insert: 0,
             enabled: None,
             levels: None,
             envelopes: Vec::new(),
@@ -310,13 +324,8 @@ pub struct PlaylistItem {
     pub start_offset_ms: f32,
     pub end_offset_ms: f32,
     pub clip_start_ticks: u32,
-    /// Audio-clip fade-in / fade-out lengths in milliseconds (FL21+ 60-byte
-    /// records, bytes 36..40 and 44..48).  0 = none.  Only filled for
-    /// audio clips (`kind == "channel"`).
     pub fade_in_ms: f32,
     pub fade_out_ms: f32,
-    /// Fade curve/tension values (bytes 40..44 and 48..52).  Read for
-    /// completeness; the converter currently emits linear fades.
     pub fade_in_curve: f32,
     pub fade_out_curve: f32,
     #[serde(skip)]
@@ -425,9 +434,7 @@ fn read_events(data: &[u8]) -> Result<(u16, Vec<(u8, Vec<u8>)>, Vec<String>)> {
         warnings.push(format!(
             "event stream ended at offset {:#x}, expected {:#x} ({} bytes unread); \
 event sizes are likely misparsed",
-p,
-end,
-end.saturating_sub(p)
+p, end, end.saturating_sub(p)
         ));
     }
 
@@ -631,8 +638,6 @@ fn decode_playlist(raw: &[u8], major: Option<u32>) -> Vec<PlaylistItem> {
             0
         };
 
-        // Audio-clip fades (FL21+ records only).  Stored in milliseconds,
-        // like the start/end offsets above.
         let f32_at = |o: usize| -> f32 {
             if size >= o + 4 {
                 f32::from_le_bytes([rec[o], rec[o + 1], rec[o + 2], rec[o + 3]])
@@ -702,6 +707,22 @@ impl PluginRef {
 pub fn parse(data: &[u8]) -> Result<Project> {
     let (ppq, events, parse_warnings) = read_events(data)?;
 
+    if std::env::var_os("FLP_DUMP_EVENTS").is_some() {
+        let mut freq: std::collections::BTreeMap<u8, Vec<usize>> =
+        std::collections::BTreeMap::new();
+        for (ev, raw) in &events {
+            freq.entry(*ev).or_default().push(raw.len());
+        }
+        eprintln!("flp: {} events, {} unique IDs", events.len(), freq.len());
+        for (ev, lens) in &freq {
+            let sample: Vec<usize> = lens.iter().take(4).copied().collect();
+            eprintln!(
+                "  id={:>3} ({:#04x}) count={:>3} lens={:?}",
+                      ev, ev, lens.len(), sample
+            );
+        }
+    }
+
     let mut prj = Project {
         ppq,
         parse_warnings,
@@ -713,8 +734,45 @@ pub fn parse(data: &[u8]) -> Result<Project> {
     let mut plug_ref: Option<PluginRef> = None;
     let mut pending_def_plugin: Option<String> = None;
     let mut pending_fx_names: Vec<String> = Vec::new();
+    let debug = std::env::var_os("FLP_DEBUG").is_some();
+
+    // Diagnostic: FLP_DUMP_CHAN=5 dumps every event that fires while
+    // channel iid=5 is the current one.  FLP_DUMP_IDS=128,155,215 dumps
+    // specific event IDs regardless of channel context.
+    let dump_iid: Option<u16> = std::env::var("FLP_DUMP_CHAN")
+    .ok()
+    .and_then(|s| s.trim().parse().ok());
+    let dump_ids: Option<Vec<u8>> = std::env::var("FLP_DUMP_IDS").ok().map(|s| {
+        s.split(',')
+        .filter_map(|x| {
+            let x = x.trim();
+            if let Some(h) = x.strip_prefix("0x") {
+                u8::from_str_radix(h, 16).ok()
+            } else {
+                x.parse().ok()
+            }
+        })
+        .collect()
+    });
 
     for (ev, raw) in &events {
+        if let (Some(target), Some(i)) = (dump_iid, chan_idx) {
+            if prj.channels[i].iid == target {
+                eprintln!(
+                    "flp: CHAN{:>3} ev={:>3} ({:#04x}) len={:>3} hex={}",
+                          target, *ev, *ev, raw.len(), hex(raw)
+                );
+            }
+        }
+        if let Some(ref ids) = dump_ids {
+            if ids.contains(ev) {
+                eprintln!(
+                    "flp: EV{:>3} ({:#04x}) len={:>3} hex={}",
+                          *ev, *ev, raw.len(), hex(raw)
+                );
+            }
+        }
+
         match *ev {
             EV_TEXT_VERSION => prj.version = text(*ev, raw),
             EV_FINE_TEMPO if raw.len() == 4 => {
@@ -732,6 +790,12 @@ pub fn parse(data: &[u8]) -> Result<Project> {
 
             EV_NEW_CHAN if raw.len() >= 2 => {
                 let iid = u16::from_le_bytes([raw[0], raw[1]]);
+                if debug {
+                    eprintln!(
+                        "flp: NEW_CHAN iid={} raw_len={} hex={}",
+                        iid, raw.len(), hex(raw)
+                    );
+                }
                 prj.channels.push(Channel::new(iid));
                 chan_idx = Some(prj.channels.len() - 1);
                 pat_idx = None;
@@ -742,6 +806,34 @@ pub fn parse(data: &[u8]) -> Result<Project> {
                     let c = &mut prj.channels[i];
                     c.type_id = raw[0] as i16;
                     c.channel_type = channel_type_name(raw[0]);
+                }
+            }
+            EV_CHAN_MIXER_TRACK => {
+                // Log unconditionally — if this fires with chan_idx ==
+                // None, the routing event is happening at a point in
+                // the stream we aren't tracking (e.g. after the last
+                // NewPat, as a batch block).  That distinction tells
+                // us whether to fix the event ID or fix the scoping.
+                if debug {
+                    eprintln!("flp: EV178 raw={} chan_idx={:?}", hex(raw), chan_idx);
+                }
+                if let Some(i) = chan_idx {
+                    let v = if raw.len() >= 4 {
+                        (u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) & 0xFF) as u16
+                    } else if raw.len() >= 2 {
+                        (u16::from_le_bytes([raw[0], raw[1]]) & 0xFF) as u16
+                    } else if raw.len() == 1 {
+                        raw[0] as u16
+                    } else {
+                        0
+                    };
+                    prj.channels[i].insert = v;
+                    if debug {
+                        eprintln!(
+                            "flp: chan {:>3} insert={} raw={}",
+                            prj.channels[i].iid, v, hex(raw)
+                        );
+                    }
                 }
             }
             EV_COLOR if raw.len() == 4 && pat_idx.is_none() => {
@@ -796,7 +888,24 @@ pub fn parse(data: &[u8]) -> Result<Project> {
             }
             EV_CHAN_SAMPLER_FLAGS if raw.len() == 4 => {
                 if let Some(i) = chan_idx {
-                    prj.channels[i].sampler_flags = Some(u32le(raw, 0));
+                    let v = u32le(raw, 0);
+                    prj.channels[i].sampler_flags = Some(v);
+                    // Empirical: for nightlight4000, channel 5 (pianoer)
+                    // has value 2 here, and insert 2 carries
+                    // Fruity Reeverb 2.  pyflp labels 0x8F
+                    // Channel_SamplerFlags, but the low byte's value
+                    // semantics match insert indices in this FL
+                    // version (0 = master, 1..=127 = user insert).
+                    // Store both interpretations: sampler_flags keeps
+                    // whatever the bitfield means, insert takes the
+                    // low byte for routing.
+                    prj.channels[i].insert = (v & 0xFF) as u16;
+                    if debug {
+                        eprintln!(
+                            "flp: chan {:>3} insert={} (ev143={:#x})",
+                                  prj.channels[i].iid, prj.channels[i].insert, v
+                        );
+                    }
                 }
             }
             EV_CHAN_SAMPLE_START if raw.len() == 4 => {
@@ -914,7 +1023,7 @@ pub fn parse(data: &[u8]) -> Result<Project> {
             EV_PAT_NOTES => {
                 if let Some(i) = pat_idx {
                     let notes = decode_notes(raw);
-                    if std::env::var_os("FLP_DEBUG").is_some() {
+                    if debug {
                         eprintln!(
                             "flp: PAT_NOTES pat_idx={} iid={} {} note(s) (existing: {})",
                                   i,

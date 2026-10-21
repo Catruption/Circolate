@@ -27,7 +27,7 @@ use crate::formats::flp as flp_src;
 use classify::{classify_channels, Classified};
 use extract::{build_fidelity, extract_inserts};
 use place::{end_tick_of, notes_in_measure, place_notes};
-use render::{render_part, NoteStyle, extract_vol_env};
+use render::{render_part, NoteStyle, extract_vol_env, channel_pitch};
 use resolve::Resolved;
 use wav::{decode_audio_to_wav, wav_sample_rate, wav_secs, crop_wav};
 
@@ -54,6 +54,18 @@ pub(super) fn debug_on() -> bool {
 
 pub(super) fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{:02x}", x)).collect::<Vec<_>>().join(" ")
+}
+
+// ── channel → mixer insert ─────────────────────────────────────────────
+
+fn build_channel_to_insert(prj: &flp_src::Project) -> HashMap<u16, u8> {
+    let mut out: HashMap<u16, u8> = HashMap::new();
+    for chan in &prj.channels {
+        if chan.insert > 0 && chan.insert <= 255 {
+            out.insert(chan.iid, chan.insert as u8);
+        }
+    }
+    out
 }
 
 // ── main entry ─────────────────────────────────────────────────────────
@@ -107,6 +119,27 @@ pub(super) fn convert(
         ));
     }
 
+    // ── extract insert effects (for shims) ───────────────────────────
+    let inserts = extract_inserts(
+        prj,
+        &plugin_index,
+        fallback_table.as_ref(),
+                                  &mut aux_files,
+    );
+
+    let channel_to_insert = build_channel_to_insert(prj);
+    let shims_by_channel = place::channel_shims(&inserts, &channel_to_insert);
+    if debug_on() {
+        let mut chans: Vec<u16> = shims_by_channel.keys().copied().collect();
+        chans.sort_unstable();
+        eprintln!(
+            "flp: shimmed channels {:?} (from {} insert(s), {} routed)",
+                  chans,
+                  inserts.len(),
+                  channel_to_insert.len(),
+        );
+    }
+
     // ── classify channels ────────────────────────────────────────────
     let Classified {
         usable_samples,
@@ -128,6 +161,18 @@ pub(super) fn convert(
                           &mut aux_files,
     );
     warnings.extend(cls_warnings);
+
+    if debug_on() {
+        eprintln!(
+            "flp: buckets samples={} embedded={} natives={} sf2={} (total {})",
+                  usable_samples.len(),
+                  usable_embedded.len(),
+                  usable_natives.len(),
+                  usable_sf2.len(),
+                  usable_samples.len() + usable_embedded.len()
+                  + usable_natives.len() + usable_sf2.len(),
+        );
+    }
 
     if usable_samples.is_empty()
         && usable_embedded.is_empty()
@@ -196,14 +241,29 @@ pub(super) fn convert(
             if start_s > 0 || end_s < total_samples {
                 if let Ok(cropped) = crop_wav(&bytes, start_s, end_s) {
                     bytes = cropped;
-                    start_s = 0; // The WAV is now physically cropped, so the offset is 0
+                    start_s = 0;
                 }
+            }
+
+            let (pitch_semis, pitch_resid) = channel_pitch(chan);
+            if pitch_semis != 0 || pitch_resid != 0 {
+                warnings.push(format!(
+                    "[{:2}] {}: channel pitch applied as {:+} semitone(s){}",
+                                      chan.iid,
+                                      if chan.name.is_empty() { "<unnamed>" } else { &chan.name },
+                                          pitch_semis,
+                                      if pitch_resid != 0 {
+                                          format!(" ({:+} cents left unapplied)", pitch_resid)
+                                      } else {
+                                          String::new()
+                                      },
+                ));
             }
 
             styles.insert(
                 chan.iid,
                 NoteStyle {
-                    transpose: 0,
+                    transpose: pitch_semis,
                     full_secs: wav_secs(&bytes),
                           bpm: tempo,
                           vol_scale: chan.volume_scale(),
@@ -237,10 +297,24 @@ pub(super) fn convert(
             let primary_rel = format!("samples/{:02}_{}.wav", chan.iid, safe);
 
             let sample_rate = wav_sample_rate(&emb.wav).unwrap_or(44100);
+            let (pitch_semis, pitch_resid) = channel_pitch(chan);
+            if pitch_semis != 0 || pitch_resid != 0 {
+                warnings.push(format!(
+                    "[{:2}] {}: channel pitch applied as {:+} semitone(s){}",
+                                      chan.iid,
+                                      if chan.name.is_empty() { "<unnamed>" } else { &chan.name },
+                                          pitch_semis,
+                                      if pitch_resid != 0 {
+                                          format!(" ({:+} cents left unapplied)", pitch_resid)
+                                      } else {
+                                          String::new()
+                                      },
+                ));
+            }
             styles.insert(
                 chan.iid,
                 NoteStyle {
-                    transpose: emb.root_key.map_or(0, |r| FL_C5_MIDI - r as i32),
+                    transpose: emb.root_key.map_or(0, |r| FL_C5_MIDI - r as i32) + pitch_semis,
                           full_secs: wav_secs(&emb.wav),
                           bpm: tempo,
                           vol_scale: chan.volume_scale(),
@@ -330,7 +404,6 @@ pub(super) fn convert(
         let mut part_for_iid: HashMap<u16, usize> = HashMap::new();
         let mut part_name_used: HashMap<String, u32> = HashMap::new();
 
-        // Built once; the measure loop only walks notes.
         let mut channels_here: Vec<(&flp_src::Channel, &'static str)> = Vec::new();
         channels_here.extend(usable_samples.iter().map(|(c, _)| (*c, "sample")));
         channels_here.extend(usable_embedded.iter().map(|(c, _)| (*c, "sample")));
@@ -388,7 +461,29 @@ pub(super) fn convert(
 
                 let section_idx = song.add_section(part_idx, body);
                 line.calls.push(Call { part_idx, section_idx, overrides: None });
+
+                // Shim suffix: call-attached form
+                // `ƒName()@<ƒSlug()>;`.  Always push one entry so
+                // `extra[ci]` stays aligned with `calls[ci]`; empty
+                // string means "no shim for this call" and Song::write
+                // emits the call bare.
+                let shim_suffix = shims_by_channel
+                .get(&chan.iid)
+                .map(|slugs| place::shim_suffix(slugs))
+                .unwrap_or_default();
+                line.extra.push(shim_suffix);
             }
+
+            // Guardrail: with one push to each vector above, this must
+            // hold.  A future patch that adds a second `line.calls.push`
+            // without a matching `line.extra.push` trips this in debug
+            // builds rather than silently dropping shims.
+            debug_assert_eq!(
+                line.calls.len(),
+                             line.extra.len(),
+                             "measure {}: calls={} extra={} — shim alignment drifted",
+                             m, line.calls.len(), line.extra.len(),
+            );
 
             song.measures.push(line);
         }
@@ -422,11 +517,12 @@ pub(super) fn convert(
 
         if !envelope_only.is_empty() {
             song.post_comments.push(
-                "//\n// Channels with active sampler envelopes (parsed, not yet rendered):".to_string(),
+                "//\n// Channels with active sampler envelopes (volume envelope is applied on sample\n\
+// and embedded-audio channels; pan/filter/pitch envelopes and LFOs are parsed, not rendered):".to_string(),
             );
             for (iid, name, n) in &envelope_only {
                 song.post_comments.push(format!(
-                    "//   [{:2}] {}: {} active envelope(s) — attack/decay/sustain/release not applied",
+                    "//   [{:2}] {}: {} active envelope(s)",
                                                 iid, name, n
                 ));
             }
@@ -477,12 +573,7 @@ pub(super) fn convert(
         // ── fidelity sidecar ─────────────────────────────────────────────
         let mut fidelity = build_fidelity(prj, &resolved_map, &sidecar_path);
         fidelity.multi_sample = multi_zones;
-        fidelity.inserts = extract_inserts(
-            prj,
-            &plugin_index,
-            fallback_table.as_ref(),
-                                           &mut aux_files,
-        );
+        fidelity.inserts = inserts;
 
         match fidelity.to_json() {
             Ok(json) => {

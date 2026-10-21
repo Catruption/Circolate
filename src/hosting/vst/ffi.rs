@@ -1,17 +1,6 @@
 //! Thin wrapper around a small C++ shim (vst_shim.cpp) that hosts VST3s.
 //!
-//! Instruments and effects share the same wrapper.  Callers decide which
-//! entry point to use: `process()` for synths (writes output, ignores
-//! input), `process_inplace()` for effects (reads and writes the same
-//! buffer).
-//!
-//! Lifecycle: `VstHost::load` creates the plugin with an empty state and
-//! then immediately applies the state it was given, then activates.
-//! That ordering matters — a sampler sizes its internal playback buffers
-//! at activation based on the state it sees.  Loading state after
-//! activation leaves those buffers sized for "nothing", and the plugin
-//! crashes when it tries to write into them.  See the comment in
-//! `vst_shim.cpp` for the full story.
+//! [unchanged header doc]
 
 use anyhow::Result;
 use std::ffi::CString;
@@ -36,6 +25,10 @@ unsafe extern "C" {
                                                                  fn vst_shim_process_inplace(handle: *mut c_void,
                                                                                              buf_l: *mut c_float, buf_r: *mut c_float,
                                                                                              frames: c_int) -> c_int;
+                                                                                             fn vst_shim_set_param_by_index(handle: *mut c_void,
+                                                                                                                            index: c_int,
+                                                                                                                            normalized: f64) -> c_int;
+                                                                                                                            fn vst_shim_dump_params(handle: *mut c_void) -> c_int;
 }
 
 pub struct VstHost {
@@ -46,15 +39,11 @@ impl VstHost {
     pub fn load(plugin_path: &str, state_bytes: &[u8], sr: u32) -> Result<Self> {
         let cpath = CString::new(plugin_path)?;
 
-        // Create — the plugin is configured but not yet active.
         let handle = unsafe { vst_shim_create(cpath.as_ptr(), sr as c_int, 512) };
         if handle.is_null() {
             return Err(anyhow::anyhow!("vst_shim_create failed for {}", plugin_path));
         }
 
-        // Apply state while inactive.  The plugin sizes its buffers
-        // against this state at activation, so this has to happen
-        // before vst_shim_activate.
         if !state_bytes.is_empty() {
             let ok = unsafe {
                 vst_shim_set_state(handle, state_bytes.as_ptr(), state_bytes.len())
@@ -68,7 +57,6 @@ impl VstHost {
             }
         }
 
-        // Now bring it online.
         unsafe { vst_shim_activate(handle) };
 
         Ok(VstHost { handle })
@@ -94,7 +82,6 @@ impl VstHost {
         self.note_off_at(note, 0);
     }
 
-    /// Instrument path: synth writes here, input is ignored.
     pub fn process(&mut self, l: &mut [f32], r: &mut [f32]) {
         unsafe {
             vst_shim_process(self.handle, l.as_mut_ptr(), r.as_mut_ptr(),
@@ -102,12 +89,31 @@ impl VstHost {
         }
     }
 
-    /// Effect path: reads and writes the same buffer.
     pub fn process_inplace(&mut self, l: &mut [f32], r: &mut [f32]) {
         unsafe {
             vst_shim_process_inplace(self.handle, l.as_mut_ptr(), r.as_mut_ptr(),
                                      l.len() as c_int);
         }
+    }
+
+    /// Set a parameter by its index in the plugin's controller order
+    /// (`IEditController::getParameterInfo` index, 0-based).  `normalized`
+    /// is clamped to [0, 1] by the shim.  Returns `true` if the plugin
+    /// has a controller and the index was in range.
+    ///
+    /// The change is queued on the plugin's controller and also forwarded
+    /// as an `inputParameterChanges` entry on the next `process` call, so
+    /// both DPF-style (shared-state) and host-pipeline plugins observe it.
+    pub fn set_param_by_index(&mut self, index: u32, normalized: f64) -> bool {
+        unsafe {
+            vst_shim_set_param_by_index(self.handle, index as c_int, normalized) == 1
+        }
+    }
+
+    /// Print the plugin's full parameter table to stderr.  Returns the
+    /// parameter count, or `-1` if the plugin has no controller.
+    pub fn dump_params(&mut self) -> i32 {
+        unsafe { vst_shim_dump_params(self.handle) }
     }
 }
 
@@ -117,7 +123,4 @@ impl Drop for VstHost {
     }
 }
 
-// SAFETY: the raw handle is only dereferenced through `&mut self`.  The
-// engine owns each `VstHost` and only touches it from the audio callback
-// (live) or the render loop (offline), never both at once.
 unsafe impl Send for VstHost {}

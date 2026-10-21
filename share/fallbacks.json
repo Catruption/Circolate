@@ -1,1048 +1,243 @@
 {
   "version": 1,
   "categories": {
-    "bass": {
-      "rms_db": -20.0,
-      "peak_db": -6.0
-    },
-    "chiptune": {
-      "rms_db": -16.0,
-      "peak_db": -4.0
-    },
-    "default": {
-      "rms_db": -18.0,
-      "peak_db": -6.0
-    },
-    "drums": {
-      "rms_db": -16.0,
-      "peak_db": -4.0
-    },
-    "keys": {
-      "rms_db": -20.0,
-      "peak_db": -8.0
-    },
-    "leads": {
-      "rms_db": -18.0,
-      "peak_db": -6.0
-    },
-    "pads": {
-      "rms_db": -22.0,
-      "peak_db": -10.0
-    },
-    "unknown": {
-      "rms_db": -24.0,
-      "peak_db": -10.0
-    }
+    "bass": { "rms_db": -20.0, "peak_db": -6.0 },
+    "chiptune": { "rms_db": -16.0, "peak_db": -4.0 },
+    "default": { "rms_db": -18.0, "peak_db": -6.0 },
+    "drums": { "rms_db": -16.0, "peak_db": -4.0 },
+    "keys": { "rms_db": -20.0, "peak_db": -8.0 },
+    "leads": { "rms_db": -18.0, "peak_db": -6.0 },
+    "pads": { "rms_db": -22.0, "peak_db": -10.0 },
+    "unknown": { "rms_db": -24.0, "peak_db": -10.0 }
   },
   "instruments": {
-    "005 2A03 White Noise": [
-      {
-        "name": "Magical8bitPlug2",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "005 2A03 White Noise #2": [
-      {
-        "name": "Magical8bitPlug2",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "3x Osc": [
-      {
-        "name": "TAL-NoiseMaker",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "3x Osc #2": [
-      {
-        "name": "TAL-NoiseMaker",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "70s Bounce": [
-      {
-        "name": "MT-PowerDrumKit",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "808 Kicked": [
-      {
-        "name": "MT-PowerDrumKit",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "909": [
-      {
-        "name": "MT-PowerDrumKit",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "ARP It Wasn't Tim ToTc": [
-      {
-        "name": "Odin2",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Above clouds": [
-      {
-        "name": "Helm",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Accordiola": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Acid": [
-      {
-        "name": "TAL-NoiseMaker",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Acid 5": [
-      {
-        "name": "TAL-NoiseMaker",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Acoustic nylon": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Addictive Keys": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Addictive Keys #2": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "All Strings Staccato": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "All Strings Sustain": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Alto Sax": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Arcade": [
-      {
-        "name": "Decent Sampler",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Arpeggio 2": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "BEL Leez Banla": [
-      {
-        "name": "Odin2",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Bajo Trap": [
-      {
-        "name": "TAL-NoiseMaker",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Bass Lead Thing": [
-      {
-        "name": "TAL-NoiseMaker",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Bosendorfer": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Brass80": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "BrassX": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Breakbeat": [
-      {
-        "name": "MT-PowerDrumKit",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Cerbera saw": [
-      {
-        "name": "OB-Xd",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Choir 3": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Choir Aahs": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Classic Trancer": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Close Grand": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Computermusik": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Concert Piano": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "DAVE": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Dark Star Metal": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Donkstring": [
-      {
-        "name": "TAL-NoiseMaker",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Drifter": [
-      {
-        "name": "Odin2",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Drugs_Bass": [
-      {
-        "name": "TAL-NoiseMaker",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Drugs_Pluck": [
-      {
-        "name": "TAL-NoiseMaker",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Drumaxx": [
-      {
-        "name": "MT-PowerDrumKit",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Eighties Keys FG": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Electric Funk Guitar": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Eurogate": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "FL Keys": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "FPC": [
-      {
-        "name": "MT-PowerDrumKit",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Face eater": [
-      {
-        "name": "Odin2",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "FatAss": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "GMS": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "GennyFL": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "GennyFL #2": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "GennyFL #3": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Grand Piano": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Greasy": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Grinder": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "HQ Jazz Kit": [
-      {
-        "name": "MT-PowerDrumKit",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Harmor": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Inst_4": [
-      {
-        "name": "OB-Xd",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Inst_5": [
-      {
-        "name": "OB-Xd",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Inst_6": [
-      {
-        "name": "OB-Xd",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "JEFF": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Keyzone Classic": [
-      {
-        "name": "Dexed",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Kontakt": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Kontakt 5": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Kontakt 5 #2": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "LABS": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Leviathan Saws": [
-      {
-        "name": "Vital",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Liquid Reese": [
-      {
-        "name": "Odin2",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "MODO BASS": [
-      {
-        "name": "TAL-NoiseMaker",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Megasaw": [
-      {
-        "name": "OB-Xd",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Music box": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "NES VST 1.2": [
-      {
-        "name": "Magical8bitPlug2",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Perfect Drums": [
-      {
-        "name": "MT-PowerDrumKit",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Pianopad": [
-      {
-        "name": "Dexed",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "PoiZone": [
-      {
-        "name": "Dexed",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Poizone": [
-      {
-        "name": "Dexed",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Purple Lullaby": [
-      {
-        "name": "Helm",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Radio Tech Dubstep": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "RealStrat Elite": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "SGM Orchestra (DW)": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "SRX KEYBOARDS": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Serum": [
-      {
-        "name": "Vital",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Serum #2": [
-      {
-        "name": "Vital",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Serum #3": [
-      {
-        "name": "Vital",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Serum #4": [
-      {
-        "name": "Vital",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Serum #5": [
-      {
-        "name": "Vital",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Shreddage": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "SimSynth": [
-      {
-        "name": "TAL-NoiseMaker",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Space Pad": [
-      {
-        "name": "Helm",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Steinway D": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Subbass": [
-      {
-        "name": "X-Or",
-        "kind": "vst3",
-        "category": "bass"
-      }
-    ],
-    "Subbass #2": [
-      {
-        "name": "X-Or",
-        "kind": "vst3",
-        "category": "bass"
-      }
-    ],
-    "Superior Drummer 3": [
-      {
-        "name": "MT-PowerDrumKit",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Temptated Bass Xtra": [
-      {
-        "name": "TAL-NoiseMaker",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Toxic Biohazard": [
-      {
-        "name": "Dexed",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Unstable Acid": [
-      {
-        "name": "TAL-NoiseMaker",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "VOX TakeMe2TheTop MC": [
-      {
-        "name": "Decent Sampler",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "Warm Morph": [
-      {
-        "name": "Helm",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "ZENOLOGY": [
-      {
-        "name": "Odin2",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "aaviolin": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "bami": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "dave": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "harmor_bass": [
-      {
-        "name": "TAL-NoiseMaker",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "magical8bitPlug": [
-      {
-        "name": "Magical8bitPlug2",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "money dubstep bass": [
-      {
-        "name": "TAL-NoiseMaker",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "nintendo_soundfont": [
-      {
-        "name": "Magical8bitPlug2",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "nintendo_soundfont #3": [
-      {
-        "name": "Magical8bitPlug2",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "pad thing 2": [
-      {
-        "name": "Helm",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "partmanage chords1": [
-      {
-        "name": "Odin2",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "sforzando": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "sforzando #3": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "ur mom :]": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": null
-      }
-    ],
-    "__default__": [
-      {
-        "name": "Surge XT",
-        "kind": "vst3",
-        "category": "unknown"
-      }
-    ]
+    "005 2A03 White Noise": [{ "name": "Magical8bitPlug2", "kind": "vst3", "category": null }],
+    "005 2A03 White Noise #2": [{ "name": "Magical8bitPlug2", "kind": "vst3", "category": null }],
+    "3x Osc": [{ "name": "TAL-NoiseMaker", "kind": "vst3", "category": null }],
+    "3x Osc #2": [{ "name": "TAL-NoiseMaker", "kind": "vst3", "category": null }],
+    "70s Bounce": [{ "name": "MT-PowerDrumKit", "kind": "vst3", "category": null }],
+    "808 Kicked": [{ "name": "MT-PowerDrumKit", "kind": "vst3", "category": null }],
+    "909": [{ "name": "MT-PowerDrumKit", "kind": "vst3", "category": null }],
+    "ARP It Wasn't Tim ToTc": [{ "name": "Odin2", "kind": "vst3", "category": null }],
+    "Above clouds": [{ "name": "Helm", "kind": "vst3", "category": null }],
+    "Accordiola": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "Acid": [{ "name": "TAL-NoiseMaker", "kind": "vst3", "category": null }],
+    "Acid 5": [{ "name": "TAL-NoiseMaker", "kind": "vst3", "category": null }],
+    "Acoustic nylon": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "Dream Piano": [{ "name": "rdpiano_juce", "kind": "vst3", "category": null }],
+    "Piano Wide": [{ "name": "rdpiano_juce", "kind": "vst3", "category": null }],
+    "DX7 Toy Piano": [{ "name": "Dexed", "kind": "vst3", "category": null }],
+    "DX100 Funk Bass": [{ "name": "Dexed", "kind": "vst3", "category": null }],
+    "Drum Analog Kit": [{ "name": "MT-PowerDrumKit", "kind": "vst3", "category": null }],
+    "Addictive Keys": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "Addictive Keys #2": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "All Strings Staccato": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "All Strings Sustain": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "Alto Sax": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "Arcade": [{ "name": "Decent Sampler", "kind": "vst3", "category": null }],
+    "Arpeggio 2": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "BEL Leez Banla": [{ "name": "Odin2", "kind": "vst3", "category": null }],
+    "Bajo Trap": [{ "name": "TAL-NoiseMaker", "kind": "vst3", "category": null }],
+    "Bass Lead Thing": [{ "name": "TAL-NoiseMaker", "kind": "vst3", "category": null }],
+    "Bosendorfer": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "Brass80": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "BrassX": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "Breakbeat": [{ "name": "MT-PowerDrumKit", "kind": "vst3", "category": null }],
+    "Cerbera saw": [{ "name": "OB-Xd", "kind": "vst3", "category": null }],
+    "Choir 3": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "Choir Aahs": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "Classic Trancer": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "Close Grand": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "Computermusik": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "Concert Piano": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "DAVE": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "Dark Star Metal": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "Donkstring": [{ "name": "TAL-NoiseMaker", "kind": "vst3", "category": null }],
+    "Drifter": [{ "name": "Odin2", "kind": "vst3", "category": null }],
+    "Drugs_Bass": [{ "name": "TAL-NoiseMaker", "kind": "vst3", "category": null }],
+    "Drugs_Pluck": [{ "name": "TAL-NoiseMaker", "kind": "vst3", "category": null }],
+    "Drumaxx": [{ "name": "MT-PowerDrumKit", "kind": "vst3", "category": null }],
+    "Eighties Keys FG": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "Electric Funk Guitar": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "Eurogate": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "FL Keys": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "FPC": [{ "name": "MT-PowerDrumKit", "kind": "vst3", "category": null }],
+    "Face eater": [{ "name": "Odin2", "kind": "vst3", "category": null }],
+    "FatAss": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "GMS": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "GennyFL": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "GennyFL #2": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "GennyFL #3": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "Grand Piano": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "Greasy": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "Grinder": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "HQ Jazz Kit": [{ "name": "MT-PowerDrumKit", "kind": "vst3", "category": null }],
+    "Harmor": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "Inst_4": [{ "name": "OB-Xd", "kind": "vst3", "category": null }],
+    "Inst_5": [{ "name": "OB-Xd", "kind": "vst3", "category": null }],
+    "Inst_6": [{ "name": "OB-Xd", "kind": "vst3", "category": null }],
+    "JEFF": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "Keyzone Classic": [{ "name": "Dexed", "kind": "vst3", "category": null }],
+    "Kontakt": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "Kontakt 5": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "Kontakt 5 #2": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "LABS": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "Leviathan Saws": [{ "name": "Vital", "kind": "vst3", "category": null }],
+    "Liquid Reese": [{ "name": "Odin2", "kind": "vst3", "category": null }],
+    "MODO BASS": [{ "name": "TAL-NoiseMaker", "kind": "vst3", "category": null }],
+    "Megasaw": [{ "name": "OB-Xd", "kind": "vst3", "category": null }],
+    "Music box": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "NES VST 1.2": [{ "name": "Magical8bitPlug2", "kind": "vst3", "category": null }],
+    "Perfect Drums": [{ "name": "MT-PowerDrumKit", "kind": "vst3", "category": null }],
+    "Pianopad": [{ "name": "Dexed", "kind": "vst3", "category": null }],
+    "PoiZone": [{ "name": "Dexed", "kind": "vst3", "category": null }],
+    "Poizone": [{ "name": "Dexed", "kind": "vst3", "category": null }],
+    "Purple Lullaby": [{ "name": "Helm", "kind": "vst3", "category": null }],
+    "Radio Tech Dubstep": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "RealStrat Elite": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "SGM Orchestra (DW)": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "SRX KEYBOARDS": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "Serum": [{ "name": "Vital", "kind": "vst3", "category": null }],
+    "Serum #2": [{ "name": "Vital", "kind": "vst3", "category": null }],
+    "Serum #3": [{ "name": "Vital", "kind": "vst3", "category": null }],
+    "Serum #4": [{ "name": "Vital", "kind": "vst3", "category": null }],
+    "Serum #5": [{ "name": "Vital", "kind": "vst3", "category": null }],
+    "Shreddage": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "SimSynth": [{ "name": "TAL-NoiseMaker", "kind": "vst3", "category": null }],
+    "Space Pad": [{ "name": "Helm", "kind": "vst3", "category": null }],
+    "Steinway D": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "Subbass": [{ "name": "X-Or", "kind": "vst3", "category": "bass" }],
+    "Subbass #2": [{ "name": "X-Or", "kind": "vst3", "category": "bass" }],
+    "Superior Drummer 3": [{ "name": "MT-PowerDrumKit", "kind": "vst3", "category": null }],
+    "Temptated Bass Xtra": [{ "name": "TAL-NoiseMaker", "kind": "vst3", "category": null }],
+    "Toxic Biohazard": [{ "name": "Dexed", "kind": "vst3", "category": null }],
+    "Unstable Acid": [{ "name": "TAL-NoiseMaker", "kind": "vst3", "category": null }],
+    "VOX TakeMe2TheTop MC": [{ "name": "Decent Sampler", "kind": "vst3", "category": null }],
+    "Warm Morph": [{ "name": "Helm", "kind": "vst3", "category": null }],
+    "ZENOLOGY": [{ "name": "Odin2", "kind": "vst3", "category": null }],
+    "aaviolin": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "bami": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "dave": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "harmor_bass": [{ "name": "TAL-NoiseMaker", "kind": "vst3", "category": null }],
+    "magical8bitPlug": [{ "name": "Magical8bitPlug2", "kind": "vst3", "category": null }],
+    "money dubstep bass": [{ "name": "TAL-NoiseMaker", "kind": "vst3", "category": null }],
+    "nintendo_soundfont": [{ "name": "Magical8bitPlug2", "kind": "vst3", "category": null }],
+    "nintendo_soundfont #3": [{ "name": "Magical8bitPlug2", "kind": "vst3", "category": null }],
+    "pad thing 2": [{ "name": "Helm", "kind": "vst3", "category": null }],
+    "partmanage chords1": [{ "name": "Odin2", "kind": "vst3", "category": null }],
+    "sforzando": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "sforzando #3": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "ur mom :]": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "__default__": [{ "name": "Surge XT", "kind": "vst3", "category": "unknown" }]
   },
   "effects": [
     {
       "match": "Fruity Fast Dist",
-      "fallback": {
-        "name": "PeakEater",
-        "kind": "vst3",
-        "gain": 1.0
-      }
+      "fallback": { "name": "PeakEater", "kind": "vst3", "gain": 1.0 }
     },
     {
       "match": "Fruity Blood Overdrive",
-      "fallback": {
-        "name": "Setekh",
-        "kind": "vst3",
-        "gain": 1.0
-      }
+      "fallback": { "name": "Setekh", "kind": "vst3", "gain": 1.0 }
     },
     {
       "match": "Fruity Soft Clipper",
-      "fallback": {
-        "name": "PeakEater",
-        "kind": "vst3",
-        "gain": 1.0
-      }
+      "fallback": { "name": "PeakEater", "kind": "vst3", "gain": 1.0 }
     },
     {
       "match": "Fruity Squeeze",
-      "fallback": {
-        "name": "MaBitcrush",
-        "kind": "vst3",
-        "gain": 1.0
-      }
+      "fallback": { "name": "MaBitcrush", "kind": "vst3", "gain": 1.0 }
     },
     {
       "match": "Effector",
-      "fallback": {
-        "name": "MaBitcrush",
-        "kind": "vst3",
-        "gain": 1.0
-      }
+      "fallback": { "name": "MaBitcrush", "kind": "vst3", "gain": 1.0 }
     },
     {
       "match": "Transient Processor",
-      "fallback": {
-        "name": "lsp-plugins",
-        "kind": "vst3",
-        "gain": 1.0
-      }
+      "fallback": { "name": "lsp-plugins", "kind": "vst3", "gain": 1.0 }
     },
     {
       "match": "Fruity Reeverb 2",
-      "fallback": {
-        "name": "Dragonfly Hall Reverb",
-        "kind": "vst3",
-        "gain": 1.0
-      }
+      "fallback": { "name": "Dragonfly Hall Reverb", "kind": "vst3", "gain": 1.0 }
     },
     {
       "match": "Fruity Reeverb",
-      "fallback": {
-        "name": "Dragonfly Room Reverb",
-        "kind": "vst3",
-        "gain": 1.0
-      }
+      "fallback": { "name": "Dragonfly Room Reverb", "kind": "vst3", "gain": 1.0 }
     },
     {
       "match": "Fruity Limiter",
-      "fallback": {
-        "name": "ProM",
-        "kind": "vst3",
-        "gain": 1.0
-      }
+      "fallback": { "name": "ProM", "kind": "vst3", "gain": 1.0 }
     },
     {
       "match": "Fruity Compressor",
-      "fallback": {
-        "name": "lsp-plugins",
-        "kind": "vst3",
-        "gain": 1.0
-      }
+      "fallback": { "name": "lsp-plugins", "kind": "vst3", "gain": 1.0 }
     },
     {
       "match": "Fruity Parametric EQ 2",
-      "fallback": {
-        "name": "lsp-plugins",
-        "kind": "vst3",
-        "gain": 1.0
-      }
+      "fallback": { "name": "lsp-plugins", "kind": "vst3", "gain": 1.0 }
     },
     {
       "match": "Fruity Parametric EQ",
-      "fallback": {
-        "name": "lsp-plugins",
-        "kind": "vst3",
-        "gain": 1.0
-      }
+      "fallback": { "name": "lsp-plugins", "kind": "vst3", "gain": 1.0 }
     },
     {
       "match": "Fruity 7 Band EQ",
-      "fallback": {
-        "name": "lsp-plugins",
-        "kind": "vst3",
-        "gain": 1.0
-      }
+      "fallback": { "name": "lsp-plugins", "kind": "vst3", "gain": 1.0 }
     },
     {
       "match": "Fruity Filter",
-      "fallback": {
-        "name": "lsp-plugins",
-        "kind": "vst3",
-        "gain": 1.0
-      }
+      "fallback": { "name": "lsp-plugins", "kind": "vst3", "gain": 1.0 }
     },
     {
       "match": "Fruity Free Filter",
-      "fallback": {
-        "name": "lsp-plugins",
-        "kind": "vst3",
-        "gain": 1.0
-      }
+      "fallback": { "name": "lsp-plugins", "kind": "vst3", "gain": 1.0 }
     },
     {
       "match": "Fruity Stereo Enhancer",
-      "fallback": {
-        "name": "lsp-plugins",
-        "kind": "vst3",
-        "gain": 1.0
-      }
+      "fallback": { "name": "lsp-plugins", "kind": "vst3", "gain": 1.0 }
     },
     {
       "match": "Fruity Chorus",
-      "fallback": {
-        "name": "Surge XT Effects",
-        "kind": "vst3",
-        "gain": 1.0
-      }
+      "fallback": { "name": "Surge XT Effects", "kind": "vst3", "gain": 1.0 }
     },
     {
       "match": "Fruity Flanger",
-      "fallback": {
-        "name": "Surge XT Effects",
-        "kind": "vst3",
-        "gain": 1.0
-      }
+      "fallback": { "name": "Surge XT Effects", "kind": "vst3", "gain": 1.0 }
     },
     {
       "match": "Fruity Phaser",
-      "fallback": {
-        "name": "Surge XT Effects",
-        "kind": "vst3",
-        "gain": 1.0
-      }
+      "fallback": { "name": "Surge XT Effects", "kind": "vst3", "gain": 1.0 }
     },
     {
       "match": "Fruity Delay 2",
-      "fallback": {
-        "name": "TAL-Dub-2",
-        "kind": "vst3",
-        "gain": 1.0
-      }
+      "fallback": { "name": "Surge XT Effects", "kind": "vst3", "gain": 1.0 }
     },
     {
       "match": "Fruity Delay 3",
-      "fallback": {
-        "name": "TAL-Dub-2",
-        "kind": "vst3",
-        "gain": 1.0
-      }
+      "fallback": { "name": "Surge XT Effects", "kind": "vst3", "gain": 1.0 }
     },
     {
       "match": "Fruity Delay Bank",
-      "fallback": {
-        "name": "TAL-Dub-2",
-        "kind": "vst3",
-        "gain": 1.0
-      }
+      "fallback": { "name": "Surge XT Effects", "kind": "vst3", "gain": 1.0 }
     },
     {
       "match": "Fruity Flangus",
-      "fallback": {
-        "name": "Surge XT Effects",
-        "kind": "vst3",
-        "gain": 1.0
-      }
+      "fallback": { "name": "Surge XT Effects", "kind": "vst3", "gain": 1.0 }
     },
     {
       "match": "Soundgoodizer",
-      "fallback": {
-        "name": "Surge XT Effects",
-        "kind": "vst3",
-        "gain": 1.0
-      }
+      "fallback": { "name": "Surge XT Effects", "kind": "vst3", "gain": 1.0 }
     },
     {
       "match": "Vocodex",
-      "fallback": {
-        "name": "Surge XT Effects",
-        "kind": "vst3",
-        "gain": 1.0
-      }
+      "fallback": { "name": "Surge XT Effects", "kind": "vst3", "gain": 1.0 }
     },
     {
       "match": "EQUO",
-      "fallback": {
-        "name": "lsp-plugins",
-        "kind": "vst3",
-        "gain": 1.0
-      }
+      "fallback": { "name": "lsp-plugins", "kind": "vst3", "gain": 1.0 }
     },
     {
       "match": "Pitcher",
-      "fallback": {
-        "name": "Surge XT Effects",
-        "kind": "vst3",
-        "gain": 1.0
-      }
+      "fallback": { "name": "Surge XT Effects", "kind": "vst3", "gain": 1.0 }
     },
     {
       "match": "Patcher",
@@ -1052,20 +247,9 @@
   ],
   "master": [],
   "search_paths": {
-    "system": [
-      "/usr/lib/vst3",
-      "/usr/local/lib/vst3",
-      "/usr/lib/lxvst",
-      "/usr/local/lib/lxvst"
-    ],
-    "user": [
-      "~/.vst3",
-      "~/.lxvst"
-    ],
-    "relative": [
-      "plugins",
-      "plugins/vst3"
-    ],
+    "system": ["/usr/lib/vst3", "/usr/local/lib/vst3", "/usr/lib/lxvst", "/usr/local/lib/lxvst"],
+    "user": ["~/.vst3", "~/.lxvst"],
+    "relative": ["plugins", "plugins/vst3"],
     "include_user_config": true
   },
   "on_missing": "warn"

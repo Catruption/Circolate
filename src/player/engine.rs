@@ -30,15 +30,8 @@ pub(crate) struct Scheduled {
     pub(crate) vol_lane: Option<AutomationLane>,
     pub(crate) pan_lane: Option<AutomationLane>,
     pub(crate) const_gain: (f64, f64),
-    /// Identity for mute lookups.  `part_path` is the string
-    /// `Project::part_path(name)` returns; `source_row` is the note's
-    /// row within its own part.  Together with `line` (the block line
-    /// the voice was placed on) these form the key the UI toggles.
     pub(crate) part_path: String,
     pub(crate) source_row: f64,
-    /// SF2 volume envelope for this voice.  `None` for voices that play
-    /// at constant gain (WAV samples, embedded audio, WAV-based multi
-    /// samples).
     pub(crate) env: Option<Sf2VoiceEnvelope>,
 }
 
@@ -47,8 +40,6 @@ impl Scheduled {
         (self.start, self.line, self.seq)
     }
 }
-
-// ── scheduled VST note ─────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 pub(crate) struct VstNote {
@@ -59,7 +50,6 @@ pub(crate) struct VstNote {
     pub(crate) velocity: u8,
     pub(crate) line: u32,
     pub(crate) seq: u32,
-    /// Same identity scheme as `Scheduled`.
     pub(crate) part_path: String,
     pub(crate) source_row: f64,
 }
@@ -225,6 +215,13 @@ struct Active {
     env_state: Option<EnvState>,
 }
 
+pub(crate) struct ShimHost {
+    pub(crate) host: VstHost,
+    pub(crate) mix: f64,
+    pub(crate) gain: f64,
+    pub(crate) pan: f64,
+}
+
 pub(crate) enum Msg {
     Batch { epoch: u64, samples: Vec<Scheduled>, vsts: Vec<VstNote> },
     Seek  { epoch: u64, pos: i64, samples: Vec<Scheduled>, vsts: Vec<VstNote> },
@@ -247,7 +244,6 @@ pub(crate) struct Engine {
     pending: VecDeque<Scheduled>,
     active: Vec<Active>,
 
-
     insert_chains: BTreeMap<u8, inserts::InsertChain>,
     channel_to_insert: BTreeMap<u16, u8>,
     insert_scratch: BTreeMap<u8, (Vec<f32>, Vec<f32>)>,
@@ -257,8 +253,6 @@ pub(crate) struct Engine {
     host_scratch: BTreeMap<u16, (Vec<f32>, Vec<f32>)>,
     vst_gains: BTreeMap<u16, f32>,
 
-    /// Native SF2 engines (VST3-free).  Shares the `iid` space with
-    /// `hosts`; each id resolves to exactly one of the two maps.
     sf2_engines: BTreeMap<u16, Sf2Engine>,
 
     vst_pending: VecDeque<VstNote>,
@@ -274,6 +268,13 @@ pub(crate) struct Engine {
     vst_hist_head: i64,
 
     master_fx: Option<EffectChain>,
+
+    // ── shim subsystem ───────────────────────────────────────────
+    shims: BTreeMap<u32, ShimHost>,
+    shim_by_line: BTreeMap<u32, Vec<u32>>,
+    shim_scratch: BTreeMap<u32, (Vec<f32>, Vec<f32>)>,
+    shim_dry_l: Vec<f32>,
+    shim_dry_r: Vec<f32>,
 }
 
 impl Engine {
@@ -308,6 +309,11 @@ impl Engine {
             insert_scratch: BTreeMap::new(),
             sf2_scratch: BTreeMap::new(),
             master_fx: None,
+            shims: BTreeMap::new(),
+            shim_by_line: BTreeMap::new(),
+            shim_scratch: BTreeMap::new(),
+            shim_dry_l: Vec::new(),
+            shim_dry_r: Vec::new(),
         }
     }
 
@@ -338,9 +344,6 @@ impl Engine {
         self.vst_gains.insert(iid, gain);
     }
 
-    /// Install a native SF2 engine under an instrument ID.  Shares the
-    /// `iid` namespace with `install_host`; a given id should be one or
-    /// the other.
     pub(crate) fn install_sf2_engine(&mut self, iid: u16, engine: Sf2Engine) {
         self.sf2_engines.insert(iid, engine);
     }
@@ -362,6 +365,50 @@ impl Engine {
     }
 
     pub(crate) fn sample_rate(&self) -> f64 { self.sr }
+
+    pub(crate) fn install_shim(
+        &mut self,
+        id: u32,
+        host: VstHost,
+        mix: f64,
+        gain: f64,
+        pan: f64,
+    ) {
+        self.shims.insert(id, ShimHost {
+            host,
+            mix: mix.clamp(0.0, 1.0),
+                          gain,
+                          pan: pan.clamp(-1.0, 1.0),
+        });
+        self.shim_scratch.insert(
+            id,
+            (vec![0.0f32; VST_BLOCK as usize], vec![0.0f32; VST_BLOCK as usize]),
+        );
+    }
+
+    /// Attach a shim to a BlockList line.  Dedups per line: if the same
+    /// shim id is already present, the call is a no-op.  This matters
+    /// because a single BlockList line can carry several calls
+    /// (`ƒpianoer(11)@<…>; ƒHardshot_131(1)@<…>; …`), each emitting its
+    /// own copy of the same shim chain.  Without dedup the chain grows
+    /// to `[0, 1, 2, 0, 1, 2, 0, 1, 2, …]`, which (a) breaks the
+    /// `chains.sort().dedup()` in `process_shims` — the long variant
+    /// survives alongside the short one — and (b) causes the same
+    /// effect to process its own output several times per block.
+    /// Deduping here collapses every line to `[0, 1, 2]`, which is
+    /// also the correct FL semantic: all voices on a line route
+    /// through the same mixer insert, and the insert processes the
+    /// summed output once.
+    pub(crate) fn attach_shim_line(&mut self, line: u32, shim_id: u32) {
+        let chain = self.shim_by_line.entry(line).or_default();
+        if !chain.contains(&shim_id) {
+            chain.push(shim_id);
+        }
+    }
+
+    pub(crate) fn shim_count(&self) -> usize {
+        self.shims.len()
+    }
 
     fn raw_pos_at(&self, v: &Scheduled, to: i64) -> f64 {
         if to <= v.start {
@@ -481,7 +528,6 @@ impl Engine {
         self.ingest(voices);
     }
 
-    /// Note-off everything the backends think is on, then forget them.
     fn panic_hosts(&mut self) {
         for (iid, mask) in self.vst_held.iter_mut() {
             if let Some(host) = self.hosts.get_mut(iid) {
@@ -545,6 +591,18 @@ impl Engine {
         out_l.fill(0.0);
         out_r.fill(0.0);
 
+        if !self.shims.is_empty() {
+            let need = out_l.len();
+            for buf in self.shim_scratch.values_mut() {
+                if buf.0.len() < need {
+                    buf.0.resize(need, 0.0);
+                    buf.1.resize(need, 0.0);
+                }
+                buf.0[..need].fill(0.0);
+                buf.1[..need].fill(0.0);
+            }
+        }
+
         if speed == 0 {
             return;
         }
@@ -556,7 +614,6 @@ impl Engine {
         let dir: i64 = if speed > 0 { 1 } else { -1 };
         let dir_f = dir as f64;
 
-        // ── Voice activation ─────────────────────────────────────────
         if speed > 0 {
             while self.pending.front().map_or(false, |v| v.start < block_end) {
                 let v = self.pending.pop_front().unwrap();
@@ -589,115 +646,136 @@ impl Engine {
             }
         }
 
-        // ── Sample voices ────────────────────────────────────────────
         let song_volume = self.song_volume;
         let linear = self.linear;
-
-        self.active.retain_mut(|a| {
-            if !mute::is_note_active(&a.v.part_path, a.v.line as usize, a.v.source_row as i64) {
-                return false;
-            }
-            let v = &a.v;
-            let smp = &*v.sample;
-            let len = smp.len() as f64;
-            let const_step = smp.rate * (v.pitch_hz / C5_HZ) / sr;
-            let loop_f = match smp.loop_pts {
-                Some((s, e)) if e > s => Some((s as f64, e as f64)),
-                               _ => None,
-            };
-            let automated_gain = v.vol_lane.is_some() || v.pan_lane.is_some();
-
-            let (i_lo, i_hi) = if speed > 0 {
-                let lo = ((v.start - block_start) as f64 / speed as f64)
-                .ceil()
-                .max(0.0) as i64;
-                let hi = ((v.end - block_start) as f64 / speed as f64)
-                .ceil()
-                .min(block_len as f64) as i64;
-                (lo, hi)
-            } else {
-                let lo = (((v.end - block_start) as f64 / speed as f64)
-                .floor() as i64)
-                + 1;
-                let hi = (((v.start - block_start) as f64 / speed as f64)
-                .floor() as i64)
-                + 1;
-                (lo.max(0), hi.min(block_len))
-            };
-
-            for i in i_lo..i_hi {
-                let f = block_start + i * speed;
-                let t = f as f64 / sr;
-                let step = match &v.pitch_lane {
-                    Some(l) => smp.rate * (l.value_at(t) / C5_HZ) / sr,
-                               None => const_step,
-                };
-
-                let mut p = a.raw_pos;
-                if let Some((ls, le)) = loop_f {
-                    let ll = le - ls;
-                    if ll > 0.0 {
-                        if p >= le {
-                            p = ls + (p - le).rem_euclid(ll);
-                        } else if p < ls {
-                            p = le - (ls - p).rem_euclid(ll);
-                        }
-                    }
+        {
+            let Self { active, shim_by_line, shim_scratch, .. } = self;
+            active.retain_mut(|a| {
+                if !mute::is_note_active(&a.v.part_path, a.v.line as usize, a.v.source_row as i64) {
+                    return false;
                 }
-
-                let gain_pair = || -> (f64, f64) {
-                    if automated_gain {
-                        let vol = v.vol_lane.as_ref().map_or(v.vol, |l| l.value_at(t));
-                        let pan = v.pan_lane.as_ref().map_or(v.pan, |l| l.value_at(t));
-                        gains(vol, pan, song_volume, linear)
-                    } else {
-                        v.const_gain
-                    }
+                let v = &a.v;
+                let smp = &*v.sample;
+                let len = smp.len() as f64;
+                let const_step = smp.rate * (v.pitch_hz / C5_HZ) / sr;
+                let loop_f = match smp.loop_pts {
+                    Some((s, e)) if e > s => Some((s as f64, e as f64)),
+                              _ => None,
                 };
-                let env_gain = || -> f32 {
-                    match &a.env_state {
-                        Some(state) => {
-                            let t_sec = (f - state.start_sample) as f64 / sr;
-                            env_level_at(state, t_sec)
+                let automated_gain = v.vol_lane.is_some() || v.pan_lane.is_some();
+
+                let (i_lo, i_hi) = if speed > 0 {
+                    let lo = ((v.start - block_start) as f64 / speed as f64)
+                    .ceil()
+                    .max(0.0) as i64;
+                    let hi = ((v.end - block_start) as f64 / speed as f64)
+                    .ceil()
+                    .min(block_len as f64) as i64;
+                    (lo, hi)
+                } else {
+                    let lo = (((v.end - block_start) as f64 / speed as f64)
+                    .floor() as i64) + 1;
+                    let hi = (((v.start - block_start) as f64 / speed as f64)
+                    .floor() as i64) + 1;
+                    (lo.max(0), hi.min(block_len))
+                };
+
+                let first_shim: Option<u32> =
+                shim_by_line.get(&v.line).and_then(|s| s.first().copied());
+
+                for i in i_lo..i_hi {
+                    let f = block_start + i * speed;
+                    let t = f as f64 / sr;
+                    let step = match &v.pitch_lane {
+                        Some(l) => smp.rate * (l.value_at(t) / C5_HZ) / sr,
+                              None => const_step,
+                    };
+
+                    let mut p = a.raw_pos;
+                    if let Some((ls, le)) = loop_f {
+                        let ll = le - ls;
+                        if ll > 0.0 {
+                            if p >= le {
+                                p = ls + (p - le).rem_euclid(ll);
+                            } else if p < ls {
+                                p = le - (ls - p).rem_euclid(ll);
+                            }
                         }
-                        None => 1.0,
                     }
-                };
 
-                if p >= 0.0 && p < len {
-                    let (sl, sr_) = interpolate(smp, p, step, a.raw_pos);
-                    let (gl, gr) = gain_pair();
-                    let eg = env_gain();
-                    let o = i as usize;
-                    out_l[o] += sl * gl as f32 * eg;
-                    out_r[o] += sr_ * gr as f32 * eg;
-                } else if p >= len && loop_f.is_none() && a.env_state.is_some() && len > 0.0 {
-                    let over = p - len;
-                    let fade_len = HOLD_TAIL_SECS * sr;
-                    if over < fade_len {
-                        let fade = (1.0 - (over / fade_len)).clamp(0.0, 1.0) as f32;
-                        let last_i = (len as usize).saturating_sub(1);
-                        let sl = smp.left[last_i];
-                        let sr_ = if smp.stereo { smp.right[last_i] } else { sl };
+                    let gain_pair = || -> (f64, f64) {
+                        if automated_gain {
+                            let vol = v.vol_lane.as_ref().map_or(v.vol, |l| l.value_at(t));
+                            let pan = v.pan_lane.as_ref().map_or(v.pan, |l| l.value_at(t));
+                            gains(vol, pan, song_volume, linear)
+                        } else {
+                            v.const_gain
+                        }
+                    };
+                    let env_gain = || -> f32 {
+                        match &a.env_state {
+                            Some(state) => {
+                                let t_sec = (f - state.start_sample) as f64 / sr;
+                                env_level_at(state, t_sec)
+                            }
+                            None => 1.0,
+                        }
+                    };
+
+                    if p >= 0.0 && p < len {
+                        let (sl, sr_) = interpolate(smp, p, step, a.raw_pos);
                         let (gl, gr) = gain_pair();
                         let eg = env_gain();
                         let o = i as usize;
-                        out_l[o] += sl * gl as f32 * eg * fade;
-                        out_r[o] += sr_ * gr as f32 * eg * fade;
+                        let cl = sl * gl as f32 * eg;
+                        let cr = sr_ * gr as f32 * eg;
+                        match first_shim.and_then(|id| shim_scratch.get_mut(&id)) {
+                            Some(buf) if o < buf.0.len() => {
+                                buf.0[o] += cl;
+                                buf.1[o] += cr;
+                            }
+                            _ => {
+                                out_l[o] += cl;
+                                out_r[o] += cr;
+                            }
+                        }
+                    } else if p >= len && loop_f.is_none() && a.env_state.is_some() && len > 0.0 {
+                        let over = p - len;
+                        let fade_len = HOLD_TAIL_SECS * sr;
+                        if over < fade_len {
+                            let fade = (1.0 - (over / fade_len)).clamp(0.0, 1.0) as f32;
+                            let last_i = (len as usize).saturating_sub(1);
+                            let sl = smp.left[last_i];
+                            let sr_ = if smp.stereo { smp.right[last_i] } else { sl };
+                            let (gl, gr) = gain_pair();
+                            let eg = env_gain();
+                            let o = i as usize;
+                            let cl = sl * gl as f32 * eg * fade;
+                            let cr = sr_ * gr as f32 * eg * fade;
+                            match first_shim.and_then(|id| shim_scratch.get_mut(&id)) {
+                                Some(buf) if o < buf.0.len() => {
+                                    buf.0[o] += cl;
+                                    buf.1[o] += cr;
+                                }
+                                _ => {
+                                    out_l[o] += cl;
+                                    out_r[o] += cr;
+                                }
+                            }
+                        }
                     }
+
+                    a.raw_pos += step * dir_f;
                 }
 
-                a.raw_pos += step * dir_f;
-            }
+                if speed > 0 {
+                    v.end > block_end
+                } else {
+                    block_end > v.start
+                }
+            });
+        }
 
-            if speed > 0 {
-                v.end > block_end
-            } else {
-                block_end > v.start
-            }
-        });
-
-        // ── VST + SF2 voices ─────────────────────────────────────────
         if !self.hosts.is_empty() || !self.sf2_engines.is_empty() {
             if speed == 1 {
                 if !self.vst_synced {
@@ -714,7 +792,10 @@ impl Engine {
             }
         }
 
-        // ── NaN / inf guard (pre-FX) ─────────────────────────────────
+        if !self.shims.is_empty() {
+            self.process_shims(out_l, out_r);
+        }
+
         for s in out_l.iter_mut() {
             if !s.is_finite() {
                 *s = 0.0;
@@ -726,7 +807,6 @@ impl Engine {
             }
         }
 
-        // ── Master bus effects ───────────────────────────────────────
         if let Some(chain) = self.master_fx.as_mut() {
             if !chain.is_empty() {
                 let mut i = 0;
@@ -738,7 +818,6 @@ impl Engine {
             }
         }
 
-        // ── NaN / inf guard (post-FX) ────────────────────────────────
         for s in out_l.iter_mut() {
             if !s.is_finite() {
                 *s = 0.0;
@@ -750,7 +829,6 @@ impl Engine {
             }
         }
 
-        // ── Monitoring scale ─────────────────────────────────────────
         if speed != 1 {
             let scale = 1.0 / (speed.unsigned_abs() as f32);
             for s in out_l.iter_mut() { *s *= scale; }
@@ -758,6 +836,113 @@ impl Engine {
         }
 
         self.pos = block_end.clamp(0, self.total);
+    }
+
+    /// Process the shim chains in `VST_BLOCK`-sized chunks.
+    ///
+    /// Two properties matter:
+    ///
+    /// * **Chunking.**  Each `VstHost` was created with
+    ///   `maxSamplesPerBlock = 512`; calling `process_inplace` with a
+    ///   larger slice writes past the plugin's internal buffers.  cpal
+    ///   delivers 1024-frame blocks here, so we must subdivide.
+    ///
+    /// * **Dedup.**  `attach_shim_line` deduped each line's chain to
+    ///   unique ids, so `chains` in this method is a short list of
+    ///   unique chains.  `processed` guards against a shim appearing in
+    ///   two distinct chains (not the case today, but cheap insurance).
+    fn process_shims(&mut self, out_l: &mut [f32], out_r: &mut [f32]) {
+        let len = out_l.len();
+
+        if self.shim_dry_l.len() < len {
+            self.shim_dry_l.resize(len, 0.0);
+            self.shim_dry_r.resize(len, 0.0);
+        }
+        for buf in self.shim_scratch.values_mut() {
+            if buf.0.len() < len {
+                buf.0.resize(len, 0.0);
+                buf.1.resize(len, 0.0);
+            }
+        }
+
+        let mut dry_l = std::mem::take(&mut self.shim_dry_l);
+        let mut dry_r = std::mem::take(&mut self.shim_dry_r);
+
+        let mut chains: Vec<Vec<u32>> = self.shim_by_line.values().cloned().collect();
+        chains.sort();
+        chains.dedup();
+
+        let block = VST_BLOCK as usize;
+        let mut chunk_start = 0usize;
+        while chunk_start < len {
+            let chunk_end = (chunk_start + block).min(len);
+            let mut processed: std::collections::HashSet<u32> =
+            std::collections::HashSet::new();
+
+            for chain in &chains {
+                for (i, &shim_id) in chain.iter().enumerate() {
+                    if !processed.insert(shim_id) {
+                        continue;
+                    }
+
+                    // Run the effect on this chunk.
+                    {
+                        let Some(shim) = self.shims.get_mut(&shim_id) else { continue; };
+                        let Some(buf) = self.shim_scratch.get_mut(&shim_id) else { continue; };
+
+                        dry_l[chunk_start..chunk_end]
+                        .copy_from_slice(&buf.0[chunk_start..chunk_end]);
+                        dry_r[chunk_start..chunk_end]
+                        .copy_from_slice(&buf.1[chunk_start..chunk_end]);
+
+                        shim.host.process_inplace(
+                            &mut buf.0[chunk_start..chunk_end],
+                            &mut buf.1[chunk_start..chunk_end],
+                        );
+
+                        let mix = shim.mix as f32;
+                        let dry_amt = 1.0 - mix;
+                        let theta = ((shim.pan + 1.0) * std::f64::consts::FRAC_PI_4) as f32;
+                        let gl = (shim.gain as f32) * theta.cos();
+                        let gr = (shim.gain as f32) * theta.sin();
+
+                        for j in chunk_start..chunk_end {
+                            buf.0[j] = dry_l[j] * dry_amt + buf.0[j] * mix;
+                            buf.1[j] = dry_r[j] * dry_amt + buf.1[j] * mix;
+                            buf.0[j] *= gl;
+                            buf.1[j] *= gr;
+                        }
+                    }
+
+                    // Route the output: next shim in the chain, or master.
+                    if let Some(next_id) = chain.get(i + 1).copied() {
+                        let (pl, pr) = match self.shim_scratch.get(&shim_id) {
+                            Some(b) => (
+                                b.0[chunk_start..chunk_end].to_vec(),
+                                        b.1[chunk_start..chunk_end].to_vec(),
+                            ),
+                            None => continue,
+                        };
+                        if let Some(next) = self.shim_scratch.get_mut(&next_id) {
+                            for j in 0..(chunk_end - chunk_start) {
+                                next.0[chunk_start + j] += pl[j];
+                                next.1[chunk_start + j] += pr[j];
+                            }
+                        }
+                    } else if let Some(b) = self.shim_scratch.get(&shim_id) {
+                        for j in chunk_start..chunk_end {
+                            out_l[j] += b.0[j];
+                            out_r[j] += b.1[j];
+                        }
+                    }
+                }
+            }
+
+            chunk_start = chunk_end;
+        }
+
+        self.shim_dry_l = dry_l;
+        self.shim_dry_r = dry_r;
     }
 
     fn render_vsts(&mut self, out_l: &mut [f32], out_r: &mut [f32], block_start: i64) {
@@ -842,17 +1027,13 @@ impl Engine {
                 }
             }
 
-            // Zero master scratch.
             for s in vst_scratch_l[..chunk_len].iter_mut() { *s = 0.0; }
             for s in vst_scratch_r[..chunk_len].iter_mut() { *s = 0.0; }
-
-            // Zero insert scratches.
             for buf in insert_scratch.values_mut() {
                 for s in buf.0[..chunk_len].iter_mut() { *s = 0.0; }
                 for s in buf.1[..chunk_len].iter_mut() { *s = 0.0; }
             }
 
-            // Channel VSTs.
             for (iid, host) in hosts.iter_mut() {
                 let Some((tl, tr)) = host_scratch.get_mut(iid) else { continue };
                 for s in tl[..chunk_len].iter_mut() { *s = 0.0; }
@@ -884,7 +1065,6 @@ impl Engine {
                 }
             }
 
-            // SF2 engines.
             for (iid, eng) in sf2_engines.iter_mut() {
                 let (sl, sr) = sf2_scratch
                 .entry(*iid)
@@ -920,7 +1100,6 @@ impl Engine {
                 }
             }
 
-            // Insert chains.
             for (&insert, chain) in insert_chains.iter_mut() {
                 if chain.is_empty() { continue; }
                 if let Some(buf) = insert_scratch.get_mut(&insert) {

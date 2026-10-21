@@ -10,8 +10,9 @@
 //! the clip, carrying the clip's source offset so playback starts at the
 //! right point in the file.  Disabled (muted) channels are skipped.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
+use crate::fidelity::InsertFidelity;
 use crate::formats::flp::{Note, Project};
 
 use super::{debug_on, hex, FL_C5_KEY, MAX_NOTE_TICKS};
@@ -217,10 +218,6 @@ pub(super) fn place_notes(prj: &Project) -> (HashMap<u16, Vec<Placed>>, bool, us
         };
         used_playlist = true;
 
-        // The clip shows pattern ticks [win_start, win_end).  A length of 0
-        // is treated as "no end".
-        // FLP_NO_WINDOW=1 restores the old behaviour (play from pattern tick
-        // 0, cut at the clip length) so the two can be compared.
         let legacy = std::env::var_os("FLP_NO_WINDOW").is_some();
         let win_start = if legacy { 0 } else { item.clip_start_ticks };
         let win_end = if item.length > 0 {
@@ -255,7 +252,6 @@ pub(super) fn place_notes(prj: &Project) -> (HashMap<u16, Vec<Placed>>, bool, us
             }
 
             let mut note = n.clone();
-            // A note can't ring past the end of its clip.
             if let Some(end) = win_end {
                 note.length = note.length.min(end - n.position);
             }
@@ -364,7 +360,6 @@ pub(super) fn place_notes(prj: &Project) -> (HashMap<u16, Vec<Placed>>, bool, us
                 flags: 0,
                 group: 0,
             },
-            // The file stores -1.0 for "no trim"; clamp it to 0.
             clip_offset_ms: Some(item.start_offset_ms.max(0.0)),
                                                     clip_end_ms: Some(item.end_offset_ms),
                                                     clip_gain,
@@ -403,4 +398,74 @@ pub(super) fn end_tick_of(placed: &HashMap<u16, Vec<Placed>>, iid: u16) -> u32 {
         .max()
         .unwrap_or(0)
     })
+}
+
+// ── shim emission ──────────────────────────────────────────────────────
+//
+// Shim helpers for the FLP → trackscript conversion.  The top-level
+// `convert/flp.rs` calls `channel_shims` once the FLP parser has
+// exposed each channel's mixer insert (`Channel.insert`), then appends
+// the returned `@<ƒSlug()>` strings to each channel's call line in
+// BlockList — via `Song::write()`, which interleaves `MeasureLine.extra`
+// with `MeasureLine.calls`.
+
+/// Slug used inside `@<ƒ…>` — letters, digits, `_`, and `.`.  Matches
+/// the `.instrument` sidecar naming so `share/fallbacks.json` keys are
+/// consistent across the insert-chain and shim paths.
+pub(super) fn effect_slug(name: &str) -> String {
+    name.chars()
+    .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '.' { c } else { '_' })
+    .collect()
+}
+
+/// Hostable effects from one insert, in slot order.  Skips slots whose
+/// resolution produced no `.instrument` sidecar (unresolved / native
+/// without fallback) — those have no loadable path.
+pub(super) fn effect_slugs_for_insert(insert: &InsertFidelity) -> Vec<String> {
+    let mut slugs: Vec<(u32, String)> = insert
+    .slots
+    .iter()
+    .filter(|s| s.instrument.is_some() && !s.plugin.is_empty())
+    .map(|s| (s.slot, effect_slug(&s.plugin)))
+    .collect();
+    slugs.sort_by_key(|(s, _)| *s);
+    slugs.into_iter().map(|(_, slug)| slug).collect()
+}
+
+/// Channel iid → ordered effect slugs, based on the FLP's routing map.
+/// A channel with no insert (or an insert with no hostable effects) is
+/// omitted from the result — its calls are emitted plain.
+pub(super) fn channel_shims(
+    inserts: &BTreeMap<String, InsertFidelity>,
+    channel_to_insert: &HashMap<u16, u8>,
+) -> HashMap<u16, Vec<String>> {
+    let mut out: HashMap<u16, Vec<String>> = HashMap::new();
+    for (&channel, &insert_idx) in channel_to_insert {
+        let Some(ins) = inserts.get(&insert_idx.to_string()) else { continue };
+        let slugs = effect_slugs_for_insert(ins);
+        if !slugs.is_empty() {
+            out.insert(channel, slugs);
+        }
+    }
+    out
+}
+
+/// Format one shim as `@<ƒSlug()>` or `@<ƒSlug(α25, β5)>`.  Emitted
+/// immediately after the call, so a call becomes
+/// `ƒPart()@<ƒReverb()>;` or `ƒPart()@<ƒReverb()>@<ƒDelay()>;`.
+pub(super) fn shim_string(slug: &str, params: &[(u32, f64)]) -> String {
+    if params.is_empty() {
+        return format!("@<ƒ{}()>", slug);
+    }
+    let parts: Vec<String> = params
+    .iter()
+    .map(|(slot, val)| format!("{}{}", crate::spec::slot_to_greek(*slot), val))
+    .collect();
+    format!("@<ƒ{}({})>", slug, parts.join(", "))
+}
+
+/// Concatenate shims for one channel into a suffix the caller appends
+/// to a call: `""` for no effects, `"@<ƒReverb()>"`, or a chain.
+pub(super) fn shim_suffix(slugs: &[String]) -> String {
+    slugs.iter().map(|s| shim_string(s, &[])).collect()
 }
