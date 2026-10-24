@@ -49,7 +49,10 @@ pub fn run(argv: &[String]) -> Result<()> {
     }
 
     if scaffold {
-        let share = PathBuf::from("share");
+        let Some(repo) = crate::paths::repo_root() else {
+            bail!("--scaffold-fallbacks requires a git checkout (no Cargo.toml found)");
+        };
+        let share = repo.join("share");
         let required_path = share.join(crate::deps::census::CENSUS_FILENAME);
         let fallbacks_path = share.join(crate::deps::fallbacks::FALLBACKS_FILENAME);
         return scaffold_fallbacks(&required_path, &fallbacks_path);
@@ -176,7 +179,7 @@ pub fn run_census(argv: &[String]) -> Result<()> {
 
     let root = path.unwrap_or_else(|| PathBuf::from("."));
     let out = out.unwrap_or_else(|| {
-        PathBuf::from("share").join(crate::deps::census::CENSUS_FILENAME)
+        crate::paths::user_cache().join(crate::deps::census::CENSUS_FILENAME)
     });
 
     write_requirements(&root, &out)

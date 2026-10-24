@@ -446,6 +446,7 @@ pub(super) fn convert(
     placed: &HashMap<u16, Vec<Placed>>,
     aux_files: &mut Vec<AuxFile>,
     warnings: &mut Vec<String>,
+    project_bpm: f64,
 ) -> Result<SlicexOut, String> {
     let state = parse_state(&plugin.state).map_err(|e| format!("Slicex state parse: {e}"))?;
 
@@ -474,11 +475,62 @@ pub(super) fn convert(
     let wav = state.wav1.to_vec();
 
     let mut cues = flp_audio::wav_cue_points(&wav);
-    let pcm = sf2::read_wav_pcm(&wav)
+    let mut pcm = sf2::read_wav_pcm(&wav)
     .ok_or_else(|| "embedded WAV is not PCM 16/24/32-bit or float32".to_string())?;
     cues.retain(|&c| (c as usize) < pcm.data.len());
     if cues.is_empty() {
         return Err("embedded WAV has no cue points (no slice markers)".into());
+    }
+
+    // Slicex follows the project tempo: in FL, changing the tempo changes how
+    // fast the slices play.  The sample's own tempo is the ACID chunk's tempo
+    // when it has one.  Slicex files seen so far have acid tempo = 0 and a
+    // beat count equal to duration x 2, i.e. Slicex assumes 120 BPM for an
+    // untagged sample (SRC[loc=WAV chunk 'acid' + settings duration_x2
+    // conf=corpus]; unverified against the DLL).  Stretch the whole sample
+    // (short slices would fall into stretch.rs's pitch-changing fallback)
+    // and scale the cue points by the same factor.
+    //   FLP_SLICEX_NO_STRETCH=1        turn this off
+    //   FLP_SLICEX_SAMPLE_BPM=<bpm>    override the sample tempo
+    let acid_tempo = state.wav1_chunks.acid.as_ref().map(|a| a.tempo);
+    let acid_beats = state.wav1_chunks.acid.as_ref().map(|a| a.beats);
+    let (sample_bpm, bpm_src) = sample_bpm_for(acid_tempo);
+    if debug_on() {
+        let secs = pcm.data.len() as f64 / pcm.rate.max(1) as f64;
+        eprintln!(
+            "  stretch: acid tempo {:?}, acid beats {:?} ({:.3} s, beats-derived {:.3} bpm), \
+             using {:.3} bpm ({}), project {:.3} bpm",
+            acid_tempo,
+            acid_beats,
+            secs,
+            acid_beats.map_or(0.0, |b| b as f64 * 60.0 / secs.max(1e-9)),
+            sample_bpm,
+            bpm_src,
+            project_bpm
+        );
+    }
+    if let Some(f) = stretch_factor(sample_bpm, project_bpm) {
+        let before = pcm.data.len();
+        pcm.data = stretch_pcm(&pcm, f);
+        for c in cues.iter_mut() {
+            *c = (*c as f64 * f).round() as _;
+        }
+        let len = pcm.data.len();
+        cues.retain(|&c| (c as usize) < len);
+        warnings.push(format!(
+            "[{:2}] {}: Slicex stretched x{:.4} (sample {:.2} bpm [{}] -> project {:.2}, {} -> {} samples)",
+            chan.iid,
+            chan.name,
+            f,
+            sample_bpm,
+            bpm_src,
+            project_bpm,
+            before,
+            len
+        ));
+        if cues.is_empty() {
+            return Err("no cue points left after tempo stretch".into());
+        }
     }
 
     let all: Vec<(usize, usize)> = cues
@@ -706,6 +758,66 @@ pub(super) fn convert(
        base_key: lo_key,
        slices: n,
     })
+}
+
+/// Tempo Slicex is assumed to use for a sample that declares none.
+const SLICEX_IMPLICIT_BPM: f64 = 120.0;
+
+/// The sample's own tempo and where it came from: the env override, a sane
+/// ACID tempo, or the implicit 120 BPM.
+fn sample_bpm_for(acid_tempo: Option<f32>) -> (f64, &'static str) {
+    if let Some(v) = std::env::var("FLP_SLICEX_SAMPLE_BPM")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+    {
+        return (v, "env");
+    }
+    match acid_tempo {
+        Some(t) if t.is_finite() && (20.0..=400.0).contains(&(t as f64)) => (t as f64, "acid"),
+        _ => (SLICEX_IMPLICIT_BPM, "implicit"),
+    }
+}
+
+/// `sample_bpm / project_bpm`, or None when no stretch should happen
+/// (opted out, no usable project tempo, or the two tempos already agree).
+fn stretch_factor(sample_bpm: f64, project_bpm: f64) -> Option<f64> {
+    if std::env::var_os("FLP_SLICEX_NO_STRETCH").is_some() {
+        return None;
+    }
+    if !sample_bpm.is_finite() || sample_bpm <= 0.0 {
+        return None;
+    }
+    if !project_bpm.is_finite() || project_bpm <= 0.0 {
+        return None;
+    }
+    let f = sample_bpm / project_bpm;
+    if (f - 1.0).abs() < 0.002 {
+        None
+    } else {
+        Some(f)
+    }
+}
+
+/// Stretch mono PCM by `factor` (output is `factor` times as long).
+/// Default is pitch-preserving WSOLA; FLP_SLICEX_STRETCH_MODE=resample
+/// does a plain rate change instead (pitch moves with the tempo).
+fn stretch_pcm(pcm: &sf2::Pcm, factor: f64) -> Vec<i16> {
+    let x: Vec<f32> = pcm.data.iter().map(|&v| v as f32 / 32768.0).collect();
+    let resample = std::env::var("FLP_SLICEX_STRETCH_MODE")
+        .map_or(false, |m| m.trim().eq_ignore_ascii_case("resample"));
+    let out = if resample {
+        let out_len = (x.len() as f64 * factor).round() as usize;
+        crate::player::stretch::linear(&[&x], out_len)
+    } else {
+        crate::player::stretch::stretch(&[&x], factor, pcm.rate as f64)
+    };
+    out.into_iter()
+        .next()
+        .unwrap_or_default()
+        .iter()
+        .map(|&v| (v * 32768.0).round().clamp(-32768.0, 32767.0) as i16)
+        .collect()
 }
 
 /// Highest key Slicex maps slices upward to (D#8 in FL naming).  Slices

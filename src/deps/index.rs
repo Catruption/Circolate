@@ -32,13 +32,6 @@ impl PluginIndex {
         PluginIndex { vst3, lv2, clap, vst2 }
     }
 
-    /// Match a plugin by file stem, ignoring extension and case.
-    /// Searches VST3, then VST2, then LV2, then CLAP.
-    ///
-    /// The FLP only carries a Windows path like
-    /// `C:\...\magical8bitPlug3.dll`; the actual binary on this machine
-    /// could be a `.vst3` bundle, a `.so`, or anything else.  All we can
-    /// trust is the stem, so that is what we match on.
     pub fn find_any(&self, name: &str) -> Option<&PathBuf> {
         find_in(&self.vst3, name)
         .or_else(|| find_in(&self.vst2, name))
@@ -46,7 +39,6 @@ impl PluginIndex {
         .or_else(|| find_in(&self.clap, name))
     }
 
-    /// Kept for callers that specifically want a VST3.
     pub fn find_vst3(&self, name: &str) -> Option<&PathBuf> {
         find_in(&self.vst3, name)
     }
@@ -56,8 +48,6 @@ impl PluginIndex {
     }
 }
 
-/// Exact stem match (case-insensitive) first, then normalized comparison
-/// (strip " #N", lowercase, drop non-alphanumerics).
 fn find_in<'a>(list: &'a [PathBuf], name: &str) -> Option<&'a PathBuf> {
     if name.is_empty() {
         return None;
@@ -131,14 +121,17 @@ fn print_group(label: &str, items: &[PathBuf]) {
 fn search_paths() -> Vec<PathBuf> {
     let mut v = Vec::new();
 
-    v.push(PathBuf::from("plugins"));
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            v.push(dir.join("plugins"));
-            v.push(dir.join("../../plugins"));
-        }
+    // 1. User data (downloaded plugins)
+    let ud = crate::paths::user_data().join("plugins");
+    if ud.is_dir() { v.push(ud); }
+
+    // 2. Repo checkout (dev fallback)
+    if let Some(repo) = crate::paths::repo_root() {
+        let repo_plugins = repo.join("plugins");
+        if repo_plugins.is_dir() { v.push(repo_plugins); }
     }
 
+    // 3. Standard user directories
     if let Ok(home) = std::env::var("HOME") {
         let home = PathBuf::from(home);
         v.push(home.join(".vst3"));
@@ -147,6 +140,7 @@ fn search_paths() -> Vec<PathBuf> {
         v.push(home.join(".clap"));
     }
 
+    // 4. System directories
     for p in [
         "/usr/lib/vst3", "/usr/local/lib/vst3",
         "/usr/lib/vst",  "/usr/local/lib/vst",
@@ -169,9 +163,6 @@ fn scan(
     scan_depth(root, 0, 4, vst3, lv2, clap, vst2);
 }
 
-/// True when `dir` (the parent directory of a candidate VST2 binary)
-/// sits inside a `vst` or `.vst` tree.  Guards against collecting every
-/// `.so` on the system as a plugin.
 fn in_vst_tree(dir: &Path) -> bool {
     dir.components().any(|c| {
         let s = c.as_os_str().to_string_lossy();
@@ -207,10 +198,6 @@ fn scan_depth(
             ("vst3", false) => { vst3.push(p); continue; }
             ("lv2", true)   => { lv2.push(p);  continue; }
             ("clap", false) => { clap.push(p); continue; }
-            // VST2: `.so` on Linux, `.dll` on Windows.  Only accept
-            // them under a `vst` / `.vst` path component so a random
-            // shared library elsewhere on the scan root isn't
-            // mistaken for a plugin.
             ("so", false) | ("dll", false) => {
                 if in_vst_tree(dir) {
                     vst2.push(p);

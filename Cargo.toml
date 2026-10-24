@@ -1,7 +1,13 @@
 [package]
-name = "trackscript-player"
+name = "circolate"
 version = "0.1.0"
 edition = "2024"
+description = "Trackscript player and FL Studio/tracker converter"
+repository = "https://github.com/yourusername/circolate"
+license = "GPL-3.0-or-later"
+readme = "README.md"
+keywords = ["audio", "music", "tracker", "fl-studio"]
+categories = ["multimedia::audio"]
 
 [dependencies]
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }

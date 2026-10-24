@@ -102,7 +102,7 @@ pub fn run(argv: &[String]) -> Result<()> {
     // Case 3: --all — walk the registries, measure every referenced plugin.
     if all {
         let out = out.unwrap_or_else(|| {
-            PathBuf::from("share").join(INVENTORY_FILENAME)
+            crate::paths::user_cache().join(INVENTORY_FILENAME)
         });
         return measure_and_write(&index, &out);
     }
@@ -186,7 +186,7 @@ fn gather_names() -> Vec<String> {
 
     let mut set: BTreeSet<String> = BTreeSet::new();
 
-    let fb_path = PathBuf::from("share").join(FALLBACKS_FILENAME);
+    let fb_path = crate::paths::system_data().join(FALLBACKS_FILENAME);
     if let Some(fb) = FallbacksTable::load(&fb_path) {
         for chain in fb.instruments.values() {
             for c in chain {

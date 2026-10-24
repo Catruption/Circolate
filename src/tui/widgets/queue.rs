@@ -16,6 +16,10 @@
 //!                      │[9]song…   │
 //!                      └───────────┘
 //! ```
+//!
+//! The last row of `tracker` may belong to the spiral's tape (`tape_rows`).
+//! The box still reaches down to it, but the tracker frame's bottom border
+//! is one row higher, so the left wall stops there and turns into the frame.
 
 use ratatui::{
     buffer::Buffer,
@@ -28,12 +32,15 @@ use crate::tui::state::{
 };
 use crate::tui::theme::{Theme, Token};
 
+/// `tracker` is the whole area including the tape row(s) at its bottom;
+/// `tape_rows` is how many of those bottom rows are the spiral's tape (0 or 1).
 pub fn render(
     state: &QueueState,
     tracker: Rect,
     buf: &mut Buffer,
     theme: &Theme,
     spiral_size: (u16, u16),
+              tape_rows: u16,
 ) -> Option<Placed> {
     let sw = spiral_size.0.max(1);
     let sh = spiral_size.1.max(1).min(NOTCH_H - 1);
@@ -44,10 +51,13 @@ pub fn render(
     }
     let set = theme.border_set();
     let edge = Style::default()
-        .fg(buf.cell((tracker.x, tracker.y)).map_or(ratatui::style::Color::Reset, |c| c.fg));
+    .fg(buf.cell((tracker.x, tracker.y)).map_or(ratatui::style::Color::Reset, |c| c.fg));
 
     let right = tracker.right() - 1;
+    // Last row of the area: the spiral's tape when `tape_rows > 0`.
     let bottom = tracker.bottom() - 1;
+    // Row of the tracker frame's bottom border, where the left wall ends.
+    let frame_bottom = bottom - tape_rows;
     let nx = right + 1 - nw;
     let ny = tracker.bottom() - NOTCH_H;
     let sx = nx + 1;       // spiral starts here
@@ -59,20 +69,21 @@ pub fn render(
     blank(
         buf,
         Rect::new(bx, ny + 1, BUF_W, NOTCH_H - 1),
-        theme.color(Token::QueueBg),
+          theme.color(Token::QueueBg),
     );
     clear_keep_bg(buf, Rect::new(sx, ny + 1, sw, NOTCH_H - 1));
 
-    // Tracker frame, rerouted around the notch.
+    // Tracker frame, rerouted around the notch.  The left wall stops at the
+    // frame's bottom border row; the tape runs on the row below it.
     put(buf, right, ny, set.bottom_right, edge);
     for x in nx + 1..right {
         put(buf, x, ny, set.horizontal_top, edge);
     }
     put(buf, nx, ny, set.top_left, edge);
-    for y in ny + 1..bottom {
+    for y in ny + 1..frame_bottom {
         put(buf, nx, y, set.vertical_left, edge);
     }
-    put(buf, nx, bottom, set.bottom_right, edge);
+    put(buf, nx, frame_bottom, set.bottom_right, edge);
 
     // Transport buttons: right-aligned inside the buffer's horizontal
     // span, at the row just below the notch's top edge.
@@ -81,8 +92,8 @@ pub fn render(
     let tx = right - 3 - lw;
     let ty = ny + 1;
     let on = Style::default()
-        .fg(theme.color(Token::QueueTransportActive))
-        .add_modifier(ratatui::style::Modifier::BOLD);
+    .fg(theme.color(Token::QueueTransportActive))
+    .add_modifier(ratatui::style::Modifier::BOLD);
     let off = Style::default().fg(theme.color(Token::QueueTransportIdle));
     put(buf, tx, ty, "◀", if state.direction == '◀' { on } else { off });
     put(buf, tx + 2, ty, "▶", if state.direction == '▶' { on } else { off });
@@ -96,11 +107,11 @@ pub fn render(
     let counter_dim = Style::default().fg(theme.color(Token::QueueCounterDim));
     let queue_text = Style::default().fg(theme.color(Token::QueueText));
     let queue_playing = Style::default()
-        .fg(theme.color(Token::QueuePlaying))
-        .add_modifier(ratatui::style::Modifier::BOLD);
+    .fg(theme.color(Token::QueuePlaying))
+    .add_modifier(ratatui::style::Modifier::BOLD);
     let cursor = Style::default()
-        .fg(theme.color(Token::QueueCursorFg))
-        .bg(theme.color(Token::QueueCursorBg));
+    .fg(theme.color(Token::QueueCursorFg))
+    .bg(theme.color(Token::QueueCursorBg));
 
     for i in 0..VISIBLE_LINES {
         let idx = first + i;
@@ -124,12 +135,13 @@ pub fn render(
 
     Some(Placed {
         notch: Rect::new(nx, ny, nw, NOTCH_H),
-        // Spiral is bottom-aligned within the notch's left side.
-        spiral: Rect::new(sx, bottom + 1 - sh, sw, sh),
-        rewind: Rect::new(tx, ty, 2, 1),
-        play: Rect::new(tx + 2, ty, 1 + lw, 1),
-        lines: Rect::new(bx, lines_y, BUF_W, VISIBLE_LINES as u16),
-        first_line: first,
+         // Spiral is bottom-aligned within the notch's left side, on the
+         // tape's row.
+         spiral: Rect::new(sx, bottom + 1 - sh, sw, sh),
+         rewind: Rect::new(tx, ty, 2, 1),
+         play: Rect::new(tx + 2, ty, 1 + lw, 1),
+         lines: Rect::new(bx, lines_y, BUF_W, VISIBLE_LINES as u16),
+         first_line: first,
     })
 }
 

@@ -4,7 +4,7 @@
 /// Stretch `chans` (equal-length channels at `sr` Hz) so the result is
 /// `factor` times as long: `factor = sample_bpm / song_bpm`.  Pitch is kept.
 /// Alignment is chosen on the channel mix so stereo images stay coherent.
-pub(super) fn stretch(chans: &[&[f32]], factor: f64, sr: f64) -> Vec<Vec<f32>> {
+pub(crate) fn stretch(chans: &[&[f32]], factor: f64, sr: f64) -> Vec<Vec<f32>> {
     let nch = chans.len();
     let n_in = chans.first().map_or(0, |c| c.len());
     let out_len = (n_in as f64 * factor).round() as usize;
@@ -92,7 +92,7 @@ pub(super) fn stretch(chans: &[&[f32]], factor: f64, sr: f64) -> Vec<Vec<f32>> {
 }
 
 /// Fallback for very short samples: plain resample (pitch changes).
-fn linear(chans: &[&[f32]], out_len: usize) -> Vec<Vec<f32>> {
+pub(crate) fn linear(chans: &[&[f32]], out_len: usize) -> Vec<Vec<f32>> {
     chans
     .iter()
     .map(|c| {

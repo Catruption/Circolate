@@ -2,12 +2,13 @@
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::asset::{AssetSource, DirSource, ENTRY_KEY};
 use crate::audio_decode::decode_audio;
+use crate::deps::index::PluginIndex;
 use crate::fidelity::{Fidelity, FIDELITY_FILENAME};
 use crate::deps::requires::{self, Requires};
 use crate::formats::trackscript::{
@@ -16,6 +17,7 @@ use crate::formats::trackscript::{
 use crate::timing::TempoMap;
 
 use super::cache::{fingerprint, hash_part};
+use super::inserts::{self, ProjectInsertChain};
 use super::lines::{resolve_line, tempo_shims_to_events, LineCall, LineInfo};
 use super::types::{
     build_sf2_instrument, MultiSampleInstrument, Sf2EngineSpec, Sf2Instrument,
@@ -35,13 +37,7 @@ const FALLBACK_VST_TRIM: f32 = 0.7;
 // ── cover image ────────────────────────────────────────────────────────
 
 fn cover_cache_dir() -> PathBuf {
-    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
-        return PathBuf::from(xdg).join("circolate").join("covers");
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".cache").join("circolate").join("covers");
-    }
-    std::env::temp_dir().join("circolate-covers")
+    crate::paths::user_cache().join("covers")
 }
 
 fn find_cover_path(source: &dyn AssetSource) -> Option<PathBuf> {
@@ -84,20 +80,8 @@ fn find_cover_path(source: &dyn AssetSource) -> Option<PathBuf> {
 }
 
 fn fallback_cover_dir() -> Option<PathBuf> {
-    let rel = Path::new("share").join("cover");
-    if rel.is_dir() {
-        return Some(rel);
-    }
-    let exe = std::env::current_exe().ok()?;
-    let mut d = exe.parent().map(Path::to_path_buf);
-    while let Some(p) = d {
-        let candidate = p.join("share").join("cover");
-        if candidate.is_dir() {
-            return Some(candidate);
-        }
-        d = p.parent().map(Path::to_path_buf);
-    }
-    None
+    let dir = crate::paths::system_data().join("cover");
+    if dir.is_dir() { Some(dir) } else { None }
 }
 
 fn fallback_cover_path(source: &dyn AssetSource) -> Option<PathBuf> {
@@ -122,13 +106,7 @@ fn fallback_cover_path(source: &dyn AssetSource) -> Option<PathBuf> {
 // ── embedded plugin cache ──────────────────────────────────────────────
 
 fn plugins_cache_dir() -> PathBuf {
-    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
-        return PathBuf::from(xdg).join("circolate").join("plugins");
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".cache").join("circolate").join("plugins");
-    }
-    std::env::temp_dir().join("circolate-plugins")
+    crate::paths::user_cache().join("plugins")
 }
 
 fn extract_embedded_plugins(
@@ -172,13 +150,7 @@ fn extract_embedded_plugins(
 // ── SF2 cache ──────────────────────────────────────────────────────────
 
 fn sf2_cache_dir() -> PathBuf {
-    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
-        return PathBuf::from(xdg).join("circolate").join("sf2");
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".cache").join("circolate").join("sf2");
-    }
-    std::env::temp_dir().join("circolate-sf2")
+    crate::paths::user_cache().join("sf2")
 }
 
 fn materialize_sf2_file(source: &dyn AssetSource, rel: &str) -> Result<Option<PathBuf>> {
@@ -305,10 +277,9 @@ pub(crate) struct Project {
     pub(crate) time_signature: (u32, u32),
     pub(crate) voice_count: usize,
     pub(crate) requires: Option<Requires>,
-    /// Parsed `@<...>` shim events.  Each `line` field indexes
-    /// `Project.lines`; the player resolves `target` via
-    /// `share/fallbacks.json` and installs a VST3 host per shim.
     pub(crate) shims: Vec<ShimEvent>,
+    pub(crate) chains: BTreeMap<u8, ProjectInsertChain>,
+    pub(crate) channel_to_insert: BTreeMap<u16, u8>,
 }
 
 impl Project {
@@ -344,6 +315,8 @@ impl Project {
             voice_count: 0,
             requires: None,
             shims: Vec::new(),
+            chains: BTreeMap::new(),
+            channel_to_insert: BTreeMap::new(),
         }
     }
 
@@ -382,12 +355,113 @@ impl Project {
         None
     }
 
+    /// Walk part path → iid → insert bus → chain.  Returns `None` when
+    /// the part has no chain or when `routing.json` was absent (the
+    /// current converter doesn't emit it, so this is mostly `None` today).
+    ///
+    /// The **inline shim chains** that appear in every trackscript
+    /// (`ƒpianoer(2)@<ƒFruity_Limiter()>@…`) are a separate data path —
+    /// see `shims_for_line_path`.  `chain_for_part` is for the
+    /// future `inserts/` sidecar format, which isn't emitted yet.
+    pub(crate) fn chain_for_part(&self, part_path: &str) -> Option<&ProjectInsertChain> {
+        let iid = if let Some(inst) = self.vst_instruments.get(part_path) {
+            inst.iid
+        } else if let Some(spec) = self.sf2_engine_specs.get(part_path) {
+            spec.iid
+        } else {
+            return None;
+        };
+        let bus = self.channel_to_insert.get(&iid)?;
+        self.chains.get(bus)
+    }
+
+    /// Inline shims attached to the given part path on the given
+    /// BlockList line.  Filters out `Tempo` (those become tempo events,
+    /// not display data) and dedupes by target name so `ƒFruity_Limiter()`
+    /// appears once even if the same shim is duplicated across multiple
+    /// LineCalls of the same part.
+    ///
+    /// This is the visual data source.  `p.shims` holds the parsed
+    /// `@<ƒTarget()>` events; `attached_call` is an index into the
+    /// BlockList line's `calls`, which `LineCall.call_index` matches.
+    pub(crate) fn shims_for_line_path(
+        &self,
+        li: usize,
+        path: &str,
+    ) -> Vec<&ShimEvent> {
+        let debug = std::env::var_os("SHIMS_DEBUG").is_some();
+        let Some(line) = self.lines.get(li) else {
+            if debug { eprintln!("shims: no line {li}"); }
+            return Vec::new();
+        };
+        let call_indices: Vec<usize> = line
+        .parts
+        .iter()
+        .filter(|c| {
+            self.parts
+            .get(&c.name)
+            .map(|p| p.sample_path.as_str())
+            == Some(path)
+        })
+        .map(|c| c.call_index)
+        .collect();
+        if debug {
+            eprintln!(
+                "shims: li={} path={:?} calls={:?} call_indices={:?}",
+                li, path,
+                line.parts.iter().map(|c| (c.name.as_str(), c.call_index)).collect::<Vec<_>>(),
+                      call_indices,
+            );
+        }
+        if call_indices.is_empty() {
+            return Vec::new();
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        let out: Vec<&ShimEvent> = self
+        .shims
+        .iter()
+        .filter(|s| s.line == li)
+        .filter(|s| s.target != "Tempo")
+        .filter(|s| {
+            s.attached_call
+            .map_or(false, |ci| call_indices.contains(&ci))
+        })
+        .filter(|s| seen.insert(s.target.clone()))
+        .collect();
+        if debug {
+            eprintln!(
+                "shims: {} match(es) on line {}: {:?}",
+                      out.len(),
+                      li,
+                      out.iter().map(|s| s.target.as_str()).collect::<Vec<_>>(),
+            );
+        }
+        out
+    }
+
     pub(crate) fn cover_path(&self) -> Option<&Path> {
         self.cover_path.as_deref()
     }
 
     pub(crate) fn part_path(&self, name: &str) -> Option<&str> {
         self.parts.get(name).map(|p| p.sample_path.as_str())
+    }
+
+    pub(crate) fn part_supports_volume(&self, part_path: &str) -> bool {
+        if self.path_to_id.get(part_path)
+            .map(|id| self.samples.contains_key(id))
+            .unwrap_or(false)
+            {
+                return true;
+            }
+            if self.vst_instruments.contains_key(part_path) {
+                return true;
+            }
+            if self.sf2_engine_specs.contains_key(part_path) {
+                return true;
+            }
+            false
     }
 
     pub(crate) fn total_secs(&self) -> f64 {
@@ -599,6 +673,7 @@ pub(crate) fn load_project_from_source(
     let mut sf2_engine_specs: HashMap<String, Sf2EngineSpec> = HashMap::new();
     let mut vst_instruments: HashMap<String, Arc<VstInstrument>> = HashMap::new();
     let mut next_sf2_id: u32 = 10_000;
+    let mut vst_index: Option<PluginIndex> = None;
 
     for entry in source.list("instruments", Some("instrument")) {
         let rel = if entry.starts_with("instruments/") || entry.starts_with("./instruments/") {
@@ -681,24 +756,32 @@ pub(crate) fn load_project_from_source(
                 },
             );
         } else if inst.is_vst3() {
-            if inst.unresolved || inst.vst_path.is_empty() {
+            if inst.unresolved {
                 continue;
             }
 
-            let embedded = embedded_plugins.get(&inst.plugin).cloned();
-            let plugin_path = embedded
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(&inst.vst_path));
+            let plugin_path = embedded_plugins
+            .get(&inst.plugin)
+            .cloned()
+            .filter(|p| p.exists())
+            .or_else(|| {
+                let recorded = PathBuf::from(&inst.vst_path);
+                if recorded.exists() { Some(recorded) } else { None }
+            })
+            .or_else(|| {
+                let idx = vst_index.get_or_insert_with(PluginIndex::scan);
+                idx.find_vst3(&inst.plugin).cloned()
+            });
 
-            if !plugin_path.exists() {
+            let Some(plugin_path) = plugin_path else {
                 if !quiet {
                     eprintln!(
-                        "  (VST sidecar points at missing file: {})",
-                              plugin_path.display()
+                        "  (VST {:?} not installed, skipping; sidecar {})",
+                              inst.plugin, sidecar_rel
                     );
                 }
                 continue;
-            }
+            };
 
             let mut state_bytes = if inst.state_path.as_os_str().is_empty() {
                 Vec::new()
@@ -781,6 +864,16 @@ pub(crate) fn load_project_from_source(
         },
         None => None,
     };
+
+    let (chains, channel_to_insert) = inserts::load_chain_metadata(source);
+    if !quiet && !chains.is_empty() {
+        let total: usize = chains.values().map(|c| c.slots.len()).sum();
+        println!(
+            "  loaded {} insert chain(s), {} slot(s) total",
+                 chains.len(),
+                 total
+        );
+    }
 
     let sr = sample_rate as f64;
     let rows_per_measure = cfg.time_signature.0 as f64 * cfg.subdivisions.max(1) as f64;
@@ -921,6 +1014,8 @@ pub(crate) fn load_project_from_source(
         fidelity,
         requires,
         shims: parsed.shims,
+        chains,
+        channel_to_insert,
     };
     Ok((Arc::new(project), cache))
 }

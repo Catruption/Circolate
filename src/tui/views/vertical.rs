@@ -5,23 +5,16 @@
 //! glyph, one or more event lines in source syntax, a multi-row braille
 //! waveform of the part's sample at full width, then a blank gap.
 //!
-//! Nothing is time-aligned.  The horizontal view splits parts into
-//! separate columns so they can be compared beat-by-beat; this view
-//! doesn't need that, because you read one part at a time.
-//!
-//! Waveform height is greedy: leftover vertical space is split evenly
-//! between parts, clamped to `min_wave_rows`.
-//!
-//! Each sample-based part's waveform carries a *sample-position*
-//! playhead — a marker at the column corresponding to the sample
-//! offset currently being played back, tracked in `state.playheads`
-//! and shared with the horizontal view.  VST parts get no marker, since
-//! a live scope is a rolling window of recent audio with no fixed left
-//! edge to index into.
+//! When the part has inline shims (`ƒpianoer(2)@<ƒFruity_Limiter()>@…`)
+//! the label line ends in `@`.  When `state.expanded_chains` contains its
+//! path the marker becomes `↦` directly after the name and the effects
+//! follow inline as `<ƒTarget()>` cells (`;` after the last), wrapping onto
+//! extra rows when they don't fit.  Shims are looked up on the BlockList
+//! line each source call came from, so carried-over notes keep their chain.
 
 use ratatui::{
     layout::Rect,
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
     Frame,
@@ -30,7 +23,7 @@ use ratatui::{
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 
-use crate::mixer::mute;
+use crate::mixer::{mute, part_volume};
 use crate::player::envelope::wrapped_pos;
 use crate::player::notes::{split_notes, value_at, DisplayNote};
 use crate::player::scope::scope_snapshot;
@@ -44,8 +37,6 @@ use crate::tui::state::{RenderState, VerticalHit, VerticalRow};
 use crate::tui::theme::{Theme, Token};
 
 const PLAYHEAD_LOOKAHEAD_SECS: f64 = 0.05;
-
-// ── formatting ─────────────────────────────────────────────────────────
 
 fn fmt_pos(row: f64, subs: u32) -> String {
     let subs_f = subs.max(1) as f64;
@@ -71,26 +62,22 @@ fn format_event(dn: &DisplayNote, subs: u32) -> String {
     format!("<{}>", parts.join(","))
 }
 
-// ── per-part layout ────────────────────────────────────────────────────
-
 struct PartBlock {
     path: String,
     first_name: String,
     label_spans: Vec<Span<'static>>,
     event_lines: Vec<EventLine>,
     col_off: bool,
-    /// Column of the sample-position playhead, or `None` when there's
-    /// nothing to track.  Only sample-backed parts get a column; VSTs
-    /// return `None` because a live scope has no fixed sample to index.
     playhead_col: Option<usize>,
+    has_chain: bool,
+    marker_x: Option<(u16, u16)>,
+    extra_rows: Vec<Vec<Span<'static>>>,
 }
 
 struct EventLine {
     line: Line<'static>,
     first_note: Option<(usize, i64)>,
 }
-
-// ── main entry ─────────────────────────────────────────────────────────
 
 pub fn draw(
     f: &mut Frame<'_>,
@@ -218,7 +205,6 @@ pub fn draw(
     let muted_parts = &snap.muted_parts;
     let soloed_part = snap.soloed_part.as_deref();
 
-    // ── pass 1: build each part's block ───────────────────────────
     let mut blocks: Vec<PartBlock> = Vec::with_capacity(path_order.len());
 
     for path in &path_order {
@@ -276,8 +262,6 @@ pub fn draw(
                     (0.0, 0.0)
                 };
 
-                // If the note started in a previous measure, clamp its visual start to 0
-                // so we don't print negative positions like `<§-1/1, ...>`.
                 if !is_current {
                     note.start_row = 0.0;
                 }
@@ -321,15 +305,6 @@ pub fn draw(
             }
         }
 
-        // Sample-position playhead for this part.  Mirrors the logic in
-        // `views/horizontal.rs`: the identity tuple detects a "different
-        // note started" transition and re-anchors the playhead; between
-        // anchors, the position advances by the audio delta scaled by
-        // the sample's own rate and the current pitch ratio.
-        //
-        // VST parts get no marker: a live scope is a rolling window of
-        // recent audio, not a bounded sample, so there's no position to
-        // point at.
         let playhead_col: Option<usize> = {
             let active = staged.iter().find(|st| {
                 st.dn.display_end > 0.0
@@ -406,11 +381,129 @@ pub fn draw(
         .line_block_title(li, &first_name)
         .unwrap_or(&first_name)
         .to_string();
-        if label.chars().count() > inner_w {
-            label = label.chars().take(inner_w.saturating_sub(1)).collect();
-            label.push('…');
+
+        // Inline shim chain.  Look on the BlockList line each source call
+        // came from (current line first, then lookback lines), so a part
+        // carried over from an earlier line still shows its chain.
+        let shim_names: Vec<String> = sources
+        .iter()
+        .map(|(_, off, _, _)| li.saturating_sub((off / rpmeasure).round() as usize))
+        .map(|l| p.shims_for_line_path(l, path))
+        .find(|v| !v.is_empty())
+        .map(|v| v.iter().map(|sh| sh.target.clone()).collect())
+        .unwrap_or_default();
+        let has_chain = !shim_names.is_empty();
+        let expanded = state.expanded_chains.contains(path.as_str());
+        let marker_chars = if has_chain { 1 } else { 0 };
+
+        let vol = part_volume::get(path);
+        let show_vol = p.part_supports_volume(path);
+        let vol_tag = if show_vol && (vol - 1.0).abs() > 0.01 {
+            format!(" {}%", (vol * 100.0).round() as i64)
+        } else {
+            String::new()
+        };
+        let tag_chars = vol_tag.chars().count();
+        let avail = inner_w.saturating_sub(tag_chars + marker_chars);
+
+        if label.chars().count() > avail {
+            if avail > 1 {
+                label = label.chars().take(avail - 1).collect();
+                label.push('…');
+            } else {
+                label = label.chars().take(avail).collect();
+            }
         }
-        let label_spans = label::split(&label, label_base, &theme, &labels_cfg, block_playing);
+
+        // Parts with a chain keep the marker right after the name, so the
+        // label isn't padded out to the right edge in that case.
+        let fill = if has_chain {
+            label.chars().count().min(avail)
+        } else {
+            avail
+        };
+        let padded = format!("{:<width$}", label, width = fill);
+        let mut label_len = 0usize;
+        let mut label_spans: Vec<Span<'static>> = Vec::new();
+        for span in label::split(&padded, label_base, &theme, &labels_cfg, block_playing) {
+            let sw = span.content.chars().count();
+            if label_len + sw <= fill {
+                label_len += sw;
+                label_spans.push(span);
+            } else {
+                let take = fill.saturating_sub(label_len);
+                if take > 0 {
+                    let s: String = span.content.chars().take(take).collect();
+                    label_spans.push(Span::styled(s, span.style));
+                    label_len = fill;
+                }
+                break;
+            }
+        }
+        while label_len < fill {
+            label_spans.push(Span::raw(" "));
+            label_len += 1;
+        }
+        if !vol_tag.is_empty() {
+            label_spans.push(Span::styled(vol_tag, label_base.add_modifier(Modifier::DIM)));
+        }
+        let marker_x = if has_chain {
+            let mx = (fill + tag_chars) as u16;
+            Some((mx, mx + 1))
+        } else {
+            None
+        };
+        let mut extra_rows: Vec<Vec<Span<'static>>> = Vec::new();
+        if has_chain {
+            let marker = if expanded { "↦" } else { "@" };
+            label_spans.push(Span::styled(
+                marker,
+                Style::default()
+                .fg(ratatui::style::Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+            ));
+            if expanded {
+                let disabled = state.disabled_chains.contains(path.as_str());
+                let chain_style = if col_off || disabled {
+                    Style::default()
+                    .fg(theme.color(Token::MutedFg))
+                    .bg(theme.color(Token::MutedBg))
+                } else {
+                    Style::default().fg(theme.color(Token::BlockInstance))
+                };
+                let n = shim_names.len();
+                let mut used = fill + tag_chars + 1;
+                let mut cur: Vec<Span<'static>> = Vec::new();
+                let mut on_label_row = true;
+                let mut placed = 0usize;
+                for (i, name) in shim_names.iter().enumerate() {
+                    let term = if i + 1 == n { ";" } else { "" };
+                    let text = format!("<ƒ{}()>{}", name, term);
+                    let w = text.chars().count();
+                    let mut lead = if on_label_row || placed > 0 { 1 } else { 0 };
+                    if used + lead + w > inner_w && (placed > 0 || on_label_row) {
+                        if !on_label_row {
+                            extra_rows.push(std::mem::take(&mut cur));
+                        }
+                        on_label_row = false;
+                        used = 0;
+                        placed = 0;
+                        lead = 0;
+                    }
+                    let target: &mut Vec<Span<'static>> =
+                    if on_label_row { &mut label_spans } else { &mut cur };
+                    if lead > 0 {
+                        target.push(Span::raw(" "));
+                    }
+                    target.push(Span::styled(text, chain_style));
+                    used += lead + w;
+                    placed += 1;
+                }
+                if !on_label_row && !cur.is_empty() {
+                    extra_rows.push(cur);
+                }
+            }
+        }
 
         staged.sort_by(|a, b| {
             a.dn.note
@@ -469,6 +562,9 @@ pub fn draw(
                     event_lines,
                     col_off,
                     playhead_col,
+                    has_chain,
+                    marker_x,
+                    extra_rows,
         });
     }
 
@@ -476,7 +572,9 @@ pub fn draw(
     let mut total_fixed = 0usize;
     let mut included = 0usize;
     for (i, b) in blocks.iter().enumerate() {
+        let shim_rows = b.extra_rows.len();
         let this_fixed = 1
+        + shim_rows
         + b.event_lines.len()
         + if i > 0 { part_gap } else { 0 };
         let projected =
@@ -499,12 +597,23 @@ pub fn draw(
     let mut y: u16 = 0;
 
     for (i, block) in blocks.iter().enumerate() {
+        let marker_x = block.marker_x;
+
         if y < inner_h as u16 {
             lines.push(Line::from(block.label_spans.clone()));
             hit_rows.push((
                 y,
-                VerticalRow::Label { path: block.path.clone() },
+                VerticalRow::Label {
+                    path: block.path.clone(),
+                           marker_x,
+                },
             ));
+            y += 1;
+        }
+
+        for row in &block.extra_rows {
+            if y >= inner_h as u16 { break; }
+            lines.push(Line::from(row.clone()));
             y += 1;
         }
 

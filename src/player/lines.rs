@@ -15,6 +15,10 @@ pub(crate) struct LineCall {
     pub pattern_measure_len: f64,
     pub line_offset: f64,
     pub overrides: Option<CallOverrides>,
+    /// Index of the originating `BlockCall` in the BlockList line.
+    /// Used by views to look up call-attached shims via
+    /// `Project::shims_for_line_path`.
+    pub call_index: usize,
 }
 
 pub(crate) struct LineInfo {
@@ -23,7 +27,6 @@ pub(crate) struct LineInfo {
     pub min_start: i64,
     pub max_end: i64,
 }
-
 
 fn format_block_title(call: &BlockCall) -> String {
     let mut title = format!("ƒ{}(", call.name);
@@ -68,10 +71,10 @@ pub(crate) fn tempo_shims_to_events(
     rows_per_measure: f64,
 ) -> Vec<(f64, f64, f64)> {
     let mut ordered: Vec<(f64, &ShimEvent)> = shims
-        .iter()
-        .filter(|s| s.target == "Tempo")
-        .map(|s| (s.line as f64 * rows_per_measure + s.row, s))
-        .collect();
+    .iter()
+    .filter(|s| s.target == "Tempo")
+    .map(|s| (s.line as f64 * rows_per_measure + s.row, s))
+    .collect();
     ordered.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut out: Vec<(f64, f64, f64)> = Vec::new();
@@ -113,11 +116,12 @@ fn resolve_call(
     blocks: &HashMap<String, Vec<String>>,
     parts: &HashMap<String, TrackscriptPart>,
     rows_per_measure: f64,
+    call_index: usize,
 ) -> Vec<LineCall> {
     let part_names: Vec<String> = blocks
-        .get(&call.name)
-        .cloned()
-        .unwrap_or_else(|| vec![call.name.clone()]);
+    .get(&call.name)
+    .cloned()
+    .unwrap_or_else(|| vec![call.name.clone()]);
 
     let mut out: Vec<LineCall> = Vec::new();
 
@@ -134,9 +138,9 @@ fn resolve_call(
             (0..sections.len()).map(|m| (m, None)).collect()
         } else {
             call.selections
-                .iter()
-                .map(|s| (s.measure, s.overrides.clone()))
-                .collect()
+            .iter()
+            .map(|s| (s.measure, s.overrides.clone()))
+            .collect()
         };
 
         let mut offset = 0.0;
@@ -148,11 +152,12 @@ fn resolve_call(
             let measure_len = sections[m_idx];
             out.push(LineCall {
                 block_title: format_block_title(call),
-                name: name.clone(),
-                pattern_measure_start: measure_start,
-                pattern_measure_len: measure_len,
-                line_offset: offset,
-                overrides,
+                     name: name.clone(),
+                     pattern_measure_start: measure_start,
+                     pattern_measure_len: measure_len,
+                     line_offset: offset,
+                     overrides,
+                     call_index,
             });
             offset += measure_len;
         }
@@ -169,11 +174,12 @@ fn resolve_call(
                 let measure_start: f64 = sections[..m_idx].iter().sum();
                 out.push(LineCall {
                     block_title: format_block_title(call),
-                    name: name.clone(),
-                    pattern_measure_start: measure_start,
-                    pattern_measure_len: *measure_len,
-                    line_offset: offset,
-                    overrides: None,
+                         name: name.clone(),
+                         pattern_measure_start: measure_start,
+                         pattern_measure_len: *measure_len,
+                         line_offset: offset,
+                         overrides: None,
+                         call_index,
                 });
                 offset += measure_len;
             }
@@ -192,8 +198,8 @@ pub(crate) fn resolve_line(
     let mut calls: Vec<LineCall> = Vec::new();
     let mut duration: f64 = rows_per_measure;
 
-    for call in line {
-        let this_call = resolve_call(call, blocks, parts, rows_per_measure);
+    for (i, call) in line.iter().enumerate() {
+        let this_call = resolve_call(call, blocks, parts, rows_per_measure, i);
         let this_duration: f64 = this_call.iter().map(|c| c.pattern_measure_len).sum();
         if this_duration > duration {
             duration = this_duration;

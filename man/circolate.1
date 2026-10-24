@@ -1,0 +1,305 @@
+.TH CIRCULATE 1 "October 2026" "circolate 0.1.0" "User Commands"
+
+.SH NAME
+circolate \- trackscript player and FL Studio/tracker converter
+
+.SH SYNOPSIS
+.B circolate
+[\fIFILE\fR]
+.br
+.B circolate
+.I COMMAND
+[\fIARGS\fR] [\fIOPTIONS\fR]
+
+.SH DESCRIPTION
+.B circolate
+plays and converts tracker music, FL Studio projects, MIDI files, and
+native
+.B .trackscript
+songs.  It opens a terminal UI when invoked without a subcommand, and
+dispatches to a converter or diagnostic tool when a subcommand is given.
+
+The player supports sample-based formats (WAV, FLAC, MP3, OGG, Vorbis),
+SoundFont 2 synthesis, VST3 instrument and effect hosting, and the
+trackscript effect shim system.
+
+.SH COMMANDS
+.TP
+.BR play " [\fIFILE\fR]"
+Play \fIFILE\fR, or open the player with an empty queue if no file is
+given.  Accepts
+.BR .trackscript ", " .tsz ", " .flp ", " .it ", " .mid ", " .midi ",
+or a directory containing a trackscript.  If \fIFILE\fR is omitted and
+.B play
+was requested explicitly, a file picker is opened.
+
+.TP
+.BR export " [\fIFILE\fR] [\-o \fIDIR\fR]"
+Convert a source file to trackscript.  Writes to
+.B trackscripts/\fISTEM\fR/
+by default.  Pass
+.B \-a
+or
+.B \-\-archive
+to write a single
+.B .tsz
+archive instead of a directory.
+
+.TP
+.BR dump " [\fIFILE\fR]"
+Print the parsed structure of a file as JSON.
+
+.TP
+.BR test " [\fIFILE\fR]"
+Run single-file diagnostics.
+
+.TP
+.BR check " [\fIPATH\fR]"
+Recursively probe
+.B .flp
+files under \fIPATH\fR for missing plugins, samples, and SoundFonts.
+Exits 1 if any file has unresolved dependencies.
+
+.TP
+.BR census " [\fIPATH\fR] [\-\-out \fIFILE\fR]"
+Tally plugin names across all
+.B .flp
+files under \fIPATH\fR and write a
+.B required_plugins.json
+corpus census.
+
+.TP
+.BR measure " \fIPLUGIN\fR"
+Measure a plugin's default-patch output level (RMS and peak, in dBFS).
+.TP
+.BR measure " \-\-only \fINAME\fR"
+Measure a single installed plugin by name.
+.TP
+.BR measure " \-\-all [\-\-out \fIFILE\fR]"
+Measure every plugin referenced by the fallback and registry tables,
+writing a
+.B plugins_inventory.json
+to the user cache directory.
+
+.TP
+.BR plugins " [\-\-paths]"
+List discovered VST3, VST2, LV2, and CLAP plugins.
+.B \-\-paths
+also prints the search directories.
+
+.TP
+.BR fetch " [\-\-dry] [\-\-only \fINAME\fR]"
+Download missing fallback plugins into the user data directory.
+
+.TP
+.BR vst-smoke " \fIPLUGIN\fR [\fISTATE\fR]"
+Load a VST3, play a sustained C4, and report peak and RMS levels.
+Developer smoke test.
+
+.TP
+.BR sf2-smoke " \fIFILE.sf2\fR [\-\-bank \fIN\fR] [\-\-patch \fIN\fR] [\-\-note \fIN\fR] [\-\-list] [\-\-out \fIFILE.wav\fR]"
+Play a note through the native SF2 engine.  Developer smoke test.
+
+.TP
+.BR list
+List trackscripts under the user and repository trackscript directories.
+
+.SH OPTIONS
+Options accepted by
+.B play
+and
+.BR export .
+.TP
+.BR \-\-render " \fIPATH\fR"
+Render to WAV offline instead of opening the TUI.
+.TP
+.BR \-\-rate " \fIN\fR"
+Sample rate for rendering (default 44100).
+.TP
+.BR \-\-start " \fISECS\fR"
+Start playback at the given offset in seconds.
+.TP
+.BR \-\-samples\-dir " \fIPATH\fR"
+Additional directory to search for samples when converting.
+.TP
+.BR \-\-sf2 " \fIPATH\fR"
+Override the SoundFont referenced by MIDI or trackscript sidecars.
+.TP
+.BR \-\-skip\-native
+Skip native FL Studio plugin channels during conversion.
+.TP
+.BR \-\-no\-cache
+Disable the sample decode cache.
+.TP
+.BR \-\-verify\-cache
+Re-decode every sample and compare against the cached version; exits
+non-zero on divergence.
+.TP
+.BR \-\-no\-master\-fx
+Bypass the master bus effect chain.
+.TP
+.BR \-\-no\-watch
+Disable live-reload for trackscript playback.
+.PP
+Global option:
+.TP
+.BR \-\-pause
+Hold the terminal open on exit.  Intended for
+.B .desktop
+launchers.
+
+.SH FILES
+.SS Shipped (installed to /usr/share/circolate/)
+.TP
+.I /usr/share/circolate/fallbacks.json
+Plugin and effect fallback table.  Defines which substitute plugins to
+load when the original is not installed.
+.TP
+.I /usr/share/circolate/player_settings.json
+Default theme, layout, and synesthesia configuration.
+.TP
+.I /usr/share/circolate/acquire.sh
+Acquisition script invoked by
+.B fetch
+for fallback plugins that cannot be downloaded declaratively.
+.TP
+.I /usr/share/circolate/cover/
+Fallback cover images, chosen at random for songs without their own.
+.TP
+.I /usr/share/circolate/icons/
+Desktop entry icons.
+.TP
+.I /usr/share/circolate/native_fx/
+Native effect LUT artifacts (currently empty; reserved).
+
+.SS User configuration (overrides shipped defaults)
+.TP
+.I ~/.config/circolate/player_settings.json
+Per-user theme, layout, and synesthesia overrides.
+.TP
+.I ~/.config/circolate/fallbacks.json
+Per-user fallback table additions and overrides.
+
+.SS User data
+.TP
+.I ~/.local/share/circolate/plugins/
+VST3, LV2, and CLAP plugins downloaded by
+.BR fetch .
+.TP
+.I ~/.local/share/circolate/soundfonts/
+User-installed SoundFonts referenced by MIDI conversion.
+
+.SS Cache (regenerable, safe to delete)
+.TP
+.I ~/.cache/circolate/covers/
+Content-hashed cover image cache.
+.TP
+.I ~/.cache/circolate/plugins_inventory.json
+Measured plugin output levels, used to compute fallback gains.
+.TP
+.I ~/.cache/circolate/required_plugins.json
+Plugin corpus census.
+.TP
+.I ~/.cache/circolate/sf2/
+Extracted SoundFonts.
+.TP
+.I ~/.cache/circolate/plugins/
+Extracted embedded plugin bundles.
+
+.SH ENVIRONMENT
+.TP
+.B XDG_CONFIG_HOME, XDG_DATA_HOME, XDG_CACHE_HOME
+Standard XDG base directories.  Each has a
+.B circolate/
+subdirectory.
+.TP
+.B CIRCOLATE_DATA_DIR
+Override the shipped-data directory.  Useful for testing and packaging.
+.TP
+.B CIRCOLATE_CONFIG_DIR, CIRCOLATE_CACHE_DIR
+Override the user config and cache directories.
+.TP
+.B FLP_DEBUG
+Enable FLP conversion tracing.
+.TP
+.B SHIM_DEBUG
+Enable effect shim resolution and parameter-setting traces.
+.TP
+.B TUI_DEBUG
+Log every keyboard and mouse event the TUI receives.
+.TP
+.B VST3_SDK
+Build-time only.  Path to a full VST3 SDK checkout.  If unset, the
+vendored minimal subset under
+.B vendor/vst3sdk/
+is used.
+
+.SH EXAMPLES
+Play a converted song:
+.PP
+.RS 4
+.nf
+circolate
+.I trackscripts/nightlight4000/nightlight4000.trackscript
+.fi
+.RE
+.PP
+Convert an FL Studio project:
+.PP
+.RS 4
+.nf
+circolate export
+.I music/song.flp
+.fi
+.RE
+.PP
+Render to WAV without opening the TUI:
+.PP
+.RS 4
+.nf
+circolate play
+.I song.trackscript
+.B \-\-render
+.I out.wav
+.B \-\-rate
+.B 48000
+.fi
+.RE
+.PP
+Refresh the plugin measurement cache:
+.PP
+.RS 4
+.nf
+circolate measure \-\-all
+.fi
+.RE
+.PP
+Check a corpus for missing plugins:
+.PP
+.RS 4
+.nf
+circolate check music/flps
+.fi
+.RE
+
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+General error.  For
+.BR check ,
+non-zero indicates at least one file with unresolved dependencies.  For
+.BR play \-\-verify\-cache ,
+non-zero indicates cache divergence.
+
+.SH SEE ALSO
+The trackscript language reference is shipped as
+.I /usr/share/doc/circolate/LANGUAGE.md
+(or
+.I docs/LANGUAGE.md
+in the source tree).
+
+.SH BUGS
+Report bugs at the project repository.

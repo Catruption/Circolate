@@ -11,5 +11,6 @@ pub mod state;
 pub mod theme;
 pub mod views;
 pub mod widgets;
+pub mod logs;
 
 pub use app::{restore, run_against, setup, show_loading};

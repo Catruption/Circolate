@@ -26,7 +26,7 @@ pub trait NativeEffect: Send {
 /// Where shipped native-effect artifacts live, relative to the install
 /// root.  `install_root()` is defined in `crate::deps::registry`.
 pub fn artifact_dir() -> Option<std::path::PathBuf> {
-    crate::deps::registry::install_root().map(|r| r.join("share").join("native_fx"))
+    crate::deps::registry::native_fx_dir()
 }
 
 /// Load a named artifact from the shipped `share/native_fx/` directory.

@@ -295,6 +295,8 @@ pub struct SpiralState {
 pub enum NotchTag {
     /// Toggle the help overlay.
     Help,
+    /// Toggle the config overlay.
+    Settings,
 }
 
 /// Where the notch drew its clickable segments, for `shared/hit.rs`.
@@ -311,6 +313,9 @@ pub struct TrackerColumnHit {
     pub width: u16,
     pub header_y: u16,
     pub rows: Vec<Option<(usize, i64)>>,
+    /// Inner-relative `x` range of the `@` / `↴` chain marker on the
+    /// header row.  `None` when the column has no chain.
+    pub marker_x: Option<(u16, u16)>,
 }
 
 pub struct TrackerHit {
@@ -323,7 +328,8 @@ pub struct TrackerHit {
 #[derive(Clone)]
 pub enum VerticalRow {
     /// The part's name line.  Left-click solos, right-click mutes.
-    Label { path: String },
+    /// `marker_x` is the `@` / `↦` chain marker range on that row.
+    Label { path: String, marker_x: Option<(u16, u16)> },
     /// A line containing one or more events.  `block_line` and
     /// `start_row` identify the first note on that line.
     Event { path: String, block_line: usize, start_row: i64 },
@@ -344,6 +350,7 @@ pub struct PlayerUi {
     pub loop_enabled: bool,
     pub last_loop_check_measure: Option<usize>,
     pub show_help: bool,
+    pub show_config: bool,
     pub last_left_click: Option<(Instant, u16, u16)>,
     pub last_reload_count: i64,
     pub reload_flash_until: Option<Instant>,
@@ -356,6 +363,7 @@ impl Default for PlayerUi {
             loop_enabled: false,
             last_loop_check_measure: None,
             show_help: false,
+            show_config: false,
             last_left_click: None,
             last_reload_count: 0,
             reload_flash_until: None,
@@ -389,6 +397,12 @@ pub struct RenderState {
     pub loading: Option<String>,
     pub loading_notes: Vec<String>,
     pub rewind_cooldown_until: Option<Instant>,
+    pub config_ui: crate::tui::widgets::config::ConfigUi,
+    /// Part paths whose chain is currently expanded (`↴` / `↦` shown).
+    pub expanded_chains: HashSet<String>,
+    /// Part paths whose chain has been toggled disabled.  Currently
+    /// visual-only — audio bypass is a follow-up.
+    pub disabled_chains: HashSet<String>,
 }
 
 impl RenderState {
@@ -417,6 +431,9 @@ impl RenderState {
             loading: None,
             loading_notes: Vec::new(),
             rewind_cooldown_until: None,
+            config_ui: Default::default(),
+            expanded_chains: HashSet::new(),
+            disabled_chains: HashSet::new(),
         }
     }
 }

@@ -100,7 +100,7 @@ pub(super) fn classify_channels<'a>(
                 // points instead of copying the raw WAV and ignoring them.
                 if let Some(plugin) = chan.plugin.as_ref() {
                     if slicex::is_slicex(plugin) {
-                        match slicex::convert(chan, plugin, placed, aux_files, &mut warnings) {
+                        match slicex::convert(chan, plugin, placed, aux_files, &mut warnings, if prj.tempo > 0.0 { prj.tempo } else { super::DEFAULT_TEMPO }) {
                             Ok(out) => {
                                 let (lo, hi) = (out.base_key, out.base_key + out.slices as u32);
                                 let mut stray_keys: Vec<u32> =
@@ -177,7 +177,7 @@ pub(super) fn classify_channels<'a>(
                 // some truly native channels might still be Slicex).
                 if let Some(plugin) = chan.plugin.as_ref() {
                     if slicex::is_slicex(plugin) {
-                        match slicex::convert(chan, plugin, placed, aux_files, &mut warnings) {
+                        match slicex::convert(chan, plugin, placed, aux_files, &mut warnings, if prj.tempo > 0.0 { prj.tempo } else { super::DEFAULT_TEMPO }) {
                             Ok(out) => {
                                 let (lo, hi) = (out.base_key, out.base_key + out.slices as u32);
                                 let mut stray_keys: Vec<u32> =
@@ -423,8 +423,8 @@ fn handle_sf2(
     .unwrap_or("?")
     .to_string();
 
-    let soundfonts_dir: Option<PathBuf> = crate::deps::registry::install_root()
-    .map(|r| r.join("soundfonts"))
+    let soundfonts_dir: Option<PathBuf> =
+    Some(crate::paths::system_data().join("soundfonts"))
     .filter(|p| p.is_dir());
 
     let mut dirs: Vec<&Path> = Vec::with_capacity(3);

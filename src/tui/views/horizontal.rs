@@ -2,6 +2,11 @@
 //! waveform behind the note text and the playhead column highlighted.
 //! Reads like a tracker grid; splits parts side by side so they can be
 //! compared beat-by-beat.
+//!
+//! When a part has inline shims (`ƒpianoer(2)@<ƒFruity_Limiter()>@…`)
+//! and `state.expanded_chains` contains its path, one `ƒTarget` divider
+//! row is prepended per shim.  Braille and playhead are shifted down by
+//! the number of prepended rows so they still line up with the sample.
 
 use ratatui::{
     layout::Rect,
@@ -14,7 +19,7 @@ use ratatui::{
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 
-use crate::mixer::mute;
+use crate::mixer::{mute, part_volume};
 use crate::player::envelope::{
     synth_envelope_live, synth_envelope_static, whole_sample_envelope, wrapped_pos,
 };
@@ -171,6 +176,33 @@ pub fn draw(
     .map(|path| by_path[path].first().map(|(n, _, _, _)| n.clone()))
     .collect();
 
+    // Shim chains per column, from p.shims (inline `@<ƒTarget()>`).  Looked
+    // up on the BlockList line each source call came from, so a column fed
+    // by a carried-over note still shows its chain.
+    let chain_names_per_col: Vec<Vec<String>> = (0..visible_cols)
+    .map(|col| {
+        let path = &path_order[col];
+        by_path[path]
+        .iter()
+        .map(|(_, off, _, _)| li.saturating_sub((off / rpmeasure.max(1.0)).round() as usize))
+        .map(|l| p.shims_for_line_path(l, path))
+        .find(|v| !v.is_empty())
+        .map(|v| v.iter().map(|sh| sh.target.clone()).collect())
+        .unwrap_or_default()
+    })
+    .collect();
+
+    let chain_rows_per_col: Vec<usize> = (0..visible_cols)
+    .map(|col| {
+        let path = &path_order[col];
+        if state.expanded_chains.contains(path) {
+            chain_names_per_col[col].len()
+        } else {
+            0
+        }
+    })
+    .collect();
+
     let snap = mute::snapshot();
     let muted_parts = &snap.muted_parts;
     let soloed_part = snap.soloed_part.as_deref();
@@ -256,6 +288,25 @@ pub fn draw(
         let header_name = header_names[col].clone();
         let mut entries: Vec<ColumnLine> = Vec::with_capacity(notes.len() + 4);
         let mut entries_bl: Vec<Option<(usize, i64)>> = Vec::with_capacity(notes.len() + 4);
+
+        // Expanded shim chain: prepend one divider row per shim.
+        if chain_rows_per_col[col] > 0 {
+            let n_chain = chain_names_per_col[col].len();
+            for (ci, name) in chain_names_per_col[col].iter().enumerate() {
+                let term = if ci + 1 == n_chain { ";" } else { "" };
+                let text = format!("<ƒ{}()>{}", name, term);
+                let truncated = if text.chars().count() > col_w {
+                    let mut s: String = text.chars().take(col_w.saturating_sub(1)).collect();
+                    s.push('…');
+                    s
+                } else {
+                    text
+                };
+                entries.push(ColumnLine::Divider { label: truncated });
+                entries_bl.push(None);
+            }
+        }
+
         let mut last_name: Option<String> = None;
         for (note, block_line) in notes.into_iter().zip(bl) {
             let name = note.source_name.clone();
@@ -275,8 +326,6 @@ pub fn draw(
         column_rows_hit.push(entries_bl);
     }
 
-    // Which columns have a note currently under the playhead?  Drives
-    // the block-number highlight in the header.
     let col_playing: Vec<bool> = (0..visible_cols)
     .map(|col| {
         columns[col].iter().any(|line| {
@@ -291,12 +340,6 @@ pub fn draw(
     })
     .collect();
 
-    // Build the per-column dot matrix. Two-step so the envelope can be
-    // cached per pixel row while the dot matrix is recomputed each
-    // frame (col_w can change on resize while pixel_rows stays fixed).
-    // `rasterize_time_y` is shared with the vertical view — it handles
-    // auto-scaling (so a 0.058-gain synth doesn't render as a 5%
-    // strip) and the pixel-range clamping in one place.
     if state.last_synth_env.len() < visible_cols {
         state.last_synth_env.resize_with(visible_cols, Vec::new);
     }
@@ -342,7 +385,6 @@ pub fn draw(
         dot_matrices.push(rasterize_time_y(&env, col_w * 2, pixel_rows));
     }
 
-    // Sample-position playhead.
     {
         let present: HashSet<&String> = path_order.iter().collect();
         state.playheads.retain(|k, _| present.contains(k));
@@ -425,7 +467,6 @@ pub fn draw(
     let muted_bg = theme.color(Token::MutedBg);
     let playhead_fg = theme.color(Token::Playhead);
 
-    // Header row + hit-test.
     let mut header: Vec<Span> = Vec::new();
     let mut hit_columns: Vec<TrackerColumnHit> = Vec::with_capacity(visible_cols);
     let mut x_cursor: u16 = 0;
@@ -438,14 +479,28 @@ pub fn draw(
         })
         .unwrap_or_else(|| "(?)".to_string());
 
+        let has_chain = !chain_names_per_col[col].is_empty();
+        let expanded = state.expanded_chains.contains(path.as_str());
+        let marker_chars = if has_chain { 1 } else { 0 };
+
+        let vol = part_volume::get(path);
+        let show_vol = p.part_supports_volume(path);
+        let vol_tag = if show_vol && (vol - 1.0).abs() > 0.01 {
+            format!(" {}%", (vol * 100.0).round() as i64)
+        } else {
+            String::new()
+        };
+        let tag_chars = vol_tag.chars().count();
+        let avail = col_w.saturating_sub(tag_chars + marker_chars);
+
         let label_chars = label_text.chars().count();
-        let trimmed = if label_chars > col_w {
-            if col_w > 1 {
-                let mut s: String = label_text.chars().take(col_w - 1).collect();
+        let trimmed = if label_chars > avail {
+            if avail > 1 {
+                let mut s: String = label_text.chars().take(avail - 1).collect();
                 s.push('…');
                 s
             } else {
-                label_text.chars().take(col_w).collect()
+                label_text.chars().take(avail).collect()
             }
         } else {
             label_text
@@ -453,11 +508,69 @@ pub fn draw(
 
         let style = label::header_style(path, muted_parts, soloed_part, &theme);
 
-        let padded = format!("{:<width$}", trimmed, width = col_w);
+        // A part with a chain keeps its marker right after the name; the
+        // column is padded out to col_w after the marker instead.
+        let fill = if has_chain {
+            trimmed.chars().count().min(avail)
+        } else {
+            avail
+        };
+        let padded = format!("{:<width$}", trimmed, width = fill);
+        // Measure label::split output and force exactly `avail` cells.
+        // If it returns more (unexpected prefix, encoding quirks), truncate;
+        // if fewer, pad.  Guarantees vol_tag + marker land at intended cells.
+        let mut label_len = 0usize;
         for span in label::split(&padded, style, &theme, &labels_cfg, col_playing[col]) {
-            header.push(span);
+            let sw = span.content.chars().count();
+            if label_len + sw <= fill {
+                label_len += sw;
+                header.push(span);
+            } else {
+                let take = fill.saturating_sub(label_len);
+                if take > 0 {
+                    let s: String = span.content.chars().take(take).collect();
+                    header.push(Span::styled(s, span.style));
+                    label_len = fill;
+                }
+                break;
+            }
+        }
+        while label_len < fill {
+            header.push(Span::raw(" "));
+            label_len += 1;
+        }
+
+        if !vol_tag.is_empty() {
+            header.push(Span::styled(vol_tag, style.add_modifier(Modifier::DIM)));
+        }
+        if has_chain {
+            let marker = if expanded { "↴" } else { "@" };
+            // Distinct style so it's obvious whether it renders at all.
+            header.push(Span::styled(
+                marker,
+                Style::default()
+                .fg(ratatui::style::Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+            ));
+            if std::env::var_os("SHIMS_DEBUG").is_some() {
+                let total: usize = header.iter().map(|s| s.content.chars().count()).sum();
+                eprintln!(
+                    "header col={} has_chain marker={:?} header_chars={} col_w={} avail={}",
+                    col, marker, total, col_w, avail
+                );
+            }
+        }
+        for _ in (fill + tag_chars + marker_chars)..col_w {
+            header.push(Span::raw(" "));
         }
         header.push(Span::raw(" "));
+
+        let marker_x = if has_chain {
+            let mx = x_cursor + (fill + tag_chars) as u16;
+            Some((mx, mx + 1))
+        } else {
+            None
+        };
 
         hit_columns.push(TrackerColumnHit {
             path: path.clone(),
@@ -465,6 +578,7 @@ pub fn draw(
                          width: col_w as u16,
                          header_y: 0,
                          rows: column_rows_hit[col].clone(),
+                         marker_x,
         });
         x_cursor += col_w as u16 + 1;
     }
@@ -476,19 +590,21 @@ pub fn draw(
         let mut spans: Vec<Span> = Vec::new();
         for col in 0..visible_cols {
             let path = &path_order[col];
+            let chain_rows = chain_rows_per_col[col];
 
             let solo_hides_col = soloed_part.map_or(false, |s| s != path.as_str());
             let is_muted_col = muted_parts.contains(path);
 
-            let playhead_char: Option<usize> = playhead_pys[col].map(|py| py / 4);
+            let playhead_char: Option<usize> =
+            playhead_pys[col].map(|py| py / 4 + chain_rows);
 
             for cx in 0..col_w {
                 let mut bits: u8 = 0;
                 for ly in 0..4 {
-                    let py = r * 4 + ly;
-                    if py >= pixel_rows {
-                        continue;
-                    }
+                    let py_signed = (r as i32 - chain_rows as i32) * 4 + ly as i32;
+                    if py_signed < 0 { continue; }
+                    let py = py_signed as usize;
+                    if py >= pixel_rows { continue; }
                     let px0 = cx * 2;
                     let px1 = cx * 2 + 1;
                     if px0 < col_w * 2 && dot_matrices[col][py][px0] {

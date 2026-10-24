@@ -1,8 +1,18 @@
 //! Master-bus effect chain.
 //!
-//! Config in `master_fx.json` at the repo root: a list of VST3 bundles
-//! applied serially to the final stereo mix, after the engine has summed
-//! every voice and before the WAV writer.
+//! Config in `master_fx.json`: a list of VST3 bundles applied serially
+//! to the final stereo mix, after the engine has summed every voice and
+//! before the WAV writer.
+//!
+//! Config lookup order:
+//!   1. `$XDG_CONFIG_HOME/circolate/master_fx.json`  (user override)
+//!   2. `/usr/share/circolate/master_fx.json`         (shipped default)
+//!
+//! Relative `path:` and `state:` fields inside the config are resolved
+//! against the config file's directory, then `system_data()`, then
+//! `user_data()`.  This lets the shipped config name plugins as
+//! `plugins/Foo.vst3` and still find them whether the packager placed
+//! them next to the config or the user installed them via `fetch`.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -34,8 +44,8 @@ impl EffectChain {
         EffectChain { hosts: Vec::new(), labels: Vec::new() }
     }
 
-    /// Load `master_fx.json` from the repo root.  Missing file = empty
-    /// chain.  Individual load failures are warned and skipped.
+    /// Load `master_fx.json`.  Missing file = empty chain.  Individual
+    /// load failures are warned and skipped.
     pub fn load_default(sample_rate: u32) -> Result<Self> {
         let Some(path) = find_config() else {
             return Ok(EffectChain::empty());
@@ -46,26 +56,28 @@ impl EffectChain {
         let cfg: Config = serde_json::from_str(&text)
         .with_context(|| format!("parsing {}", path.display()))?;
 
-        let repo_root = path.parent().unwrap_or_else(|| Path::new("."));
+        let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
 
         let mut hosts  = Vec::new();
         let mut labels = Vec::new();
 
         for entry in cfg.chain {
-            let plugin_path = repo_root.join(&entry.path);
-            if !plugin_path.exists() {
-                eprintln!("  master fx: missing {}", plugin_path.display());
+            let Some(plugin_path) = resolve_relative(&entry.path, config_dir) else {
+                eprintln!("  master fx: missing {}", entry.path);
                 continue;
-            }
+            };
 
             let state_bytes = match &entry.state {
-                Some(s) => {
-                    let p = repo_root.join(s);
-                    std::fs::read(&p).unwrap_or_else(|e| {
+                Some(s) => match resolve_relative(s, config_dir) {
+                    Some(p) => std::fs::read(&p).unwrap_or_else(|e| {
                         eprintln!("  master fx: cannot read state {}: {}", p.display(), e);
                         Vec::new()
-                    })
-                }
+                    }),
+                    None => {
+                        eprintln!("  master fx: state file missing: {}", s);
+                        Vec::new()
+                    }
+                },
                 None => Vec::new(),
             };
 
@@ -108,12 +120,31 @@ impl EffectChain {
 }
 
 fn find_config() -> Option<PathBuf> {
-    let mut v = vec![PathBuf::from("master_fx.json")];
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            v.push(dir.join("master_fx.json"));
-            v.push(dir.join("../../master_fx.json"));
-        }
+    let user = crate::paths::user_config().join("master_fx.json");
+    if user.is_file() {
+        return Some(user);
     }
-    v.into_iter().find(|p| p.exists())
+    let system = crate::paths::system_data().join("master_fx.json");
+    if system.is_file() {
+        return Some(system);
+    }
+    None
+}
+
+/// Resolve a possibly-relative path from the config.  Absolute paths
+/// are used as-is.  Relative paths are tried against (in order) the
+/// config file's parent directory, `system_data()`, and `user_data()`,
+/// returning the first candidate that exists.
+fn resolve_relative(rel: &str, config_dir: &Path) -> Option<PathBuf> {
+    let p = Path::new(rel);
+    if p.is_absolute() {
+        return if p.exists() { Some(p.to_path_buf()) } else { None };
+    }
+    [
+        config_dir.join(rel),
+        crate::paths::system_data().join(rel),
+        crate::paths::user_data().join(rel),
+    ]
+    .into_iter()
+    .find(|p| p.exists())
 }

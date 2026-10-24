@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use super::engine::Engine;
 use super::project::{Cache, Loader, Project};
+use crate::deps::index::PluginIndex;
 use crate::effects::EffectChain;
 use crate::hosting::sf2::engine::Sf2Engine;
 use crate::hosting::vst::ffi::VstHost;
@@ -54,25 +55,49 @@ pub(crate) fn render_offline(
 
     // Install VST hosts before any rendering.  One per channel iid.
     //
+    // Name-only resolution: the recorded `plugin_path` is stale and may
+    // leak the original author's home directory, so it's used solely as
+    // a **transitional bridge** to recover the plugin name (via
+    // `file_stem`).  The actual load path comes from the local plugin
+    // scan.  New trackscripts that stop emitting `Path:` will need a
+    // `plugin_name` field on `VstInstrument`; until then this is the
+    // workable fallback for both old and new sidecars.
+    //
     // Fallback hosts receive an extra attenuation stage driven by
     // VST_FALLBACK_GAIN (see the constant's doc comment). Exact
     // matches get `vinst.gain` verbatim — they carry the original
     // plugin and its state, so no fudge is needed.
     let fb = vst_fallback_gain();
+    let index = PluginIndex::scan();
     for (name, vinst) in &project.vst_instruments {
-        let path_str = match vinst.plugin_path.to_str() {
-            Some(s) => s,
-            None => {
-                eprintln!("  (skipping VST with non-UTF8 path: {})", name);
-                continue;
-            }
+        let stem = vinst
+        .plugin_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+        let resolved = index
+        .find_vst3(stem)
+        .or_else(|| index.find_vst3(name))
+        .cloned();
+
+        let Some(plugin_path) = resolved else {
+            eprintln!(
+                "  (skipping VST [{}]: plugin {:?} not installed)",
+                      name, stem
+            );
+            continue;
         };
+
         let eff_gain = if vinst.fallback {
             vinst.gain * fb
         } else {
             vinst.gain
         };
-        match VstHost::load(path_str, &vinst.state_bytes, project.sample_rate) {
+        match VstHost::load(
+            plugin_path.to_str().unwrap_or(""),
+                            &vinst.state_bytes,
+                            project.sample_rate,
+        ) {
             Ok(host) => {
                 let tag = if vinst.fallback {
                     if (eff_gain - 1.0).abs() > 1e-4 {
@@ -86,13 +111,11 @@ pub(crate) fn render_offline(
                 println!(
                     "  loaded VST [{}] {} ({})",
                          vinst.iid,
-                         vinst.plugin_path
-                         .file_stem()
-                         .and_then(|s| s.to_str())
-                         .unwrap_or("?"),
-                         tag
+                         if stem.is_empty() { name.as_str() } else { stem },
+                             tag
                 );
                 engine.install_host_with_gain(vinst.iid, host, eff_gain);
+                engine.register_part_path(vinst.iid, name.clone());
             }
             Err(e) => {
                 eprintln!("  failed to load VST {} ({:#})", name, e);
@@ -105,8 +128,8 @@ pub(crate) fn render_offline(
     }
 
     // Native SF2 engines.  Same setup as `install_sf2_engines` in the live
-    // path (play.rs); without this, every SF2 note in an offline render is
-    // dropped and the WAV comes out silent.
+    // path; without this, every SF2 note in an offline render is dropped
+    // and the WAV comes out silent.
     let sf2_debug = std::env::var_os("FLP_DEBUG").is_some();
     let default_gain = crate::hosting::sf2::engine::DEFAULT_GAIN;
     for (name, spec) in &project.sf2_engine_specs {
@@ -126,6 +149,7 @@ pub(crate) fn render_offline(
         }
         sf2.set_gain(effective);
         engine.install_sf2_engine(spec.iid, sf2);
+        engine.register_part_path(spec.iid, name.clone());
     }
     println!("  installed {} SF2 engine(s)", engine.sf2_engine_count());
 
@@ -133,31 +157,7 @@ pub(crate) fn render_offline(
     // `.instrument` sidecars the FLP converter wrote next to the
     // trackscript.  The directory is passed via TRACKSCRIPT_INSERT_DIR
     // for now; later this becomes a Project field.
-    //
-    // Each chain carries an insert-level `volume` applied once after
-    // the last slot processes. That is the mixer insert fader.
-    // Sourced from the `Volume:` line in each `.instrument` sidecar
-    // (currently unity; see `convert/flp/extract.rs::insert_volume`).
-    if let Ok(dir) = std::env::var("TRACKSCRIPT_INSERT_DIR") {
-        let dir = std::path::PathBuf::from(dir);
-        let inserts_dir = dir.join("inserts");
-        let chains = crate::player::inserts::load_chains(&inserts_dir, project.sample_rate);
-        let total_slots: usize = chains.values().map(|c| c.slot_count()).sum();
-        println!("  loaded {} insert chain(s), {} slot(s) total", chains.len(), total_slots);
-        for (idx, chain) in chains {
-            println!(
-                "    insert {:02}: {} slot(s), volume {:.3}",
-                     idx,
-                     chain.slot_count(),
-                     chain.volume
-            );
-            engine.install_insert_chain(idx, chain);
-        }
-        let routing = crate::player::inserts::load_routing(&dir);
-        for (iid, insert) in routing {
-            engine.set_channel_insert(iid, insert);
-        }
-    }
+    crate::player::inserts::install_chains(&mut engine, project, project.sample_rate);
 
     // Master bus effects.  Silent if master_fx.json is missing or empty.
     if !no_master_fx {
@@ -214,7 +214,10 @@ pub(crate) fn write_wav(path: &Path, l: &[f32], r: &[f32], sr: u32) -> Result<()
     }
     writer.finalize()?;
     if clipped > 0 {
-        println!("  warning: {} output samples clip at peak {:.3}", clipped, peak);
+        println!(
+            "  warning: {} output samples clip at peak {:.3}",
+            clipped, peak
+        );
     }
     Ok(())
 }

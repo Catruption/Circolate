@@ -34,3 +34,12 @@ Thumbs.db
 *.tmp
 *.bak
 /trackscripts/*.tsz
+
+# ── Generated data files ───────────────────────────────────────
+/share/plugins_inventory.json
+/share/required_plugins.json
+/system (ignore)/
+/share/soundfonts/
+/share/soundfonts/
+/share/circolate/trackscripts/no villains.tsz
+/share/circolate/trackscripts/Carol Roll.tsz

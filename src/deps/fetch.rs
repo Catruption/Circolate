@@ -3,17 +3,6 @@
 //! Walks `fallbacks.json`, checks each entry's `provides` path, and either
 //! reports "already present" or runs the acquire step.  Idempotent:
 //! running it twice does nothing the second time.
-//!
-//! Two acquire shapes:
-//!
-//!   Declarative — `{ url, archive, extract_to }`:
-//!     Downloads with curl, extracts with tar/unzip/7z, verifies
-//!     `provides` exists afterward.  Used for 90% of plugins.
-//!
-//!   Script — `{ script, provides }`:
-//!     Runs `sh <script>`.  Used only when the download can't be
-//!     expressed declaratively (session-signed URLs, builds from source,
-//!     plugins with account gates).
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -34,9 +23,6 @@ pub fn run(argv: &[String]) -> Result<()> {
             }
             "-h" | "--help" => {
                 println!("usage: trackscript-player fetch [--dry] [--only NAME]");
-                println!();
-                println!("  --dry        list scripts that would run, don't execute");
-                println!("  --only NAME  run only the entry whose fallback name matches");
                 return Ok(());
             }
             other => bail!("unknown flag: {other}"),
@@ -44,11 +30,11 @@ pub fn run(argv: &[String]) -> Result<()> {
     }
 
     let table = RegistryTable::load()
-    .context("fallbacks.json not found (run from the repo root)")?;
+    .context("fallbacks.json not found")?;
 
-    // Make sure we're at the repo root for relative paths in the JSON.
-    // If fallbacks.json was found via the exe path, cd there first.
-    let repo_root = std::env::current_dir()?;
+    // The fetch destination is always the user data directory.
+    let dest_root = crate::paths::user_data();
+    std::fs::create_dir_all(dest_root.join("plugins"))?;
 
     let mut fetched = 0usize;
     let mut present = 0usize;
@@ -67,7 +53,7 @@ pub fn run(argv: &[String]) -> Result<()> {
             }
         }
 
-        let provides = repo_root.join(acq.provides());
+        let provides = dest_root.join(acq.provides());
         if provides.exists() {
             println!("  ok      {}  ({})", mapping.fallback.name, acq.provides());
             present += 1;
@@ -87,7 +73,7 @@ pub fn run(argv: &[String]) -> Result<()> {
         }
 
         println!("  fetching {} → {}", mapping.fallback.name, acq.provides());
-        match run_one(acq, &repo_root) {
+        match run_one(acq, &dest_root) {
             Ok(()) => {
                 if provides.exists() {
                     println!("  done");
@@ -114,19 +100,20 @@ pub fn run(argv: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn run_one(acq: &Acquire, repo_root: &Path) -> Result<()> {
+fn run_one(acq: &Acquire, dest_root: &Path) -> Result<()> {
     match acq {
         Acquire::Download { url, archive, extract_to, sha256, .. } => {
-            download_and_extract(url, archive, extract_to, sha256.as_deref(), repo_root)
+            download_and_extract(url, archive, extract_to, sha256.as_deref(), dest_root)
         }
         Acquire::Script { script, .. } => {
-            let s = repo_root.join(script);
+            // Scripts live in the system data dir (e.g., /usr/share/circolate/acquire.sh)
+            let s = crate::paths::system_data().join(script);
             if !s.exists() {
                 bail!("script not found: {}", s.display());
             }
             let status = Command::new("sh")
             .arg(&s)
-            .current_dir(repo_root)
+            .current_dir(dest_root) // Execute in the user data directory
             .status()
             .with_context(|| format!("running {}", s.display()))?;
             if !status.success() {
@@ -142,9 +129,9 @@ fn download_and_extract(
     archive: &str,
     extract_to: &str,
     want_sha: Option<&str>,
-    repo_root: &Path,
+    dest_root: &Path,
 ) -> Result<()> {
-    let dest_dir = repo_root.join(extract_to);
+    let dest_dir = dest_root.join(extract_to);
     std::fs::create_dir_all(&dest_dir)
     .with_context(|| format!("creating {}", dest_dir.display()))?;
 

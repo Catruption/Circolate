@@ -1,23 +1,13 @@
 //! `share/player_settings.json`.  Committed to the repo, layered over
 //! built-in defaults.  Optionally, a `player_settings.json` next to a
 //! `.trackscript` overrides it for that song.
-//!
-//! Three tiers, in increasing priority:
-//!   1. built-in defaults (`theme::builtin`, this file's `Default` impls)
-//!   2. `share/player_settings.json`
-//!   3. `player_settings.json` next to the currently-playing trackscript
-//!
-//! Schema is loose: unknown keys are ignored, bad values fall back with
-//! a warning, and only the fields you set override anything.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::Deserialize;
 
 use crate::tui::theme::{builtin, parse_color, BorderStyle, Theme, Token};
-
-// ── raw JSON shape ─────────────────────────────────────────────────────
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -144,11 +134,6 @@ impl Default for SynesthesiaConfig {
 fn d_hue_step() -> f64 { 30.0 }
 fn d_one() -> f64 { 1.0 }
 
-// ── resolved settings ──────────────────────────────────────────────────
-
-/// What the render path actually reads.  Built by `Config::resolve()`:
-/// the raw JSON shape is validated and normalized, and paired with a
-/// materialized `Theme`.
 #[derive(Clone)]
 pub struct Settings {
     pub theme: Theme,
@@ -158,17 +143,19 @@ pub struct Settings {
     pub view_mode: Option<String>,
 }
 
-// ── loading ────────────────────────────────────────────────────────────
-
 impl Config {
-    /// Layered load.  `trackscript_dir` is the directory of the currently
-    /// playing `.trackscript`, if any — a `player_settings.json` there
-    /// overrides the repo default.
     pub fn load_layered(trackscript_dir: Option<&Path>) -> Self {
         let mut cfg = Config::default();
-        if let Some(repo) = find_repo_settings() {
-            cfg.merge_from_file(&repo);
-        }
+
+        // 1. System default (e.g., /usr/share/circolate/player_settings.json)
+        let sys = crate::paths::system_data().join("player_settings.json");
+        cfg.merge_from_file(&sys);
+
+        // 2. User override (e.g., ~/.config/circolate/player_settings.json)
+        let user = crate::paths::user_config().join("player_settings.json");
+        cfg.merge_from_file(&user);
+
+        // 3. Song override
         if let Some(dir) = trackscript_dir {
             cfg.merge_from_file(&dir.join("player_settings.json"));
         }
@@ -189,10 +176,6 @@ impl Config {
         if other.theme.border.is_some() { self.theme.border = other.theme.border; }
         self.theme.overrides.extend(other.theme.overrides);
         if other.view.mode.is_some() { self.view.mode = other.view.mode; }
-
-        // Tunables are wholesale replaced: a `"layout"` block in a
-        // higher layer means "everything here wins".  Missing keys
-        // inside it were already filled by serde's per-field default.
         self.layout = other.layout;
         self.labels = other.labels;
         self.synesthesia = other.synesthesia;
@@ -238,8 +221,6 @@ impl Config {
     }
 }
 
-/// Clamp the layout scalars so nothing downstream has to.  Cheap, and
-/// it makes the JSON schema self-documenting: "these are bounds".
 fn normalize_layout(mut l: LayoutConfig) -> LayoutConfig {
     l.cover_dim = l.cover_dim.clamp(0.0, 2.0);
     if l.min_col_w < 4 { l.min_col_w = 4; }
@@ -253,58 +234,40 @@ fn normalize_layout(mut l: LayoutConfig) -> LayoutConfig {
     l
 }
 
-fn find_repo_settings() -> Option<PathBuf> {
-    let starts: [Option<PathBuf>; 2] = [
-        std::env::current_dir().ok(),
-        std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)),
-    ];
-    for start in starts.into_iter().flatten() {
-        let mut d = Some(start);
-        while let Some(p) = d {
-            let candidate = p.join("share").join("player_settings.json");
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-            d = p.parent().map(Path::to_path_buf);
-        }
-    }
-    None
-}
-
 fn token_from_name(s: &str) -> Option<Token> {
     Some(match s {
         "border" => Token::Border,
-        "playhead" => Token::Playhead,
-        "spiral-current" => Token::SpiralCurrent,
-        "spiral-played" => Token::SpiralPlayed,
-        "spiral-future" => Token::SpiralFuture,
-        "spiral-loop-bg" => Token::SpiralLoopBg,
-        "muted-fg" => Token::MutedFg,
-        "muted-bg" => Token::MutedBg,
-        "soloed" => Token::Soloed,
-        "help-button" => Token::HelpButton,
-        "block-number" => Token::BlockNumber,
-        "block-number-playing" => Token::BlockNumberPlaying,
-        "block-fn" => Token::BlockFn,
-        "block-instance" => Token::BlockInstance,
-        "note-playing-fg" => Token::NotePlayingFg,
-        "note-playing-bg" => Token::NotePlayingBg,
-        "played" => Token::Played,
-        "unplayed" => Token::Unplayed,
-        "wave" => Token::Wave,
-        "help-fg" => Token::HelpFg,
-        "help-key" => Token::HelpKey,
-        "help-dim" => Token::HelpDim,
-        "help-bg" => Token::HelpBg,
-        "queue-bg" => Token::QueueBg,
-        "queue-transport-active" => Token::QueueTransportActive,
-        "queue-transport-idle" => Token::QueueTransportIdle,
-        "queue-text" => Token::QueueText,
-        "queue-playing" => Token::QueuePlaying,
-        "queue-counter" => Token::QueueCounter,
-        "queue-counter-dim" => Token::QueueCounterDim,
-        "queue-cursor-fg" => Token::QueueCursorFg,
-        "queue-cursor-bg" => Token::QueueCursorBg,
-        _ => return None,
+         "playhead" => Token::Playhead,
+         "spiral-current" => Token::SpiralCurrent,
+         "spiral-played" => Token::SpiralPlayed,
+         "spiral-future" => Token::SpiralFuture,
+         "spiral-loop-bg" => Token::SpiralLoopBg,
+         "muted-fg" => Token::MutedFg,
+         "muted-bg" => Token::MutedBg,
+         "soloed" => Token::Soloed,
+         "help-button" => Token::HelpButton,
+         "block-number" => Token::BlockNumber,
+         "block-number-playing" => Token::BlockNumberPlaying,
+         "block-fn" => Token::BlockFn,
+         "block-instance" => Token::BlockInstance,
+         "note-playing-fg" => Token::NotePlayingFg,
+         "note-playing-bg" => Token::NotePlayingBg,
+         "played" => Token::Played,
+         "unplayed" => Token::Unplayed,
+         "wave" => Token::Wave,
+         "help-fg" => Token::HelpFg,
+         "help-key" => Token::HelpKey,
+         "help-dim" => Token::HelpDim,
+         "help-bg" => Token::HelpBg,
+         "queue-bg" => Token::QueueBg,
+         "queue-transport-active" => Token::QueueTransportActive,
+         "queue-transport-idle" => Token::QueueTransportIdle,
+         "queue-text" => Token::QueueText,
+         "queue-playing" => Token::QueuePlaying,
+         "queue-counter" => Token::QueueCounter,
+         "queue-counter-dim" => Token::QueueCounterDim,
+         "queue-cursor-fg" => Token::QueueCursorFg,
+         "queue-cursor-bg" => Token::QueueCursorBg,
+         _ => return None,
     })
 }

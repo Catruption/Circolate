@@ -280,6 +280,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "circolate"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cc",
+ "clap",
+ "claxon",
+ "cpal",
+ "crossterm",
+ "hound",
+ "image",
+ "lewton",
+ "libc",
+ "midly",
+ "ratatui",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "symphonia",
+ "zip",
+]
+
+[[package]]
 name = "clang-sys"
 version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1908,30 +1932,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "baa693a8032d7e1cada7d0041e96126df243179ff061456783ac7f12bda4744c"
 dependencies = [
  "winnow",
-]
-
-[[package]]
-name = "trackscript-player"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cc",
- "clap",
- "claxon",
- "cpal",
- "crossterm",
- "hound",
- "image",
- "lewton",
- "libc",
- "midly",
- "ratatui",
- "regex",
- "serde",
- "serde_json",
- "sha2",
- "symphonia",
- "zip",
 ]
 
 [[package]]

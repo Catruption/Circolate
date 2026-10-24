@@ -1,9 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=Test Source
-Comment=Run diagnostics on a source file
-Exec=/run/media/cashmere/Creationism/Circolate/share/run.sh test %F
-Icon=/run/media/cashmere/Creationism/Circolate/share/icons/Test.png
-Terminal=false
-Categories=Utility;
-StartupNotify=true

@@ -1,0 +1,34 @@
+{
+  "labels": {
+    "accent_fn": true,
+    "accent_instance": true,
+    "accent_number": true
+  },
+  "layout": {
+    "cover_dim": 0.4000000059604645,
+    "help_glyph": "?",
+    "lookback_lines": 128,
+    "max_col_w": 40,
+    "min_col_w": 10,
+    "playhead_marker": "━",
+    "spiral_aspect_x": 2,
+    "spiral_max_h": 15
+  },
+  "synesthesia": {
+    "enabled": true,
+    "hue_step": 30.0,
+    "saturation_from_volume": true,
+    "saturation_scale": 1.0,
+    "value": 1.0
+  },
+  "theme": {
+    "border": "thick",
+    "overrides": {
+      "block-instance": "#8ab4d2"
+    },
+    "preset": "default"
+  },
+  "view": {
+    "mode": "auto"
+  }
+}

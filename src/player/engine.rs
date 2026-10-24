@@ -41,6 +41,8 @@ impl Scheduled {
     }
 }
 
+// ── scheduled VST note ─────────────────────────────────────────────────
+
 #[derive(Clone, Debug)]
 pub(crate) struct VstNote {
     pub(crate) start: i64,
@@ -252,6 +254,12 @@ pub(crate) struct Engine {
     hosts: BTreeMap<u16, VstHost>,
     host_scratch: BTreeMap<u16, (Vec<f32>, Vec<f32>)>,
     vst_gains: BTreeMap<u16, f32>,
+    /// Maps each VST/SF2 iid to the part path that owns it.  Populated by
+    /// `register_part_path` (called from `play.rs` and `render.rs` after
+    /// installing each host/engine).  Used by `render_vsts` to look up
+    /// the per-part volume multiplier so scrolling a header affects VST
+    /// and SF2 parts the same way it affects raw samples.
+    iid_to_part_path: BTreeMap<u16, String>,
 
     sf2_engines: BTreeMap<u16, Sf2Engine>,
 
@@ -293,6 +301,7 @@ impl Engine {
             hosts: BTreeMap::new(),
             host_scratch: BTreeMap::new(),
             vst_gains: BTreeMap::new(),
+            iid_to_part_path: BTreeMap::new(),
             sf2_engines: BTreeMap::new(),
             vst_pending: VecDeque::new(),
             vst_active: Vec::new(),
@@ -344,6 +353,13 @@ impl Engine {
         self.vst_gains.insert(iid, gain);
     }
 
+    /// Register the part path that owns a given VST/SF2 iid.  Must be
+    /// called immediately after installing the host or engine so that
+    /// `render_vsts` can look up the per-part volume multiplier.
+    pub(crate) fn register_part_path(&mut self, iid: u16, part_path: String) {
+        self.iid_to_part_path.insert(iid, part_path);
+    }
+
     pub(crate) fn install_sf2_engine(&mut self, iid: u16, engine: Sf2Engine) {
         self.sf2_engines.insert(iid, engine);
     }
@@ -386,19 +402,6 @@ impl Engine {
         );
     }
 
-    /// Attach a shim to a BlockList line.  Dedups per line: if the same
-    /// shim id is already present, the call is a no-op.  This matters
-    /// because a single BlockList line can carry several calls
-    /// (`ƒpianoer(11)@<…>; ƒHardshot_131(1)@<…>; …`), each emitting its
-    /// own copy of the same shim chain.  Without dedup the chain grows
-    /// to `[0, 1, 2, 0, 1, 2, 0, 1, 2, …]`, which (a) breaks the
-    /// `chains.sort().dedup()` in `process_shims` — the long variant
-    /// survives alongside the short one — and (b) causes the same
-    /// effect to process its own output several times per block.
-    /// Deduping here collapses every line to `[0, 1, 2]`, which is
-    /// also the correct FL semantic: all voices on a line route
-    /// through the same mixer insert, and the insert processes the
-    /// summed output once.
     pub(crate) fn attach_shim_line(&mut self, line: u32, shim_id: u32) {
         let chain = self.shim_by_line.entry(line).or_default();
         if !chain.contains(&shim_id) {
@@ -683,6 +686,11 @@ impl Engine {
                 let first_shim: Option<u32> =
                 shim_by_line.get(&v.line).and_then(|s| s.first().copied());
 
+                // Live per-block lookup so scrolling the header affects
+                // notes already in flight, not just the next scheduled
+                // note.
+                let part_vol = crate::mixer::part_volume::get(&v.part_path);
+
                 for i in i_lo..i_hi {
                     let f = block_start + i * speed;
                     let t = f as f64 / sr;
@@ -704,13 +712,14 @@ impl Engine {
                     }
 
                     let gain_pair = || -> (f64, f64) {
-                        if automated_gain {
+                        let (gl, gr) = if automated_gain {
                             let vol = v.vol_lane.as_ref().map_or(v.vol, |l| l.value_at(t));
                             let pan = v.pan_lane.as_ref().map_or(v.pan, |l| l.value_at(t));
                             gains(vol, pan, song_volume, linear)
                         } else {
                             v.const_gain
-                        }
+                        };
+                        (gl * part_vol, gr * part_vol)
                     };
                     let env_gain = || -> f32 {
                         match &a.env_state {
@@ -838,19 +847,6 @@ impl Engine {
         self.pos = block_end.clamp(0, self.total);
     }
 
-    /// Process the shim chains in `VST_BLOCK`-sized chunks.
-    ///
-    /// Two properties matter:
-    ///
-    /// * **Chunking.**  Each `VstHost` was created with
-    ///   `maxSamplesPerBlock = 512`; calling `process_inplace` with a
-    ///   larger slice writes past the plugin's internal buffers.  cpal
-    ///   delivers 1024-frame blocks here, so we must subdivide.
-    ///
-    /// * **Dedup.**  `attach_shim_line` deduped each line's chain to
-    ///   unique ids, so `chains` in this method is a short list of
-    ///   unique chains.  `processed` guards against a shim appearing in
-    ///   two distinct chains (not the case today, but cheap insurance).
     fn process_shims(&mut self, out_l: &mut [f32], out_r: &mut [f32]) {
         let len = out_l.len();
 
@@ -885,7 +881,6 @@ impl Engine {
                         continue;
                     }
 
-                    // Run the effect on this chunk.
                     {
                         let Some(shim) = self.shims.get_mut(&shim_id) else { continue; };
                         let Some(buf) = self.shim_scratch.get_mut(&shim_id) else { continue; };
@@ -914,7 +909,6 @@ impl Engine {
                         }
                     }
 
-                    // Route the output: next shim in the chain, or master.
                     if let Some(next_id) = chain.get(i + 1).copied() {
                         let (pl, pr) = match self.shim_scratch.get(&shim_id) {
                             Some(b) => (
@@ -953,6 +947,7 @@ impl Engine {
             hosts,
             host_scratch,
             vst_gains,
+            iid_to_part_path,
             vst_pending,
             vst_active,
             vst_held,
@@ -1040,7 +1035,12 @@ impl Engine {
                 for s in tr[..chunk_len].iter_mut() { *s = 0.0; }
                 host.process(&mut tl[..chunk_len], &mut tr[..chunk_len]);
 
-                let gain = vst_gains.get(iid).copied().unwrap_or(1.0);
+                let host_gain = vst_gains.get(iid).copied().unwrap_or(1.0);
+                let part_scale = iid_to_part_path
+                .get(iid)
+                .map(|p| crate::mixer::part_volume::get(p) as f32)
+                .unwrap_or(1.0);
+                let gain = host_gain * part_scale;
                 super::scope::scope_push_block(
                     *iid as usize,
                     &tl[..chunk_len],
@@ -1076,25 +1076,30 @@ impl Engine {
                 for s in sl[..chunk_len].iter_mut() { *s = 0.0; }
                 for s in sr[..chunk_len].iter_mut() { *s = 0.0; }
                 eng.process(&mut sl[..chunk_len], &mut sr[..chunk_len]);
+
+                let part_scale = iid_to_part_path
+                .get(iid)
+                .map(|p| crate::mixer::part_volume::get(p) as f32)
+                .unwrap_or(1.0);
                 super::scope::scope_push_block(
                     *iid as usize,
                     &sl[..chunk_len],
                     &sr[..chunk_len],
-                    1.0,
+                    part_scale,
                 );
 
                 let insert = channel_to_insert.get(iid).copied();
                 match insert.and_then(|ins| insert_scratch.get_mut(&ins)) {
                     Some(buf) => {
                         for j in 0..chunk_len {
-                            buf.0[j] += sl[j];
-                            buf.1[j] += sr[j];
+                            buf.0[j] += sl[j] * part_scale;
+                            buf.1[j] += sr[j] * part_scale;
                         }
                     }
                     None => {
                         for j in 0..chunk_len {
-                            vst_scratch_l[j] += sl[j];
-                            vst_scratch_r[j] += sr[j];
+                            vst_scratch_l[j] += sl[j] * part_scale;
+                            vst_scratch_r[j] += sr[j] * part_scale;
                         }
                     }
                 }

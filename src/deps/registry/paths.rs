@@ -12,28 +12,16 @@ use std::path::PathBuf;
 
 use super::schema::SearchPaths;
 
-/// Walk up from the current executable looking for a directory that
-/// contains a `share/` subfolder.  That's the "install root" — where
-/// `share/registry.json` lives.  Returns `None` if we never find one,
-/// which is fine; relative paths are simply skipped.
-pub fn install_root() -> Option<PathBuf> {
-    let mut dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    for _ in 0..4 {
-        if dir.join("share").is_dir() {
-            return Some(dir);
-        }
-        dir = dir.parent()?.to_path_buf();
-    }
-    None
+/// The directory where shipped native-effect artifacts live.  Sits
+/// next to `share/registry.json` so the whole native-effect model set
+/// travels with the binary.
+pub fn native_fx_dir() -> Option<PathBuf> {
+    Some(crate::paths::system_data().join("native_fx"))
 }
 
 /// `$XDG_CONFIG_HOME/circolate` or `~/.config/circolate`.
 pub fn user_config_dir() -> Option<PathBuf> {
-    if let Some(x) = std::env::var_os("XDG_CONFIG_HOME") {
-        return Some(PathBuf::from(x).join("circolate"));
-    }
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".config").join("circolate"))
+    Some(crate::paths::user_config())
 }
 
 /// Expand a leading `~` using `$HOME`.
@@ -55,24 +43,24 @@ pub fn resolve_all(sp: &SearchPaths) -> Vec<PathBuf> {
         }
     };
 
+    // 1. User data (where `circolate fetch` downloads plugins)
+    push(crate::paths::user_data().join("plugins"));
+
+    // 2. Explicit registry paths (system & user)
     for s in &sp.system {
         push(expand_tilde(s));
     }
     for s in &sp.user {
         push(expand_tilde(s));
     }
-    if let Some(root) = install_root() {
-        for s in &sp.relative {
-            push(root.join(s));
-        }
+
+    // 3. Relative paths (resolved against the repo root in dev, or
+    //    system_data in a packaged install).
+    let root = crate::paths::repo_root().unwrap_or_else(crate::paths::system_data);
+    for s in &sp.relative {
+        push(root.join(s));
     }
-    // Filter to directories that actually exist.  No need to scan
-    // paths that will just fail.
+
+    // Filter to directories that actually exist.
     out.into_iter().filter(|p| p.is_dir()).collect()
-}
-/// The directory where shipped native-effect artifacts live.  Sits
-/// next to `share/registry.json` so the whole native-effect model set
-/// travels with the binary.
-pub fn native_fx_dir() -> Option<PathBuf> {
-    install_root().map(|r| r.join("share").join("native_fx"))
 }

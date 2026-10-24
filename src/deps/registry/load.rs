@@ -12,13 +12,11 @@
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 
-use super::paths;
 use super::schema::*;
 
 pub fn load_shipped() -> Result<Registry> {
-    let root = paths::install_root()
-    .context("could not locate install root (no share/ dir above the binary)")?;
-    let path = root.join("share").join("registry.json");
+    // Use the centralized system data path (e.g., /usr/share/circolate)
+    let path = crate::paths::system_data().join("registry.json");
     let text = std::fs::read_to_string(&path)
     .with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_str(&text)
@@ -26,8 +24,8 @@ pub fn load_shipped() -> Result<Registry> {
 }
 
 pub fn load_user() -> Option<Registry> {
-    let dir = paths::user_config_dir()?;
-    let path = dir.join("registry.json");
+    // Use the centralized user config path (e.g., ~/.config/circolate)
+    let path = crate::paths::user_config().join("registry.json");
     if !path.is_file() {
         return None;
     }
@@ -53,8 +51,6 @@ fn merge(shipped: Registry, user: Registry) -> Registry {
         system:   [shipped.search_paths.system,   user.search_paths.system].concat(),
         user:     [shipped.search_paths.user,     user.search_paths.user].concat(),
         relative: [shipped.search_paths.relative, user.search_paths.relative].concat(),
-        // User can only ever add; include_user_config stays true unless
-        // the shipped table itself says otherwise.
         include_user_config: shipped.search_paths.include_user_config
         || user.search_paths.include_user_config,
     };

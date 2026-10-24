@@ -8,7 +8,7 @@ use std::path::PathBuf;
 pub use schema::{
     Acquire, FallbackTarget, Mapping, MasterEntry, MissingPolicy,
 };
-pub use paths::install_root;
+pub use paths::native_fx_dir;
 
 use crate::deps::fallbacks::{FallbacksTable, FALLBACKS_FILENAME};
 use crate::deps::index::PluginIndex;
@@ -23,7 +23,7 @@ pub enum Resolution {
         replaces: String,
         gain: f32,
         via_default: bool,
-        state: Option<PathBuf>, // <--- NEW
+        state: Option<PathBuf>,
     },
     FallbackMissing { name: String, replaces: String },
     NoMatch,
@@ -48,17 +48,22 @@ pub struct RegistryTable {
 
 impl RegistryTable {
     pub fn load() -> anyhow::Result<Self> {
-        let root = paths::install_root()
-        .unwrap_or_else(|| PathBuf::from("."));
-        let share = root.join("share");
-
+        // The fallbacks table is loaded from the system data directory
+        // (e.g., /usr/share/circolate/fallbacks.json).
+        // If we need to support user overrides for fallbacks specifically,
+        // they would be checked in crate::paths::user_config() first.
+        let share = crate::paths::system_data();
         let fb_path = share.join(FALLBACKS_FILENAME);
+
         let fallbacks = FallbacksTable::load(&fb_path)
         .ok_or_else(|| anyhow::anyhow!(
             "{} missing or malformed", fb_path.display()
         ))?;
 
-        let inv_path = share.join(INVENTORY_FILENAME);
+        let mut inv_path = crate::paths::user_cache().join(INVENTORY_FILENAME);
+        if !inv_path.is_file() {
+            inv_path = share.join(INVENTORY_FILENAME);
+        }
         let inv = PluginInventory::load(&inv_path);
         let inventory = if inv.is_empty() { None } else { Some(inv) };
 
@@ -95,7 +100,7 @@ impl RegistryTable {
                     replaces: name.to_string(),
                     gain: picked.computed_gain,
                     via_default: picked.via_default,
-                    state: picked.state_path, // <--- NEW
+                    state: picked.state_path,
                 };
             }
         }
@@ -175,7 +180,7 @@ impl RegistryTable {
                     replaces: replaces.to_string(),
                     gain: fb.gain,
                     via_default: false,
-                    state: None, // <--- NEW
+                    state: None,
                 };
             }
         }
@@ -186,7 +191,7 @@ impl RegistryTable {
                 replaces: replaces.to_string(),
                 gain: fb.gain,
                 via_default: false,
-                state: None, // <--- NEW
+                state: None,
             };
         }
         Resolution::FallbackMissing {
