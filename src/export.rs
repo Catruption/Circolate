@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use crate::archive;
 use crate::convert::{self, ConvertOptions, PitchMode};
+use crate::paths; // Added import
 
 pub fn run(argv: &[String]) -> Result<()> {
     let mut src: Option<PathBuf> = None;
@@ -101,7 +102,12 @@ fn write_directory_output(
 ) -> Result<()> {
     let out = out_dir
     .map(|p| p.to_path_buf())
-    .unwrap_or_else(|| convert::default_out_dir(src));
+    .unwrap_or_else(|| {
+        // FIX: Point to the standard user trackscripts directory.
+        // We append `stem` so multiple exports of the same project don't
+        // overwrite each other's samples/ folders.
+        paths::export_dir().join(stem)
+    });
 
     std::fs::create_dir_all(&out)
     .with_context(|| format!("creating {}", out.display()))?;
@@ -177,7 +183,8 @@ fn write_archive_output(
             }
         }
         None => {
-            let dir = convert::default_out_dir(src);
+            // FIX: Point to the standard user trackscripts directory.
+            let dir = paths::export_dir();
             std::fs::create_dir_all(&dir)
             .with_context(|| format!("creating {}", dir.display()))?;
             dir.join(format!("{}.{}", stem, archive::EXTENSION))

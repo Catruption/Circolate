@@ -6,7 +6,7 @@
 //! each MIDI channel is matched to the SF2 whose preset table
 //! contains that channel's `(bank, program)`.  Channels with no match
 //! fall back to a default bank; if there's no default either, the
-//! channel is skipped with a warning.
+//! channel is given a placeholder so the Trackscript can still be generated.
 //!
 //! When every channel resolves to the same SF2 (a plain GM MIDI), the
 //! trackscript writes `SoundFont: ask;` so the launcher can offer to
@@ -60,7 +60,7 @@ pub(super) fn convert(
     };
 
     let mut distinct_sf2s: HashSet<PathBuf> = HashSet::new();
-    let mut channel_sf2: Vec<(u8, u8, u8, String)> = Vec::new();
+    let mut channel_sf2: Vec<(u8, u8, u8, Option<String>)> = Vec::new();
 
     for ch in &mf.channels {
         let (bank, patch) = bank_patch_for(ch);
@@ -73,26 +73,24 @@ pub(super) fn convert(
 
         let Some(sf2_path) = chosen else {
             eprintln!(
-                "midi: channel {} (bank {} patch {}) has no matching SF2; skipping",
+                "midi: channel {} (bank {} patch {}) has no matching SF2; using placeholder",
                       ch.channel, bank, patch
             );
+            channel_sf2.push((ch.channel, bank, patch, None));
             continue;
         };
 
         let rel = copy_sf2_once(&sf2_path, &mut sf2_copied, &mut aux)?;
         distinct_sf2s.insert(sf2_path);
-        channel_sf2.push((ch.channel, bank, patch, rel));
+        channel_sf2.push((ch.channel, bank, patch, Some(rel)));
     }
 
-    if channel_sf2.is_empty() {
-        bail!("no SoundFonts matched any channel; cannot convert");
-    }
-
-    for (channel, bank, patch, sf2_rel) in &channel_sf2 {
+    for (channel, bank, patch, sf2_rel_opt) in &channel_sf2 {
         let Some(ch) = mf.channels.iter().find(|c| c.channel == *channel) else {
             continue;
         };
         let part_name = part_name_for(ch);
+        let sf2_rel = sf2_rel_opt.as_deref().unwrap_or("samples/unknown.sf2");
         write_sidecar(&mut aux, &part_name, sf2_rel, *bank, *patch, *channel);
     }
 

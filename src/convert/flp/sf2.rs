@@ -115,22 +115,6 @@ fn try_fruity(state: &[u8], at: usize) -> Option<SfState> {
     let s = path_start?;
     let path = String::from_utf8_lossy(&state[s..at]).into_owned();
 
-    // Modern Fruity Soundfont Player state layout (version 2):
-    //   [0..4]   u32: version = 2
-    //   [4..8]   u32: preset (0..127)
-    //   [8..12]  u32: bank   (0..128, 128 = drum bank)
-    //   [12..16] u32: likely volume
-    //   [16..20] u32: likely pan
-    //   ...
-    //
-    // Byte 8-12 is the bank field. This was previously hardcoded to 0
-    // which made bank-1 channels (e.g. `bee` and `oh` in Carol Roll,
-    // which use preset (1, 2) and (1, 3)) indistinguishable from bank-0
-    // channels. They aren't; the FLP author's soundfont put alternative
-    // voice variants in a second bank.
-    //
-    // When the prologue is shorter than expected (older format), both
-    // fields default to 0 — the previous behavior for the whole state.
     let preset = state
     .get(4..8)
     .and_then(|b| b.try_into().ok())
@@ -259,5 +243,114 @@ pub(super) fn find_sf2(st: Option<&SfState>, chan_name: &str, dirs: &[&Path]) ->
             eprintln!("flp:   candidate {}", f.display());
         }
     }
+    None
+}
+
+// ── SF2 PRESET RESOLUTION ─────────────────────────────────────────────
+
+/// Reads the `phdr` chunk from an SF2 file to get a list of `(bank, preset)` pairs.
+pub(super) fn read_sf2_presets(path: &Path) -> Option<Vec<(u16, u16)>> {
+    let data = std::fs::read(path).ok()?;
+    if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"sfbk" {
+        return None;
+    }
+
+    let mut p = 12;
+    let mut pdta_start = 0;
+    let mut pdta_len = 0;
+
+    // Find the pdta LIST chunk
+    while p + 8 <= data.len() {
+        let id = &data[p..p+4];
+        let size = u32::from_le_bytes([data[p+4], data[p+5], data[p+6], data[p+7]]) as usize;
+        if id == b"LIST" && p + 12 <= data.len() && &data[p+8..p+12] == b"pdta" {
+            pdta_start = p + 12;
+            pdta_len = size - 4; // size includes the 'pdta' identifier, so minus 4 for the actual chunks
+            break;
+        }
+        p += 8 + size + (size & 1);
+    }
+
+    if pdta_start == 0 { return None; }
+
+    let end = (pdta_start + pdta_len).min(data.len());
+    let mut p = pdta_start;
+    let mut phdr_start = 0;
+    let mut phdr_len = 0;
+
+    // Find the phdr chunk within pdta
+    while p + 8 <= end {
+        let id = &data[p..p+4];
+        let size = u32::from_le_bytes([data[p+4], data[p+5], data[p+6], data[p+7]]) as usize;
+        if id == b"phdr" {
+            phdr_start = p + 8;
+            phdr_len = size;
+            break;
+        }
+        p += 8 + size + (size & 1);
+    }
+
+    if phdr_start == 0 || phdr_len < 38 { return None; }
+
+    let mut presets = Vec::new();
+    let count = phdr_len / 38;
+    for i in 0..count {
+        let offset = phdr_start + i * 38;
+        if offset + 38 > data.len() { break; }
+
+        let name_bytes = &data[offset..offset+20];
+        // Check for "EOP" terminal record (padding with nulls)
+        if &name_bytes[0..3] == b"EOP" && name_bytes[3..].iter().all(|&b| b == 0) {
+            break;
+        }
+
+        let preset = u16::from_le_bytes([data[offset+20], data[offset+21]]);
+        let bank = u16::from_le_bytes([data[offset+22], data[offset+23]]);
+        presets.push((bank, preset));
+    }
+    Some(presets)
+}
+
+/// Given a requested bank/preset and the list of presets actually in the SF2,
+/// finds the best substitute.
+pub(super) fn resolve_sf2_preset(
+    requested_bank: u16,
+    requested_preset: u16,
+    available: &[(u16, u16)],
+) -> Option<(u16, u16)> {
+    // 1. Exact match
+    if available.contains(&(requested_bank, requested_preset)) {
+        return Some((requested_bank, requested_preset));
+    }
+
+    // 2. Nearest patch in the SAME bank
+    let same_bank: Vec<u16> = available
+    .iter()
+    .filter(|(b, _)| *b == requested_bank)
+    .map(|(_, p)| *p)
+    .collect();
+
+    if !same_bank.is_empty() {
+        let mut best_preset = same_bank[0];
+        let mut min_diff = (best_preset as i32 - requested_preset as i32).abs();
+
+        for &p in &same_bank[1..] {
+            let diff = (p as i32 - requested_preset as i32).abs();
+            // Prefer the lower preset if distances are equal (e.g. asking for 3,
+            // available are 2 and 4 -> pick 2)
+            if diff < min_diff || (diff == min_diff && p < best_preset) {
+                min_diff = diff;
+                best_preset = p;
+            }
+        }
+        return Some((requested_bank, best_preset));
+    }
+
+    // 3. First available preset in the file (different bank)
+    if let Some(&(fallback_bank, fallback_preset)) = available.first() {
+        return Some((fallback_bank, fallback_preset));
+    }
+
+    // 4. No presets at all (corrupt file)
     None
 }

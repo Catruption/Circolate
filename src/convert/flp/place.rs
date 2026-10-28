@@ -70,6 +70,17 @@ fn resolve_slides(
     notes: &[Note],
     slicex_channels: &HashSet<u16>,
 ) -> Vec<(Note, Vec<Bend>)> {
+    // --- ADD THIS BLOCK ---
+    if std::env::var_os("FLP_DEBUG").is_some() {
+        for n in notes {
+            // Check the channels where the 800 missing notes live
+            if n.channel == 32 || n.channel == 104 {
+                eprintln!("flp: slide check -> chan {} key {} flags {:#06x}", n.channel, n.key, n.flags);
+            }
+        }
+    }
+    // ----------------------
+
     const FLAG_SLIDE: u16 = 0x08;
     if std::env::var_os("FLP_NO_SLIDE").is_some() {
         return notes.iter().cloned().map(|n| (n, Vec::new())).collect();

@@ -36,7 +36,7 @@ pub(crate) struct Scheduled {
 }
 
 impl Scheduled {
-    fn key(&self) -> (i64, u32, u32) {
+    pub(crate) fn key(&self) -> (i64, u32, u32) {
         (self.start, self.line, self.seq)
     }
 }
@@ -57,7 +57,7 @@ pub(crate) struct VstNote {
 }
 
 impl VstNote {
-    fn key(&self) -> (i64, u32, u32) {
+    pub(crate) fn key(&self) -> (i64, u32, u32) {
         (self.start, self.line, self.seq)
     }
 }
@@ -283,6 +283,16 @@ pub(crate) struct Engine {
     shim_scratch: BTreeMap<u32, (Vec<f32>, Vec<f32>)>,
     shim_dry_l: Vec<f32>,
     shim_dry_r: Vec<f32>,
+    /// Cached chain-of-shims list; rebuilt only when `shim_by_line` changes.
+    shim_chains_cache: Vec<Vec<u32>>,
+    /// Reusable "already processed this chunk" scratch buffer.
+    shim_processed: Vec<u32>,
+    /// Reusable link buffer for handing audio from one shim into the next.
+    shim_link_l: Vec<f32>,
+    shim_link_r: Vec<f32>,
+
+    /// Reusable VST event buffer (per render_vsts call).
+    vst_events_buf: Vec<(i32, u8, u16, u8, u8)>,
 }
 
 impl Engine {
@@ -323,6 +333,11 @@ impl Engine {
             shim_scratch: BTreeMap::new(),
             shim_dry_l: Vec::new(),
             shim_dry_r: Vec::new(),
+            shim_chains_cache: Vec::new(),
+            shim_processed: Vec::with_capacity(64),
+            shim_link_l: vec![0.0; VST_BLOCK as usize],
+            shim_link_r: vec![0.0; VST_BLOCK as usize],
+            vst_events_buf: Vec::with_capacity(128),
         }
     }
 
@@ -407,6 +422,13 @@ impl Engine {
         if !chain.contains(&shim_id) {
             chain.push(shim_id);
         }
+        // Invalidate + rebuild the cached chain list.  This runs at install
+        // time (from `install_shims`), not on the audio thread, so the
+        // allocation and sort are free.
+        let mut all: Vec<Vec<u32>> = self.shim_by_line.values().cloned().collect();
+        all.sort();
+        all.dedup();
+        self.shim_chains_cache = all;
     }
 
     pub(crate) fn shim_count(&self) -> usize {
@@ -472,8 +494,16 @@ impl Engine {
     }
 
     pub(crate) fn ingest(&mut self, mut voices: Vec<Scheduled>) {
-        voices.sort_by_key(Scheduled::key);
-        let mut future = Vec::new();
+        voices.sort_unstable_by_key(Scheduled::key);
+
+        // Reserve upfront so the per-voice inserts below never reallocate.
+        if self.pending.capacity() < self.pending.len() + voices.len() + 64 {
+            self.pending.reserve(voices.len() + 64);
+        }
+        if self.active.capacity() < self.active.len() + voices.len() + 64 {
+            self.active.reserve(voices.len() + 64);
+        }
+
         for v in voices {
             if v.end <= self.pos {
                 continue;
@@ -486,35 +516,47 @@ impl Engine {
                 let env_state = self.env_state_for(&v);
                 self.active.push(Active { v, raw_pos, env_state });
             } else {
-                future.push(v);
+                let key = v.key();
+                let idx = self
+                .pending
+                .binary_search_by_key(&key, |p| p.key())
+                .unwrap_or_else(|i| i);
+                self.pending.insert(idx, v);
             }
         }
-        if !future.is_empty() {
-            let mut all: Vec<Scheduled> = self.pending.drain(..).collect();
-            all.extend(future);
-            all.sort_by_key(Scheduled::key);
-            self.pending = all.into();
-        }
     }
-
     pub(crate) fn ingest_vst(&mut self, mut notes: Vec<VstNote>) {
-        notes.sort_by_key(VstNote::key);
-        self.vst_log.extend(notes.iter().cloned());
-        let mut future = Vec::new();
+        notes.sort_unstable_by_key(VstNote::key);
+
+        if self.vst_pending.capacity() < self.vst_pending.len() + notes.len() + 64 {
+            self.vst_pending.reserve(notes.len() + 64);
+        }
+        if self.vst_log.capacity() < self.vst_log.len() + notes.len() + 64 {
+            self.vst_log.reserve(notes.len() + 64);
+        }
+
+        // Cap vst_log so long sessions don't leak memory.
+        const VST_LOG_MAX: usize = 10_000;
+        if self.vst_log.len() + notes.len() > VST_LOG_MAX {
+            let drop = ((self.vst_log.len() + notes.len()) - VST_LOG_MAX)
+            .min(self.vst_log.len());
+            self.vst_log.drain(..drop);
+        }
+
         for mut n in notes {
+            self.vst_log.push(n.clone());
             if n.end <= self.pos {
                 continue;
             }
             if n.start < self.pos {
                 n.start = self.pos;
             }
-            future.push(n);
-        }
-        if !future.is_empty() {
-            let mut all: Vec<VstNote> = self.vst_pending.drain(..).collect();
-            all.extend(future);
-            all.sort_by_key(VstNote::key);
-            self.vst_pending = all.into();
+            let key = n.key();
+            let idx = self
+            .vst_pending
+            .binary_search_by_key(&key, |p| p.key())
+            .unwrap_or_else(|i| i);
+            self.vst_pending.insert(idx, n);
         }
     }
 
@@ -864,63 +906,67 @@ impl Engine {
         let mut dry_l = std::mem::take(&mut self.shim_dry_l);
         let mut dry_r = std::mem::take(&mut self.shim_dry_r);
 
-        let mut chains: Vec<Vec<u32>> = self.shim_by_line.values().cloned().collect();
-        chains.sort();
-        chains.dedup();
-
         let block = VST_BLOCK as usize;
+        let num_chains = self.shim_chains_cache.len();
+
         let mut chunk_start = 0usize;
         while chunk_start < len {
             let chunk_end = (chunk_start + block).min(len);
-            let mut processed: std::collections::HashSet<u32> =
-            std::collections::HashSet::new();
+            let chunk_len = chunk_end - chunk_start;
 
-            for chain in &chains {
-                for (i, &shim_id) in chain.iter().enumerate() {
-                    if !processed.insert(shim_id) {
+            if self.shim_link_l.len() < chunk_len {
+                self.shim_link_l.resize(chunk_len, 0.0);
+                self.shim_link_r.resize(chunk_len, 0.0);
+            }
+            self.shim_processed.clear();
+
+            for chain_idx in 0..num_chains {
+                let chain_len = self.shim_chains_cache[chain_idx].len();
+                for i in 0..chain_len {
+                    let shim_id = self.shim_chains_cache[chain_idx][i];
+                    if self.shim_processed.contains(&shim_id) {
                         continue;
                     }
+                    self.shim_processed.push(shim_id);
 
-                    {
-                        let Some(shim) = self.shims.get_mut(&shim_id) else { continue; };
-                        let Some(buf) = self.shim_scratch.get_mut(&shim_id) else { continue; };
+                    let Some(shim) = self.shims.get_mut(&shim_id) else { continue; };
+                    let Some(buf) = self.shim_scratch.get_mut(&shim_id) else { continue; };
 
-                        dry_l[chunk_start..chunk_end]
-                        .copy_from_slice(&buf.0[chunk_start..chunk_end]);
-                        dry_r[chunk_start..chunk_end]
-                        .copy_from_slice(&buf.1[chunk_start..chunk_end]);
+                    dry_l[chunk_start..chunk_end]
+                    .copy_from_slice(&buf.0[chunk_start..chunk_end]);
+                    dry_r[chunk_start..chunk_end]
+                    .copy_from_slice(&buf.1[chunk_start..chunk_end]);
 
-                        shim.host.process_inplace(
-                            &mut buf.0[chunk_start..chunk_end],
-                            &mut buf.1[chunk_start..chunk_end],
-                        );
+                    shim.host.process_inplace(
+                        &mut buf.0[chunk_start..chunk_end],
+                        &mut buf.1[chunk_start..chunk_end],
+                    );
 
-                        let mix = shim.mix as f32;
-                        let dry_amt = 1.0 - mix;
-                        let theta = ((shim.pan + 1.0) * std::f64::consts::FRAC_PI_4) as f32;
-                        let gl = (shim.gain as f32) * theta.cos();
-                        let gr = (shim.gain as f32) * theta.sin();
+                    let mix = shim.mix as f32;
+                    let dry_amt = 1.0 - mix;
+                    let theta = ((shim.pan + 1.0) * std::f64::consts::FRAC_PI_4) as f32;
+                    let gl = (shim.gain as f32) * theta.cos();
+                    let gr = (shim.gain as f32) * theta.sin();
 
-                        for j in chunk_start..chunk_end {
-                            buf.0[j] = dry_l[j] * dry_amt + buf.0[j] * mix;
-                            buf.1[j] = dry_r[j] * dry_amt + buf.1[j] * mix;
-                            buf.0[j] *= gl;
-                            buf.1[j] *= gr;
-                        }
+                    for j in chunk_start..chunk_end {
+                        buf.0[j] = dry_l[j] * dry_amt + buf.0[j] * mix;
+                        buf.1[j] = dry_r[j] * dry_amt + buf.1[j] * mix;
+                        buf.0[j] *= gl;
+                        buf.1[j] *= gr;
                     }
 
-                    if let Some(next_id) = chain.get(i + 1).copied() {
-                        let (pl, pr) = match self.shim_scratch.get(&shim_id) {
-                            Some(b) => (
-                                b.0[chunk_start..chunk_end].to_vec(),
-                                        b.1[chunk_start..chunk_end].to_vec(),
-                            ),
-                            None => continue,
-                        };
+                    if let Some(next_id) = self.shim_chains_cache[chain_idx].get(i + 1).copied() {
+                        {
+                            let Some(buf) = self.shim_scratch.get(&shim_id) else { continue; };
+                            self.shim_link_l[..chunk_len]
+                            .copy_from_slice(&buf.0[chunk_start..chunk_end]);
+                            self.shim_link_r[..chunk_len]
+                            .copy_from_slice(&buf.1[chunk_start..chunk_end]);
+                        }
                         if let Some(next) = self.shim_scratch.get_mut(&next_id) {
-                            for j in 0..(chunk_end - chunk_start) {
-                                next.0[chunk_start + j] += pl[j];
-                                next.1[chunk_start + j] += pr[j];
+                            for j in 0..chunk_len {
+                                next.0[chunk_start + j] += self.shim_link_l[j];
+                                next.1[chunk_start + j] += self.shim_link_r[j];
                             }
                         }
                     } else if let Some(b) = self.shim_scratch.get(&shim_id) {
@@ -960,6 +1006,7 @@ impl Engine {
             channel_to_insert,
             insert_scratch,
             sf2_scratch,
+            vst_events_buf,
             ..
         } = self;
 
@@ -974,7 +1021,8 @@ impl Engine {
         while chunk_start < block_end {
             let chunk_len = ((block_end - chunk_start) as usize).min(VST_BLOCK as usize);
             let chunk_end = chunk_start + chunk_len as i64;
-            let mut events: Vec<(i32, u8, u16, u8, u8)> = Vec::new();
+            vst_events_buf.clear();
+            let events = &mut *vst_events_buf;
 
             while vst_pending.front().map_or(false, |n| n.start < chunk_end) {
                 let n = vst_pending.pop_front().unwrap();
@@ -1002,7 +1050,7 @@ impl Engine {
             }
 
             events.sort_by_key(|e| (e.0, e.1));
-            for &(off, kind, iid, note, vel) in &events {
+            for &(off, kind, iid, note, vel) in events.iter() {
                 if let Some(host) = hosts.get_mut(&iid) {
                     let bit = 1u128 << (note.min(127) as u32);
                     let held = vst_held.entry(iid).or_insert(0);

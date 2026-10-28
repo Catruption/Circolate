@@ -51,27 +51,27 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Play a song
-    Play { #[arg(trailing_var_arg = true)] args: Vec<String> },
+    Play { #[arg(trailing_var_arg = true, allow_hyphen_values = true)] args: Vec<String> },
     /// Convert a source file to trackscript
-    Export { #[arg(trailing_var_arg = true)] args: Vec<String> },
+    Export { #[arg(trailing_var_arg = true, allow_hyphen_values = true)] args: Vec<String> },
     /// Print a file's parsed structure as JSON
-    Dump { #[arg(trailing_var_arg = true)] args: Vec<String> },
+    Dump { #[arg(trailing_var_arg = true, allow_hyphen_values = true)] args: Vec<String> },
     /// Run diagnostics
-    Test { #[arg(trailing_var_arg = true)] args: Vec<String> },
+    Test { #[arg(trailing_var_arg = true, allow_hyphen_values = true)] args: Vec<String> },
     /// Recursively probe .flp files for missing deps
-    Check { #[arg(trailing_var_arg = true)] args: Vec<String> },
+    Check { #[arg(trailing_var_arg = true, allow_hyphen_values = true)] args: Vec<String> },
     /// Tally plugin names across all .flp files
-    Census { #[arg(trailing_var_arg = true)] args: Vec<String> },
+    Census { #[arg(trailing_var_arg = true, allow_hyphen_values = true)] args: Vec<String> },
     /// Measure plugin default output levels
-    Measure { #[arg(trailing_var_arg = true)] args: Vec<String> },
+    Measure { #[arg(trailing_var_arg = true, allow_hyphen_values = true)] args: Vec<String> },
     /// List discovered VST3 / LV2 / CLAP
-    Plugins { #[arg(trailing_var_arg = true)] args: Vec<String> },
+    Plugins { #[arg(trailing_var_arg = true, allow_hyphen_values = true)] args: Vec<String> },
     /// Download missing fallback plugins
-    Fetch { #[arg(trailing_var_arg = true)] args: Vec<String> },
+    Fetch { #[arg(trailing_var_arg = true, allow_hyphen_values = true)] args: Vec<String> },
     /// Load a VST3, play a note, report peak
-    VstSmoke { #[arg(trailing_var_arg = true)] args: Vec<String> },
+    VstSmoke { #[arg(trailing_var_arg = true, allow_hyphen_values = true)] args: Vec<String> },
     /// Play a note through the native SF2 engine
-    Sf2Smoke { #[arg(trailing_var_arg = true)] args: Vec<String> },
+    Sf2Smoke { #[arg(trailing_var_arg = true, allow_hyphen_values = true)] args: Vec<String> },
     /// List available trackscripts
     List,
 }

@@ -470,7 +470,7 @@ fn handle_mouse(m: MouseEvent, tp: &Arc<Transport>, p: &Project, state: &mut Ren
         m.column >= r.x && m.column < r.x + r.width && m.row >= r.y && m.row < r.y + r.height
     };
     let in_box = state.queue_placed
-    .map_or(false, |q| has(q.notch) && !has(q.spiral));
+    .map_or(false, |q| has(q.box_rect) && !has(q.spiral));
 
     if in_box {
         if let (MouseEventKind::Down(b), Some(q)) = (m.kind, state.queue_placed) {

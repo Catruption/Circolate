@@ -213,16 +213,16 @@ fn render_slice(
 
     // 2. amp envelope on the output timeline
     resampled
-        .iter()
-        .enumerate()
-        .map(|(j, &x)| {
-            let g = match amp_pts {
-                Some(p) if !p.is_empty() => gain_at(p, (j as f64 / rate_f) / scale, k),
-                _ => 1.0,
-            };
-            (x as f64 * g).round().clamp(-32768.0, 32767.0) as i16
-        })
-        .collect()
+    .iter()
+    .enumerate()
+    .map(|(j, &x)| {
+        let g = match amp_pts {
+            Some(p) if !p.is_empty() => gain_at(p, (j as f64 / rate_f) / scale, k),
+         _ => 1.0,
+        };
+        (x as f64 * g).round().clamp(-32768.0, 32767.0) as i16
+    })
+    .collect()
 }
 
 pub(super) fn build(
@@ -320,7 +320,7 @@ pub(super) fn build(
             std::fs::create_dir_all(&dir).ok();
             std::fs::write(
                 dir.join(format!("{}_slice{:02}_key{}.wav", name, i, keys[i])),
-                wav16_mono(&rendered, pcm.rate),
+                           wav16_mono(&rendered, pcm.rate),
             )
             .ok();
         }
@@ -357,26 +357,40 @@ pub(super) fn build(
     pgen.extend_from_slice(&sf_gen(GEN_INSTRUMENT, 0));
     pgen.extend_from_slice(&sf_gen(0, 0));
 
+    // Zone mapping fix: instead of only mapping the explicit keys, we map
+    // all 128 MIDI keys. Notes played above the slice range wrap around
+    // (modulo n), matching FL Studio Slicex's overflow behavior.
+    let zone_count = if n > 0 { 128u16 } else { 0u16 };
+
     let mut inst = Vec::new();
     inst.extend_from_slice(&name20(name));
     inst.extend_from_slice(&0u16.to_le_bytes());
     inst.extend_from_slice(&name20("EOI"));
-    inst.extend_from_slice(&(n as u16).to_le_bytes());
+    inst.extend_from_slice(&zone_count.to_le_bytes());
 
     let mut ibag = Vec::new();
     let mut igen = Vec::new();
-    for i in 0..n {
-        ibag.extend_from_slice(&(i as u16 * gens_per_zone).to_le_bytes());
-        ibag.extend_from_slice(&0u16.to_le_bytes());
 
-        let key = keys[i] as u16;
-        igen.extend_from_slice(&sf_gen(GEN_KEY_RANGE, key | (key << 8)));
-        for g in &globals {
-            igen.extend_from_slice(g);
+    if n > 0 {
+        let base_key = keys.first().copied().unwrap_or(60) as i32;
+        let n_i32 = n as i32;
+
+        for k in 0..128u16 {
+            let slice_idx = ((k as i32 - base_key).rem_euclid(n_i32)) as usize;
+
+            ibag.extend_from_slice(&(k * gens_per_zone).to_le_bytes());
+            ibag.extend_from_slice(&0u16.to_le_bytes());
+
+            let key = k;
+            igen.extend_from_slice(&sf_gen(GEN_KEY_RANGE, key | (key << 8)));
+            for g in &globals {
+                igen.extend_from_slice(g);
+            }
+            igen.extend_from_slice(&sf_gen(GEN_SAMPLE_ID, slice_idx as u16));
         }
-        igen.extend_from_slice(&sf_gen(GEN_SAMPLE_ID, i as u16));
     }
-    ibag.extend_from_slice(&(n as u16 * gens_per_zone).to_le_bytes());
+
+    ibag.extend_from_slice(&(zone_count * gens_per_zone).to_le_bytes());
     ibag.extend_from_slice(&0u16.to_le_bytes());
     igen.extend_from_slice(&sf_gen(0, 0));
     let imod = vec![0u8; 10];

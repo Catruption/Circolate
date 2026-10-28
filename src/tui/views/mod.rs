@@ -7,7 +7,6 @@ pub mod horizontal;
 pub mod vertical;
 
 use ratatui::{
-    buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -20,8 +19,9 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use crate::player::{Project, Transport};
+use crate::tui::layout::{self, QueueLayout};
 use crate::tui::spiral::{build_coil, coil_sizes, SpiralLayout};
-use crate::tui::state::{RenderState, VISIBLE_LINES};
+use crate::tui::state::{RenderState, BUF_W};
 use crate::tui::theme::Theme;
 use crate::tui::widgets;
 use crate::tui::widgets::cover::Cover;
@@ -76,6 +76,7 @@ pub fn draw(
 
     draw_header(f, chunks[0], project, tp, sample_rate, state.loading.as_deref(), &theme);
 
+    // The bottom row belongs to the spiral's tape.
     let tape_rows: u16 = if chunks[1].height > 6 { 1 } else { 0 };
     let tracker_area = Rect { height: chunks[1].height - tape_rows, ..chunks[1] };
 
@@ -100,13 +101,19 @@ pub fn draw(
 
     let total_measures = project.line_count();
     let aspect = state.settings.layout.spiral_aspect_x.max(1);
-    let max_h_cfg = state.settings.layout.spiral_max_h.min(VISIBLE_LINES).max(2);
+    let max_h_cfg = state.settings.layout.spiral_max_h.max(2);
 
     let tape_left = chunks[1].left();
     let budget_w = (chunks[1].width as usize / 2).max(8);
-    let budget_h = max_h_cfg.min((chunks[1].height as usize).saturating_sub(2).max(2));
-    let mut scratch = Buffer::empty(area);
-    let mut best: Option<SpiralLayout> = None;
+    let budget_h = max_h_cfg
+    .min((chunks[1].height as usize).saturating_sub(2).max(2));
+
+    let speed_label_w = state.queue.speed_label.chars().count() as u16;
+
+    // Try coil sizes from smallest upward; take the first whose tape fits
+    // in the room the queue box leaves.  No rendering needed during the
+    // search — `compute_queue` is pure geometry, so the loop is cheap.
+    let mut best: Option<(SpiralLayout, QueueLayout)> = None;
     for n in coil_sizes(total_measures, aspect) {
         let mut layout = build_coil(total_measures, n, aspect);
         layout.tape_left = tape_left;
@@ -114,41 +121,32 @@ pub fn draw(
             break;
         }
         let size = (layout.grid_w.max(1), layout.grid_h);
-        let Some(p) = widgets::queue::render(
-            &state.queue,
-            chunks[1],
-            &mut scratch,
-            &theme,
-            size,
-            tape_rows,
+        let Some(queue_layout) = layout::compute_queue(
+            chunks[1], tape_rows, size, BUF_W, speed_label_w,
         ) else {
             if best.is_some() { break; }
             continue;
         };
-        let fits = layout.tape_fits(p.spiral.x);
-        best = Some(layout);
+        let fits = layout.tape_fits(queue_layout.spiral.x);
+        best = Some((layout, queue_layout));
         if fits { break; }
     }
 
+    // Draw the queue box.
     let (spiral_layout, queue_placed) = match best {
-        Some(layout) => {
-            let size = (layout.grid_w.max(1), layout.grid_h);
+        Some((spiral_layout, queue_layout)) => {
             let placed = widgets::queue::render(
-                &state.queue,
-                chunks[1],
-                f.buffer_mut(),
-                                                &theme,
-                                                size,
-                                                tape_rows,
+                &state.queue, &queue_layout, f.buffer_mut(), &theme,
             );
-            (Some(layout), placed)
+            (Some(spiral_layout), Some(placed))
         }
         None => (None, None),
     };
     state.queue_placed = queue_placed;
 
+    // Notch: bottom-left strip.  Bounded by the queue box on the right.
     let notch_max_x = queue_placed
-    .map_or(chunks[1].right().saturating_sub(1), |q| q.notch.x);
+    .map_or(chunks[1].right().saturating_sub(1), |q| q.box_rect.x);
     let segments = build_notch_segments(state);
     state.notch = widgets::notch::render(
         &segments,
@@ -176,7 +174,7 @@ pub fn draw(
         widgets::help::draw(f, area, &theme);
     }
 
-    if state.player.show_config {                                   // ← CHANGE
+    if state.player.show_config {
         widgets::config::draw(f, area, &state.config_ui, &state.settings);
     }
 }
@@ -225,8 +223,6 @@ fn refresh_cover(state: &mut RenderState, project: &Project, area: Rect) {
     }
 }
 
-/// The notch's current contents.  Add segments here — for example a
-/// `blocklist N/M` status cell — and they'll render automatically.
 fn build_notch_segments(state: &RenderState) -> Vec<widgets::notch::Segment> {
     use crate::tui::state::NotchTag;
     use crate::tui::widgets::notch::Segment;
@@ -236,11 +232,13 @@ fn build_notch_segments(state: &RenderState) -> Vec<widgets::notch::Segment> {
             text: state.settings.layout.help_glyph.clone(),
             tag: Some(NotchTag::Help),
             emphasized: true,
+            color: None,
         },
-        Segment {                                             // ← CHANGE
+        Segment {
             text: "⇅".into(),
             tag: Some(NotchTag::Settings),
             emphasized: false,
+            color: Some(Color::Cyan),
         },
     ]
 }

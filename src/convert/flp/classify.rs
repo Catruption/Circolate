@@ -94,39 +94,10 @@ pub(super) fn classify_channels<'a>(
 
         match chan.channel_type.as_str() {
             "sampler" | "instrument" => {
-                // FL often wraps Slicex channels as "instrument" rather than
-                // "native" depending on the FL version or how the project was
-                // saved. Check for Slicex here first, so we parse the slice
-                // points instead of copying the raw WAV and ignoring them.
                 if let Some(plugin) = chan.plugin.as_ref() {
                     if slicex::is_slicex(plugin) {
                         match slicex::convert(chan, plugin, placed, aux_files, &mut warnings, if prj.tempo > 0.0 { prj.tempo } else { super::DEFAULT_TEMPO }) {
                             Ok(out) => {
-                                let (lo, hi) = (out.base_key, out.base_key + out.slices as u32);
-                                let mut stray_keys: Vec<u32> =
-                                placed.get(&chan.iid).map_or_else(Vec::new, |v| {
-                                    v.iter()
-                                    .map(|p| p.note.key as u32)
-                                    .filter(|&k| k < lo || k >= hi)
-                                    .collect()
-                                });
-                                let stray = stray_keys.len();
-                                stray_keys.sort_unstable();
-                                stray_keys.dedup();
-                                if stray > 0 {
-                                    warnings.push(format!(
-                                        "[{:2}] Slicex: {} note(s) outside slice keys {}..{} will be silent (keys: {})",
-                                                          chan.iid,
-                                                          stray,
-                                                          lo,
-                                                          hi - 1,
-                                                          stray_keys
-                                                          .iter()
-                                                          .map(|k| k.to_string())
-                                                          .collect::<Vec<_>>()
-                                                          .join(", ")
-                                    ));
-                                }
                                 sidecar_path.insert(chan.iid, out.instrument_rel);
                                 usable_sf2.push(chan);
                             }
@@ -173,37 +144,10 @@ pub(super) fn classify_channels<'a>(
                     }
                 }
 
-                // 0. Slicex? (redundant if it was already caught above, but
-                // some truly native channels might still be Slicex).
                 if let Some(plugin) = chan.plugin.as_ref() {
                     if slicex::is_slicex(plugin) {
                         match slicex::convert(chan, plugin, placed, aux_files, &mut warnings, if prj.tempo > 0.0 { prj.tempo } else { super::DEFAULT_TEMPO }) {
                             Ok(out) => {
-                                let (lo, hi) = (out.base_key, out.base_key + out.slices as u32);
-                                let mut stray_keys: Vec<u32> =
-                                placed.get(&chan.iid).map_or_else(Vec::new, |v| {
-                                    v.iter()
-                                    .map(|p| p.note.key as u32)
-                                    .filter(|&k| k < lo || k >= hi)
-                                    .collect()
-                                });
-                                let stray = stray_keys.len();
-                                stray_keys.sort_unstable();
-                                stray_keys.dedup();
-                                if stray > 0 {
-                                    warnings.push(format!(
-                                        "[{:2}] Slicex: {} note(s) outside slice keys {}..{} will be silent (keys: {})",
-                                                          chan.iid,
-                                                          stray,
-                                                          lo,
-                                                          hi - 1,
-                                                          stray_keys
-                                                          .iter()
-                                                          .map(|k| k.to_string())
-                                                          .collect::<Vec<_>>()
-                                                          .join(", ")
-                                    ));
-                                }
                                 sidecar_path.insert(chan.iid, out.instrument_rel);
                                 usable_sf2.push(chan);
                             }
@@ -213,7 +157,6 @@ pub(super) fn classify_channels<'a>(
                     }
                 }
 
-                // 1. SoundFont player?
                 if let Some(plugin) = chan.plugin.as_ref() {
                     let is_sf2_plugin = sf2::is_sf2_player(plugin);
                     let has_sf2_marker = plugin
@@ -269,7 +212,6 @@ pub(super) fn classify_channels<'a>(
                         }
                 }
 
-                // 2. Embedded audio in plugin state?
                 if let Some(plugin) = chan.plugin.as_ref() {
                     if let Some(emb) = extract_embedded(chan, &plugin.state, &mut warnings) {
                         usable_embedded.push((chan, emb));
@@ -277,7 +219,6 @@ pub(super) fn classify_channels<'a>(
                     }
                 }
 
-                // 3. VST
                 let has_state = chan.plugin.as_ref().map_or(false, |p| !p.state.is_empty());
                 if !has_state {
                     skipped.push((chan, "native channel without saved state".into()));
@@ -352,7 +293,6 @@ pub(super) fn classify_channels<'a>(
         }
     }
 
-    // ── VST sidecars for every usable native ─────────────────────────
     {
         let mut used: HashMap<String, u32> = HashMap::new();
         for chan in &usable_natives {
@@ -423,58 +363,107 @@ fn handle_sf2(
     .unwrap_or("?")
     .to_string();
 
-    let soundfonts_dir: Option<PathBuf> =
-    Some(crate::paths::system_data().join("soundfonts"))
-    .filter(|p| p.is_dir());
+    let sf2_roots: Vec<PathBuf> = crate::paths::soundfont_roots()
+    .into_iter()
+    .filter(|p| p.is_dir())
+    .collect();
 
-    let mut dirs: Vec<&Path> = Vec::with_capacity(3);
+    let mut dirs: Vec<&Path> = Vec::with_capacity(2 + sf2_roots.len());
     if let Some(d) = opts.samples_dir.as_deref() {
         dirs.push(d);
     }
     dirs.push(flp_dir);
-    if let Some(d) = soundfonts_dir.as_deref() {
-        dirs.push(d);
+    for root in &sf2_roots {
+        dirs.push(root.as_path());
     }
 
     if debug_on() {
         eprintln!(
-            "flp: chan {} sf2 state: path={:?} bank={} patch={} dirs={}",
-            chan.iid,
+            "flp: chan {} sf2 state: path={:?} bank={} patch={}",
+            chan.iid, want, sf.bank, sf.preset,
+        );
+        for d in &dirs {
+            eprintln!("flp:   search root: {}", d.display());
+        }
+    }
+
+    let src: PathBuf = if let Some(p) = crate::paths::find_soundfont(&want) {
+        if debug_on() {
+            eprintln!(
+                "flp: chan {} sf2 resolved via paths::find_soundfont: {}",
+                chan.iid,
+                p.display()
+            );
+        }
+        p
+    } else if let Some(p) = sf2::find_sf2(Some(sf), &chan.name, &dirs) {
+        if debug_on() {
+            eprintln!(
+                "flp: chan {} sf2 resolved via channel-name search: {}",
+                chan.iid,
+                p.display()
+            );
+        }
+        p
+    } else {
+        let roots: Vec<String> = crate::paths::soundfont_roots()
+        .iter()
+        .map(|p| {
+            format!(
+                "  {}{}",
+                p.display(),
+                    if p.is_dir() { "" } else { " (missing)" }
+            )
+        })
+        .collect();
+        return Sf2Outcome::Skip(format!(
+            "SF2 not found: {}\nsearched:\n{}\nset CIRCOLATE_SOUNDFONT_DIR to override",
             want,
-            sf.bank,
-            sf.preset,
-            dirs.len()
-        );
-    }
-
-    let Some(src) = sf2::find_sf2(Some(sf), &chan.name, &dirs) else {
-        return Sf2Outcome::Skip(format!("SF2 not found: {}", want));
+            roots.join("\n")
+        ));
     };
-    if debug_on() {
-        eprintln!(
-            "flp: chan {} sf2 {} bank {} patch {}",
-            chan.iid,
-            src.display(),
-                  sf.bank,
-                  sf.preset
-        );
-    }
 
-    match sf2_presets_of(&src, preset_cache) {
-        Some(presets) => {
-            let bank_u16 = sf.bank as u16;
-            let preset_u16 = sf.preset as u16;
-            if !presets.iter().any(|(b, p)| *b == bank_u16 && *p == preset_u16) {
+    let mut resolved_bank = sf.bank;
+    let mut resolved_preset = sf.preset;
+
+    // 1. Read available presets and apply the fallback ladder
+    if let Some(presets) = sf2_presets_of(&src, preset_cache) {
+        if let Some((fb_bank, fb_preset)) =
+            sf2::resolve_sf2_preset(sf.bank as u16, sf.preset as u16, &presets)
+            {
+                resolved_bank = fb_bank as u32;
+                resolved_preset = fb_preset as u32;
+
+                if resolved_bank != sf.bank || resolved_preset != sf.preset {
+                    warnings.push(format!(
+                        "[{:2}] {}: SF2 preset ({}, {}) not found in {} — using nearest ({}, {})",
+                                          chan.iid,
+                                          if chan.name.is_empty() { &chan.channel_type } else { &chan.name },
+                                              sf.bank,
+                                          sf.preset,
+                                          src.display(),
+                                          resolved_bank,
+                                          resolved_preset,
+                    ));
+                }
+            } else {
+                // No presets found at all (corrupt file), bail to VST.
                 return Sf2Outcome::PresetMissing(format!(
-                    "{}: SF2 preset ({}, {}) not in {} — routing to fallback",
-                                                         if chan.name.is_empty() { &chan.channel_type } else { &chan.name },
-                                                             sf.bank,
-                                                         sf.preset,
-                                                         src.display(),
+                    "{}: SF2 has no presets in {} — routing to fallback",
+                    if chan.name.is_empty() { &chan.channel_type } else { &chan.name },
+                        src.display(),
                 ));
             }
-        }
-        None => {}
+    }
+
+    if debug_on() {
+        eprintln!(
+            "flp: chan {} sf2 {} bank {} patch {} (resolved)",
+                  chan.iid,
+                  src.display(),
+                  resolved_bank,
+                  resolved_preset
+        );
     }
 
     let base_raw = if chan.name.is_empty() {
@@ -484,6 +473,7 @@ fn handle_sf2(
     };
     let base = identifier(&base_raw);
 
+    // 2. Write sidecar with the RESOLVED values, not the original ones
     match write_sf2_sidecar(
         chan,
         &base,
@@ -491,8 +481,8 @@ fn handle_sf2(
         sf2_copied,
         aux_files,
         warnings,
-        sf.bank,
-        sf.preset,
+        resolved_bank,
+        resolved_preset,
     ) {
         Some(rel) => Sf2Outcome::Done(rel),
         None => Sf2Outcome::Skip(format!(

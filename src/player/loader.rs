@@ -1,6 +1,6 @@
 //! Streaming loader: emits voices for a horizon of upcoming blocks.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::timing::AutomationLane;
 
@@ -15,12 +15,24 @@ pub(crate) struct Loaded {
 
 pub(crate) struct Loader {
     project: Arc<Project>,
-    pub(crate) cache: Cache,
+    pub(crate) cache: Arc<Mutex<Cache>>,
     pub(crate) cursor: usize,
 }
 
 impl Loader {
+    /// Construct from an owned cache, wrapping it in `Arc<Mutex<_>>`.
+    /// Used by the worker thread when no pre-warm has been done.
+    #[allow(dead_code)]
     pub(crate) fn new(project: Arc<Project>, cache: Cache) -> Self {
+        Loader {
+            project,
+            cache: Arc::new(Mutex::new(cache)),
+            cursor: 0,
+        }
+    }
+
+    /// Construct from a shared cache, so pre-warm results persist.
+    pub(crate) fn with_shared_cache(project: Arc<Project>, cache: Arc<Mutex<Cache>>) -> Self {
         Loader {
             project,
             cache,
@@ -32,16 +44,19 @@ impl Loader {
         let project = Arc::clone(&self.project);
         let mut samples = Vec::new();
         let mut vsts = Vec::new();
+        let mut cache = self.cache.lock().unwrap();
         while self.cursor < project.order.len() {
             let li = project.order[self.cursor];
             if project.lines[li].min_start > horizon {
                 break;
             }
             self.cursor += 1;
-            let batch = prepare_line(&project, &mut self.cache, li, i64::MIN);
+            let batch = prepare_line(&project, &mut cache, li, i64::MIN);
             samples.extend(batch.samples);
             vsts.extend(batch.vsts);
         }
+        samples.sort_unstable_by_key(Scheduled::key);
+        vsts.sort_unstable_by_key(VstNote::key);
         Loaded { samples, vsts }
     }
 
@@ -50,6 +65,7 @@ impl Loader {
         self.cursor = 0;
         let mut samples = Vec::new();
         let mut vsts = Vec::new();
+        let mut cache = self.cache.lock().unwrap();
         while self.cursor < project.order.len() {
             let li = project.order[self.cursor];
             let line = &project.lines[li];
@@ -60,10 +76,12 @@ impl Loader {
             if line.max_end <= to {
                 continue;
             }
-            let batch = prepare_line(&project, &mut self.cache, li, to);
+            let batch = prepare_line(&project, &mut cache, li, to);
             samples.extend(batch.samples);
             vsts.extend(batch.vsts);
         }
+        samples.sort_unstable_by_key(Scheduled::key);
+        vsts.sort_unstable_by_key(VstNote::key);
         Loaded { samples, vsts }
     }
 }
@@ -134,12 +152,8 @@ pub(crate) fn prepare_line(
 
             let (mut vol, mut pan) = (tv.vol, tv.pan);
             if let Some(ov) = &call.overrides {
-                if let Some(v) = ov.vol {
-                    vol = v;
-                }
-                if let Some(p) = ov.pan {
-                    pan = p;
-                }
+                if let Some(v) = ov.vol { vol = v; }
+                if let Some(p) = ov.pan { pan = p; }
             }
 
             let mut offset = tv.offset as f64;
@@ -157,9 +171,7 @@ pub(crate) fn prepare_line(
             }
 
             let mk = |wp: &Vec<_>, initial: f64| -> Option<AutomationLane> {
-                if wp.is_empty() {
-                    return None;
-                }
+                if wp.is_empty() { return None; }
                 let abs: Vec<_> = wp
                 .iter()
                 .map(|&(r, d, x)| (call_base_row + r - measure_start, d, x))

@@ -12,10 +12,10 @@ pub(crate) fn stretch(chans: &[&[f32]], factor: f64, sr: f64) -> Vec<Vec<f32>> {
         return vec![Vec::new(); nch];
     }
 
-    let win = (((sr * 0.04) as usize).max(64)) & !1; // ~40 ms, even
+    let win = (((sr * 0.04) as usize).max(64)) & !1;
     let hop_out = win / 2;
     let hop_in = hop_out as f64 / factor;
-    let tol = ((sr * 0.012) as usize).max(8); // ±12 ms search
+    let tol = ((sr * 0.012) as usize).max(8);
 
     if n_in < win * 2 + 2 * tol {
         return linear(chans, out_len);
@@ -35,30 +35,53 @@ pub(crate) fn stretch(chans: &[&[f32]], factor: f64, sr: f64) -> Vec<Vec<f32>> {
     let frames = out_len / hop_out + 1;
     let mut prev = 0usize;
 
+    // Reusable energy buffer for the search step.  Recomputed per frame
+    // because the search window shifts with `nominal`.
+    let search_span_max = 2 * tol + 1;
+    let mut energy: Vec<f32> = vec![0.0; search_span_max];
+
     for k in 0..frames {
         let nominal = (k as f64 * hop_in).round() as isize;
         let pos = if k == 0 {
             0
         } else {
-            // The segment that would naturally follow the previous one.
             let tgt = (prev + hop_out).min(max_pos);
             let lo = (nominal - tol as isize).max(0);
             let hi = (nominal + tol as isize).min(max_pos as isize);
             if lo > hi {
                 max_pos
             } else {
-                let mut best = lo as usize;
-                let mut best_score = f64::MIN;
-                for cand in lo as usize..=hi as usize {
-                    let (mut dot, mut en) = (0f64, 1e-9f64);
+                let lo_u = lo as usize;
+                let hi_u = hi as usize;
+                let span = hi_u - lo_u + 1;
+
+                // Sliding-window energy: energy[c] = Σ mid[c..c+win]².
+                // Compute the first candidate directly, then update as a
+                // running sum — one subtraction and one addition per step.
+                let mut sum = 0f32;
+                for i in 0..win {
+                    let x = mid[lo_u + i];
+                    sum += x * x;
+                }
+                energy[0] = sum;
+                for c in 1..span {
+                    let leaving = mid[lo_u + c - 1];
+                    let entering = mid[lo_u + c + win - 1];
+                    sum = sum - leaving * leaving + entering * entering;
+                    energy[c] = sum;
+                }
+
+                let mut best = lo_u;
+                let mut best_score = f32::MIN;
+                for c in 0..span {
+                    let cand = lo_u + c;
+                    let mut dot = 0f32;
                     let mut i = 0;
                     while i < win {
-                        let a = mid[cand + i] as f64;
-                        dot += a * mid[tgt + i] as f64;
-                        en += a * a;
+                        dot += mid[cand + i] * mid[tgt + i];
                         i += 4;
                     }
-                    let score = dot / en.sqrt();
+                    let score = dot / (energy[c] + 1e-9).sqrt();
                     if score > best_score {
                         best_score = score;
                         best = cand;
@@ -76,8 +99,6 @@ pub(crate) fn stretch(chans: &[&[f32]], factor: f64, sr: f64) -> Vec<Vec<f32>> {
                 if o + i >= dst.len() {
                     break;
                 }
-                // Keep the very first half-window at full gain so an
-                // onset at the start of the sample is not faded in.
                 let w = if k == 0 && i < hop_out { 1.0 } else { hann[i] };
                 dst[o + i] += w * src[i];
             }
@@ -124,7 +145,6 @@ mod tests {
         .collect();
         let out = stretch(&[&sine], 1.2857, sr);
         assert_eq!(out[0].len(), (n as f64 * 1.2857).round() as usize);
-        // Count zero crossings: frequency should stay ~440 Hz.
         let zc = out[0].windows(2).filter(|w| w[0] <= 0.0 && w[1] > 0.0).count();
         let hz = zc as f64 / (out[0].len() as f64 / sr);
         assert!((hz - 440.0).abs() < 15.0, "got {hz}");

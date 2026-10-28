@@ -10,7 +10,7 @@
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
 };
 
 use crate::tui::state::{NotchPlaced, NotchTag};
@@ -18,16 +18,15 @@ use crate::tui::theme::{Theme, Token};
 
 /// One rendered segment.  `tag` is `Some` if clicking it should do
 /// something; `emphasized` picks the accent colour over the plain
-/// border colour.
+/// border colour.  `color` overrides `emphasized` when set, so a
+/// segment can have its own accent (e.g. Settings in cyan).
 pub struct Segment {
     pub text: String,
     pub tag: Option<NotchTag>,
     pub emphasized: bool,
+    pub color: Option<Color>,
 }
 
-/// Render the notch on the bottom row of `tracker`.  `max_x` is an
-/// exclusive right bound: the notch will not write at or past it.
-/// Returns `None` if the segments don't fit before `max_x`.
 pub fn render(
     segments: &[Segment],
     tracker: Rect,
@@ -39,13 +38,11 @@ pub fn render(
         return None;
     }
 
-    // Content width = sum of segment widths + one space between each,
-    // plus the `[` and `]` brackets.
     let content_w: usize = segments
-        .iter()
-        .map(|s| s.text.chars().count())
-        .sum::<usize>()
-        + segments.len().saturating_sub(1);
+    .iter()
+    .map(|s| s.text.chars().count())
+    .sum::<usize>()
+    + segments.len().saturating_sub(1);
     let notch_w = content_w + 2;
 
     let x0 = tracker.x;
@@ -57,8 +54,8 @@ pub fn render(
 
     let border_style = Style::default().fg(theme.color(Token::Border));
     let emphasis = Style::default()
-        .fg(theme.color(Token::HelpButton))
-        .add_modifier(Modifier::BOLD);
+    .fg(theme.color(Token::HelpButton))
+    .add_modifier(Modifier::BOLD);
 
     put(buf, x0, y, "[", border_style);
     let mut cursor = x0 + 1;
@@ -69,7 +66,13 @@ pub fn render(
             put(buf, cursor, y, " ", border_style);
             cursor += 1;
         }
-        let style = if seg.emphasized { emphasis } else { border_style };
+        let style = if let Some(c) = seg.color {
+            Style::default().fg(c).add_modifier(Modifier::BOLD)
+        } else if seg.emphasized {
+            emphasis
+        } else {
+            border_style
+        };
         put(buf, cursor, y, &seg.text, style);
         let w = seg.text.chars().count() as u16;
         if let Some(tag) = seg.tag {

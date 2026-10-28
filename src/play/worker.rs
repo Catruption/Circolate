@@ -10,7 +10,7 @@ use crate::player::{self, Cache, Loader, Msg, Project, Transport};
 use super::audio::Silence;
 
 pub struct ReloadSlot {
-    pub pending: Mutex<Option<(Arc<Project>, Cache)>>,
+    pub pending: Mutex<Option<(Arc<Project>, Arc<Mutex<Cache>>)>>,
 }
 
 pub fn watch_for_changes(
@@ -50,7 +50,7 @@ pub fn watch_for_changes(
                 }
                 last_hashes = new_hashes;
                 if let Ok(mut g) = slot.pending.lock() {
-                    *g = Some((project, cache));
+                    *g = Some((project, Arc::new(Mutex::new(cache))));
                 }
                 last_mtime = mtime;
             }
@@ -82,7 +82,7 @@ pub fn worker(
             let pending = slot.pending.lock().ok().and_then(|mut g| g.take());
             if let Some((new_project, new_cache)) = pending {
                 wrap_ready = false;
-                loader = Loader::new(new_project, new_cache);
+                loader = Loader::with_shared_cache(new_project, new_cache);
                 let cur = tp.position.load(Ordering::Relaxed);
                 tp.seek_to.store(cur, Ordering::Release);
                 tp.reload_count.fetch_add(1, Ordering::Relaxed);

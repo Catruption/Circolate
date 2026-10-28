@@ -190,7 +190,13 @@ pub(crate) fn render_offline(
         engine.render(&mut l[i..i + n], &mut r[i..i + n], 1);
         i += n;
     }
-    (l, r, loader.cache)
+    let cache = Arc::try_unwrap(loader.cache)
+    .ok()
+    .expect("offline render should own the cache exclusively")
+    .into_inner()
+    .ok()
+    .expect("cache mutex poisoned");
+    (l, r, cache)
 }
 
 pub(crate) fn write_wav(path: &Path, l: &[f32], r: &[f32], sr: u32) -> Result<()> {

@@ -62,11 +62,7 @@ pub fn run(args: Args) -> Result<()> {
                            settings.clone(),
             ) {
                 Ok(Outcome::Quit) => return Ok(()),
-                  Ok(Outcome::Next {
-                      name,
-                      queue: q,
-                      notes: n,
-                  }) => {
+                  Ok(Outcome::Next { name, queue: q, notes: n }) => {
                       queue = q;
                       pending_notes = n;
                       match crate::paths::resolve_track(&name) {
@@ -128,11 +124,10 @@ fn play_one(
     let channels = stream_config.channels as usize;
 
     let is_watchable_trackscript = song.map_or(false, |p| {
-        !is_archive(p)
-        && matches!(SourceKind::from_path(p), Ok(SourceKind::Trackscript))
+        !is_archive(p) && matches!(SourceKind::from_path(p), Ok(SourceKind::Trackscript))
     });
 
-    let (project, cache, project_path, _guard) = match song {
+    let (project, cache_owned, project_path, _guard) = match song {
         Some(p) => {
             let (ts_path, guard) = resolve_source(p, args)?;
             let (project, cache) = {
@@ -147,6 +142,20 @@ fn play_one(
             (project, cache, std::path::PathBuf::new(), None)
         }
     };
+
+    // ── share the cache across pre-warm and worker ────────────────────
+    let cache = Arc::new(Mutex::new(cache_owned));
+
+    // ── pre-warm: walk the entire project and force template builds and
+    //     stretches *before* playback starts.  This moves WSOLA clusters
+    //     from "first 3s of playback" to "loading screen".  Runs on the
+    //     main thread with the terminal in loading state, so any silence
+    //     the OS produces goes unnoticed.
+    if project.order.len() > 0 {
+        let _s = Silence::new();
+        let mut prewarm = Loader::with_shared_cache(Arc::clone(&project), Arc::clone(&cache));
+        let _ = prewarm.load_due(i64::MAX);
+    }
 
     let mut queue = queue;
     if queue.playing.is_none() {
@@ -204,9 +213,13 @@ fn play_one(
 
     let (tx, rx): (Sender<Msg>, Receiver<Msg>) = channel();
     let (wrap_tx, wrap_rx): (Sender<Msg>, Receiver<Msg>) = channel();
-    let lookahead = sample_rate as i64 / 4;
+
+    // 2-second lookahead gives the worker ~8× more slack to absorb cold
+    // template builds or stretch clusters without the audio thread's
+    // pending queue draining.
+    let lookahead = sample_rate as i64 * 2;
     {
-        let loader = Loader::new(Arc::clone(&project), cache);
+        let loader = Loader::with_shared_cache(Arc::clone(&project), Arc::clone(&cache));
         let tp = Arc::clone(&transport);
         let slot = reload_slot.clone();
         std::thread::spawn(move || worker(loader, tx, tp, lookahead, slot, total, wrap_tx));
@@ -343,10 +356,6 @@ fn play_one(
 
     match request {
         None => Ok(Outcome::Quit),
-        Some(name) => Ok(Outcome::Next {
-            name,
-            queue,
-            notes,
-        }),
+        Some(name) => Ok(Outcome::Next { name, queue, notes }),
     }
 }

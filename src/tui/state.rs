@@ -20,9 +20,6 @@ pub const GUTTER_W: u16 = 3;
 pub const TEXT_W: u16 = 9;
 pub const BUF_W: u16 = GUTTER_W + TEXT_W;
 pub const VISIBLE_LINES: usize = 5;
-/// Top edge + transport row + buffer rows.  The last buffer row sits
-/// on the tracker's bottom border row.
-pub const NOTCH_H: u16 = 2 + VISIBLE_LINES as u16;
 
 #[derive(Debug, Clone)]
 pub struct QueueLine {
@@ -251,7 +248,7 @@ pub enum Click { None, Rewind, Play }
 /// Where the queue widget drew things, for the event loop to hit-test.
 #[derive(Clone, Copy)]
 pub struct Placed {
-    pub notch: Rect,
+    pub box_rect: Rect,
     pub spiral: Rect,
     pub rewind: Rect,
     pub play: Rect,
