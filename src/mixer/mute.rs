@@ -1,22 +1,25 @@
 //! Global mute/solo state.  The tracker UI mutates this; the audio
-//! callback reads it.  A single `Mutex<Inner>` keeps the invariant that
-//! a note's audibility is consistent with what the UI is displaying.
+//! callback reads it.
+//!
+//! Reads are lock-free and allocation-free (`ArcSwap::load`), so the
+//! audio thread never waits on the UI.  Writers copy the state, edit
+//! the copy, and swap it in (`rcu`), which is fine at UI rates.
 //!
 //! Mute and solo are exclusive per part: soloing a muted part unmutes
 //! it, muting a soloed part unsolos it.  Any number of parts can be
 //! muted; at most one can be soloed.
-//!
-//! The audio side needs one call per note-on: `is_note_active`.  See
-//! the doc comment on that function for the exact invocation.
 
-use std::collections::HashSet;
-use std::sync::{Mutex, OnceLock};
+use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 
-#[derive(Default)]
+use arc_swap::ArcSwap;
+
+#[derive(Default, Clone)]
 struct Inner {
-    /// Notes that are individually muted, keyed by
-    /// (part path, block line, start row within the block).
-    muted_notes: HashSet<(String, usize, i64)>,
+    /// Individually muted notes: part path -> (block line, start row).
+    /// Nested so the audio side can look up by `&str` without building
+    /// a `(String, ..)` key (which would allocate on every call).
+    muted_notes: HashMap<String, HashSet<(usize, i64)>>,
     /// Parts whose every note is muted.
     muted_parts: HashSet<String>,
     /// The single soloed part, if any.  When set, only that part's
@@ -24,143 +27,97 @@ struct Inner {
     soloed_part: Option<String>,
 }
 
-struct MuteState {
-    inner: Mutex<Inner>,
-}
+static MUTE: LazyLock<ArcSwap<Inner>> = LazyLock::new(|| ArcSwap::from_pointee(Inner::default()));
 
-static MUTE: OnceLock<MuteState> = OnceLock::new();
-
-fn state() -> &'static MuteState {
-    MUTE.get_or_init(|| MuteState { inner: Mutex::new(Inner::default()) })
+/// Copy-edit-swap.  `f` may run more than once if another writer races us.
+fn update(f: impl Fn(&mut Inner)) {
+    MUTE.rcu(|cur| {
+        let mut next = Inner::clone(cur);
+        f(&mut next);
+        next
+    });
 }
 
 // ── audio-side read ────────────────────────────────────────────────────
 
-/// Whether a given note should be audible.
-///
-/// Call this from the audio callback when a note-on is about to be
-/// dispatched:
-///
-/// ```ignore
-/// if crate::mixer::mute::is_note_active(&part_path, block_line, start_row) {
-///     // schedule the note as usual
-/// }
-/// ```
+/// Whether a given note should be audible.  Wait-free, no allocation.
 ///
 /// - `part_path` is the same string `Project::part_path` returns.
-/// - `block_line` is the index of the line the note's block originated
-///   on, not the currently-playing line.  For a carried note, this is
-///   the original block's line, not the line the note has been carried
-///   into.  Stable across the note's lifetime.
+/// - `block_line` is the line the note's block originated on (stable
+///   across the note's lifetime, even for carried notes).
 /// - `start_row` is the note's row within its block, in the source's
 ///   own coordinate system.
 pub fn is_note_active(part_path: &str, block_line: usize, start_row: i64) -> bool {
-    let m = state();
-    let inner = match m.inner.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    };
-
-    // Solo, when set, wins over everything else.
-    if let Some(soloed) = &inner.soloed_part {
-        if soloed != part_path {
-            return false;
-        }
-    }
-    if inner.muted_parts.contains(part_path) {
+    let s = MUTE.load();
+    if s.soloed_part.as_deref().is_some_and(|p| p != part_path) {
         return false;
     }
-    if inner.muted_notes.contains(&(part_path.to_string(), block_line, start_row)) {
+    if s.muted_parts.contains(part_path) {
         return false;
     }
-    true
+    !s.muted_notes
+        .get(part_path)
+        .is_some_and(|rows| rows.contains(&(block_line, start_row)))
 }
 
 // ── mutators ───────────────────────────────────────────────────────────
 
 pub fn toggle_note_mute(part_path: &str, block_line: usize, start_row: i64) {
-    let m = state();
-    let mut inner = match m.inner.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    };
-    let key = (part_path.to_string(), block_line, start_row);
-    if !inner.muted_notes.remove(&key) {
-        inner.muted_notes.insert(key);
-    }
+    update(|s| {
+        let key = (block_line, start_row);
+        let rows = s.muted_notes.entry(part_path.to_string()).or_default();
+        if !rows.remove(&key) {
+            rows.insert(key);
+        }
+        if rows.is_empty() {
+            s.muted_notes.remove(part_path);
+        }
+    });
 }
 
-/// Toggle mute on a part.  Muting the currently-soloed part unsolos it,
-/// because the two states are exclusive.
+/// Toggle mute on a part.  Muting the currently-soloed part unsolos it.
 pub fn toggle_part_mute(part_path: &str) {
-    let m = state();
-    let mut inner = match m.inner.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    };
-    if !inner.muted_parts.remove(part_path) {
-        if inner.soloed_part.as_deref() == Some(part_path) {
-            inner.soloed_part = None;
+    update(|s| {
+        if !s.muted_parts.remove(part_path) {
+            if s.soloed_part.as_deref() == Some(part_path) {
+                s.soloed_part = None;
+            }
+            s.muted_parts.insert(part_path.to_string());
         }
-        inner.muted_parts.insert(part_path.to_string());
-    }
+    });
 }
 
 /// Toggle solo on a part.  Soloing a different part moves the solo
-/// there.  Soloing a muted part unmutes it, because the two states are
-/// exclusive.
+/// there.  Soloing a muted part unmutes it.
 pub fn toggle_solo(part_path: &str) {
-    let m = state();
-    let mut inner = match m.inner.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    };
-    if inner.soloed_part.as_deref() == Some(part_path) {
-        inner.soloed_part = None;
-    } else {
-        inner.muted_parts.remove(part_path);
-        inner.soloed_part = Some(part_path.to_string());
-    }
-}
-
-/// Set the soloed part explicitly.  `None` clears it.  Used by `h`/`l`
-/// navigation, where "move the solo pointer" is a set operation, not a
-/// toggle.
-pub fn set_solo(part: Option<&str>) {
-    let m = state();
-    let mut inner = match m.inner.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    };
-    match part {
-        Some(p) => {
-            inner.muted_parts.remove(p);
-            inner.soloed_part = Some(p.to_string());
+    update(|s| {
+        if s.soloed_part.as_deref() == Some(part_path) {
+            s.soloed_part = None;
+        } else {
+            s.muted_parts.remove(part_path);
+            s.soloed_part = Some(part_path.to_string());
         }
-        None => inner.soloed_part = None,
-    }
+    });
 }
 
-/// The part currently soloed, if any.  Takes the lock; callers that
-/// already have a snapshot should use that instead.
+/// Set the soloed part explicitly (`None` clears it).  Used by `h`/`l`
+/// navigation, where "move the solo pointer" is a set, not a toggle.
+pub fn set_solo(part: Option<&str>) {
+    update(|s| {
+        if let Some(p) = part {
+            s.muted_parts.remove(p);
+        }
+        s.soloed_part = part.map(str::to_string);
+    });
+}
+
+/// The part currently soloed, if any.
 pub fn soloed() -> Option<String> {
-    let m = state();
-    let inner = match m.inner.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    };
-    inner.soloed_part.clone()
+    MUTE.load().soloed_part.clone()
 }
 
 pub fn clear_all() {
-    let m = state();
-    let mut inner = match m.inner.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    };
-    inner.muted_notes.clear();
-    inner.muted_parts.clear();
-    inner.soloed_part = None;
+    MUTE.store(Default::default());
 }
 
 // ── render snapshot ────────────────────────────────────────────────────
@@ -173,14 +130,14 @@ pub struct Snapshot {
 }
 
 pub fn snapshot() -> Snapshot {
-    let m = state();
-    let inner = match m.inner.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    };
+    let s = MUTE.load();
     Snapshot {
-        muted_parts: inner.muted_parts.clone(),
-        soloed_part: inner.soloed_part.clone(),
-        muted_notes: inner.muted_notes.clone(),
+        muted_parts: s.muted_parts.clone(),
+        soloed_part: s.soloed_part.clone(),
+        muted_notes: s
+            .muted_notes
+            .iter()
+            .flat_map(|(path, rows)| rows.iter().map(move |&(l, r)| (path.clone(), l, r)))
+            .collect(),
     }
 }

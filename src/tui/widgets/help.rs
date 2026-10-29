@@ -14,7 +14,11 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, theme: &Theme) {
     let w = 56u16.min(area.width.saturating_sub(4));
     let h = 22u16.min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
+
+    // FIXED: Biased vertical centering (60% top, 40% bottom)
+    let y = area.y + (area.height.saturating_sub(h) * 6) / 10;
+    let y = y.min(area.y + area.height.saturating_sub(h));
+
     let rect = Rect::new(x, y, w, h);
 
     f.render_widget(Clear, rect);
@@ -48,6 +52,7 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, theme: &Theme) {
     lines.push(row("click queue", "type · enter plays · esc leaves"));
     lines.push(row("pgup / pgdn", "loop count (or click [n])"));
     lines.push(row("?", "toggle this help"));
+    lines.push(row("a", "toggle analysis"));
     lines.push(row("q / esc", "quit"));
     lines.push(Line::from(Span::styled("", desc)));
     lines.push(Line::from(Span::styled("  Mouse:", key)));

@@ -255,20 +255,27 @@ fn event_loop(
                     && k.modifiers.contains(KeyModifiers::CONTROL);
 
                     // ── ANALYSIS MODAL ──
-                    if state.player.show_analysis {
-                        if k.kind != KeyEventKind::Release {
-                            if k.code == KeyCode::Esc || k.code == KeyCode::Char('A') || k.code == KeyCode::Char('a') {
-                                state.player.show_analysis = false;
+                    if k.kind != KeyEventKind::Release {
+                        if state.player.show_analysis {
+                            // If the modal is open, intercept Esc, A, a, or q to close it
+                            if k.code == KeyCode::Esc
+                                || k.code == KeyCode::Char('A')
+                                || k.code == KeyCode::Char('a')
+                                || k.code == KeyCode::Char('q')
+                                {
+                                    state.player.show_analysis = false;
+                                    continue;
+                                }
+                                // Otherwise, fall through to let keys (play/pause/seek) work!
+                        } else if (k.code == KeyCode::Char('A') || k.code == KeyCode::Char('a'))
+                            && !state.queue.focused
+                            {
+                                // If modal is closed AND we are not typing in the queue, 'A' opens it
+                                state.player.show_analysis = true;
+                                state.player.show_help = false;
+                                state.player.show_config = false;
+                                continue;
                             }
-                        }
-                        continue;
-                    }
-
-                    if k.kind != KeyEventKind::Release && (k.code == KeyCode::Char('A') || k.code == KeyCode::Char('a')) {
-                        state.player.show_analysis = true;
-                        state.player.show_help = false;
-                        state.player.show_config = false;
-                        continue;
                     }
                     // ────────────────────
 

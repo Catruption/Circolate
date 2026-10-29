@@ -1,8 +1,7 @@
 //! Voice scheduling, mixer, and DSP primitives.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::f64::consts::{FRAC_PI_4, PI};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use crate::effects::EffectChain;
 use crate::hosting::sf2::engine::Sf2Engine;
@@ -13,6 +12,10 @@ use crate::hosting::vst::ffi::VstHost;
 
 use super::project::{Project, Sample, Sf2VoiceEnvelope};
 use super::inserts;
+
+mod dsp;
+pub(crate) use dsp::gains;
+use dsp::{env_level_at, interpolate, mix_add, sanitize, up_table, EnvState};
 
 // ── scheduled sample voice ─────────────────────────────────────────────
 
@@ -62,153 +65,6 @@ impl VstNote {
     }
 }
 
-// ── mixing maths ───────────────────────────────────────────────────────
-
-#[inline]
-pub(crate) fn gains(vol_pct: f64, pan: f64, song_volume: f64, linear: bool) -> (f64, f64) {
-    let v = vol_pct * song_volume / 100.0;
-    let pan = pan.clamp(-1.0, 1.0);
-    if linear {
-        (v * (1.0 - pan).min(1.0), v * (1.0 + pan).min(1.0))
-    } else {
-        let theta = (pan + 1.0) * FRAC_PI_4;
-        (v * theta.cos(), v * theta.sin())
-    }
-}
-
-// ── sinc interpolation ─────────────────────────────────────────────────
-
-const SINC_PHASES: usize = 512;
-const SINC_TAPS: usize = 8;
-const SINC_TAPS_BEFORE: i64 = 3;
-
-static SINC_UP: OnceLock<[[f64; SINC_TAPS]; SINC_PHASES]> = OnceLock::new();
-
-#[inline]
-fn sinc(x: f64) -> f64 {
-    if x.abs() < 1e-12 {
-        1.0
-    } else {
-        let px = PI * x;
-        px.sin() / px
-    }
-}
-
-fn up_table() -> &'static [[f64; SINC_TAPS]; SINC_PHASES] {
-    SINC_UP.get_or_init(|| {
-        let mut t = [[0.0f64; SINC_TAPS]; SINC_PHASES];
-        for p in 0..SINC_PHASES {
-            let frac = p as f64 / SINC_PHASES as f64;
-            let mut sum = 0.0;
-            for k in 0..SINC_TAPS {
-                let d = frac - (k as i64 - SINC_TAPS_BEFORE) as f64;
-                let win = if d.abs() < 4.0 {
-                    0.5 + 0.5 * (PI * d / 4.0).cos()
-                } else {
-                    0.0
-                };
-                t[p][k] = sinc(d) * win;
-                sum += t[p][k];
-            }
-            if sum.abs() >= 1e-12 {
-                for k in 0..SINC_TAPS {
-                    t[p][k] /= sum;
-                }
-            }
-        }
-        t
-    })
-}
-
-fn interpolate(smp: &Sample, pos: f64, _step: f64, raw_pos: f64) -> (f32, f32) {
-    let n = smp.len() as i64;
-    let center = pos.floor() as i64;
-
-    let frac = pos - center as f64;
-    let phase = ((frac * SINC_PHASES as f64) as usize) & (SINC_PHASES - 1);
-    let w = &up_table()[phase];
-
-    let mut l = 0.0f64;
-    let mut r = 0.0f64;
-    for k in 0..SINC_TAPS {
-        let mut i = center + (k as i64 - SINC_TAPS_BEFORE);
-        if let Some((ls, le)) = smp.loop_pts {
-            let ll = le - ls;
-            if ll > 0 {
-                let wrap = i >= le || (raw_pos >= le as f64 && i < ls);
-                if wrap {
-                    i = ls + (i - ls).rem_euclid(ll);
-                }
-            }
-        }
-        let i = i.clamp(0, n - 1) as usize;
-        l += smp.left[i] as f64 * w[k];
-        if smp.stereo {
-            r += smp.right[i] as f64 * w[k];
-        }
-    }
-    if !smp.stereo {
-        r = l;
-    }
-    (l as f32, r as f32)
-}
-
-// ── envelope phase boundaries ──────────────────────────────────────────
-
-struct EnvState {
-    delay_sec: f64,
-    attack_end: f64,
-    hold_end: f64,
-    decay_end: f64,
-    release_start: f64,
-    release_end: f64,
-    peak: f32,
-    sustain: f32,
-    attack_inv: f32,
-    decay_inv: f32,
-    release_inv: f32,
-    start_sample: i64,
-}
-
-#[inline]
-fn env_level_at(state: &EnvState, t_sec: f64) -> f32 {
-    if t_sec < 0.0 {
-        return 0.0;
-    }
-    if t_sec >= state.release_end {
-        return 0.0;
-    }
-    if t_sec >= state.release_start {
-        let at_release = env_sustain_level(state, state.release_start);
-        let ft = ((t_sec - state.release_start) * state.release_inv as f64)
-        .clamp(0.0, 1.0) as f32;
-        return at_release * (1.0 - ft);
-    }
-    env_sustain_level(state, t_sec)
-}
-
-#[inline]
-fn env_sustain_level(state: &EnvState, t_sec: f64) -> f32 {
-    if t_sec < state.delay_sec {
-        return 0.0;
-    }
-    let t_sec = t_sec - state.delay_sec;
-    if t_sec < state.attack_end {
-        if state.attack_end <= 0.0 {
-            return state.peak;
-        }
-        return (t_sec * state.attack_inv as f64) as f32 * state.peak;
-    }
-    if t_sec < state.hold_end {
-        return state.peak;
-    }
-    if t_sec < state.decay_end {
-        let f = ((t_sec - state.hold_end) * state.decay_inv as f64).clamp(0.0, 1.0) as f32;
-        return state.peak - (state.peak - state.sustain) * f;
-    }
-    state.sustain
-}
-
 // ── engine ─────────────────────────────────────────────────────────────
 
 struct Active {
@@ -254,11 +110,6 @@ pub(crate) struct Engine {
     hosts: BTreeMap<u16, VstHost>,
     host_scratch: BTreeMap<u16, (Vec<f32>, Vec<f32>)>,
     vst_gains: BTreeMap<u16, f32>,
-    /// Maps each VST/SF2 iid to the part path that owns it.  Populated by
-    /// `register_part_path` (called from `play.rs` and `render.rs` after
-    /// installing each host/engine).  Used by `render_vsts` to look up
-    /// the per-part volume multiplier so scrolling a header affects VST
-    /// and SF2 parts the same way it affects raw samples.
     iid_to_part_path: BTreeMap<u16, String>,
 
     sf2_engines: BTreeMap<u16, Sf2Engine>,
@@ -277,26 +128,27 @@ pub(crate) struct Engine {
 
     master_fx: Option<EffectChain>,
 
+    // Pause Tail state
+    pause_fade: f32,
+    tail_frames: i64,
+
     // ── shim subsystem ───────────────────────────────────────────
     shims: BTreeMap<u32, ShimHost>,
     shim_by_line: BTreeMap<u32, Vec<u32>>,
     shim_scratch: BTreeMap<u32, (Vec<f32>, Vec<f32>)>,
     shim_dry_l: Vec<f32>,
     shim_dry_r: Vec<f32>,
-    /// Cached chain-of-shims list; rebuilt only when `shim_by_line` changes.
     shim_chains_cache: Vec<Vec<u32>>,
-    /// Reusable "already processed this chunk" scratch buffer.
     shim_processed: Vec<u32>,
-    /// Reusable link buffer for handing audio from one shim into the next.
     shim_link_l: Vec<f32>,
     shim_link_r: Vec<f32>,
 
-    /// Reusable VST event buffer (per render_vsts call).
     vst_events_buf: Vec<(i32, u8, u16, u8, u8)>,
 }
 
 impl Engine {
     pub(crate) fn new(p: &Project) -> Self {
+        up_table(); // build the sinc table now, not mid-callback
         let hist_len = (VST_HISTORY_SECS * p.sample_rate as f64).max(1.0) as usize;
         Engine {
             sr: p.sample_rate as f64,
@@ -328,6 +180,8 @@ impl Engine {
             insert_scratch: BTreeMap::new(),
             sf2_scratch: BTreeMap::new(),
             master_fx: None,
+            pause_fade: 1.0,
+            tail_frames: 0,
             shims: BTreeMap::new(),
             shim_by_line: BTreeMap::new(),
             shim_scratch: BTreeMap::new(),
@@ -366,17 +220,17 @@ impl Engine {
             ),
         );
         self.vst_gains.insert(iid, gain);
+        self.vst_held.entry(iid).or_insert(0);
     }
 
-    /// Register the part path that owns a given VST/SF2 iid.  Must be
-    /// called immediately after installing the host or engine so that
-    /// `render_vsts` can look up the per-part volume multiplier.
     pub(crate) fn register_part_path(&mut self, iid: u16, part_path: String) {
         self.iid_to_part_path.insert(iid, part_path);
     }
 
     pub(crate) fn install_sf2_engine(&mut self, iid: u16, engine: Sf2Engine) {
         self.sf2_engines.insert(iid, engine);
+        self.sf2_scratch.insert(iid, (vec![0.0; VST_BLOCK as usize], vec![0.0; VST_BLOCK as usize]));
+        self.vst_held.entry(iid).or_insert(0);
     }
 
     pub(crate) fn host_count(&self) -> usize {
@@ -422,9 +276,6 @@ impl Engine {
         if !chain.contains(&shim_id) {
             chain.push(shim_id);
         }
-        // Invalidate + rebuild the cached chain list.  This runs at install
-        // time (from `install_shims`), not on the audio thread, so the
-        // allocation and sort are free.
         let mut all: Vec<Vec<u32>> = self.shim_by_line.values().cloned().collect();
         all.sort();
         all.dedup();
@@ -467,12 +318,13 @@ impl Engine {
         let hold_end = attack_end + env.hold_sec as f64;
         let decay_end = hold_end + env.decay_sec as f64;
 
-        let release_sec = (env.release_sec as f64).min(note_dur_sec * 0.5);
-        let release_start = (note_dur_sec - release_sec).max(0.0);
+        let release_sec = (env.release_sec as f64).max(0.020);
+        let release_start = note_dur_sec;
+        let release_end = note_dur_sec + release_sec;
 
         let attack_inv = if env.attack_sec > 0.0 { 1.0 / env.attack_sec } else { 0.0 };
         let decay_inv = if env.decay_sec > 0.0 { 1.0 / env.decay_sec } else { 0.0 };
-        let release_inv = if release_sec > 0.0 { (1.0 / release_sec) as f32 } else { 0.0 };
+        let release_inv = (1.0 / release_sec) as f32;
 
         let peak = env.peak.clamp(0.0, 1.0);
         let sustain = peak * env.sustain_fraction.clamp(0.0, 1.0);
@@ -483,7 +335,7 @@ impl Engine {
             hold_end,
             decay_end,
             release_start,
-            release_end: note_dur_sec,
+            release_end,
             peak,
             sustain,
             attack_inv,
@@ -496,7 +348,6 @@ impl Engine {
     pub(crate) fn ingest(&mut self, mut voices: Vec<Scheduled>) {
         voices.sort_unstable_by_key(Scheduled::key);
 
-        // Reserve upfront so the per-voice inserts below never reallocate.
         if self.pending.capacity() < self.pending.len() + voices.len() + 64 {
             self.pending.reserve(voices.len() + 64);
         }
@@ -525,6 +376,7 @@ impl Engine {
             }
         }
     }
+
     pub(crate) fn ingest_vst(&mut self, mut notes: Vec<VstNote>) {
         notes.sort_unstable_by_key(VstNote::key);
 
@@ -535,7 +387,6 @@ impl Engine {
             self.vst_log.reserve(notes.len() + 64);
         }
 
-        // Cap vst_log so long sessions don't leak memory.
         const VST_LOG_MAX: usize = 10_000;
         if self.vst_log.len() + notes.len() > VST_LOG_MAX {
             let drop = ((self.vst_log.len() + notes.len()) - VST_LOG_MAX)
@@ -648,51 +499,61 @@ impl Engine {
             }
         }
 
-        if speed == 0 {
-            return;
+        // Pause and tail logic
+        if speed != 0 {
+            self.pause_fade = 1.0;
+            self.tail_frames = (self.sr * 1.0) as i64; // 1 second of tail
+        } else if self.tail_frames <= 0 {
+            return; // Fully faded, do nothing
         }
 
         let block_len = out_l.len() as i64;
         let block_start = self.pos;
-        let block_end = block_start + block_len * speed;
+        // If paused, block_end is the same as block_start (sequencer doesn't advance)
+        let block_end = if speed != 0 { block_start + block_len * speed } else { block_start };
+
         let sr = self.sr;
-        let dir: i64 = if speed > 0 { 1 } else { -1 };
+        let dir: i64 = if speed > 0 { 1 } else if speed < 0 { -1 } else { 0 };
         let dir_f = dir as f64;
 
-        if speed > 0 {
-            while self.pending.front().map_or(false, |v| v.start < block_end) {
-                let v = self.pending.pop_front().unwrap();
-                if !mute::is_note_active(&v.part_path, v.line as usize, v.source_row as i64) {
-                    continue;
-                }
-                let raw_pos = v.offset;
-                let env_state = self.env_state_for(&v);
-                self.active.push(Active { v, raw_pos, env_state });
-            }
-        } else {
-            let mut i = 0;
-            while i < self.pending.len() {
-                let activate = {
-                    let v = &self.pending[i];
-                    v.end <= block_start && v.end > block_end
-                };
-                if activate {
-                    let v = self.pending.remove(i).unwrap();
+        if speed != 0 {
+            if speed > 0 {
+                while self.pending.front().map_or(false, |v| v.start < block_end) {
+                    let v = self.pending.pop_front().unwrap();
                     if !mute::is_note_active(&v.part_path, v.line as usize, v.source_row as i64) {
                         continue;
                     }
-                    let step = v.sample.rate * (v.pitch_hz / C5_HZ) / sr;
-                    let note_len = (v.end - v.start).max(0) as f64;
-                    let raw_pos = v.offset + (note_len - 1.0).max(0.0) * step;
-                    self.active.push(Active { v, raw_pos, env_state: None });
-                } else {
-                    i += 1;
+                    let raw_pos = v.offset;
+                    let env_state = self.env_state_for(&v);
+                    self.active.push(Active { v, raw_pos, env_state });
+                }
+            } else {
+                let mut i = 0;
+                while i < self.pending.len() {
+                    let activate = {
+                        let v = &self.pending[i];
+                        v.end <= block_start && v.end > block_end
+                    };
+                    if activate {
+                        let v = self.pending.remove(i).unwrap();
+                        if !mute::is_note_active(&v.part_path, v.line as usize, v.source_row as i64) {
+                            continue;
+                        }
+                        let step = v.sample.rate * (v.pitch_hz / C5_HZ) / sr;
+                        let note_len = (v.end - v.start).max(0) as f64;
+                        let raw_pos = v.offset + (note_len - 1.0).max(0.0) * step;
+                        self.active.push(Active { v, raw_pos, env_state: None });
+                    } else {
+                        i += 1;
+                    }
                 }
             }
         }
 
         let song_volume = self.song_volume;
         let linear = self.linear;
+        let pause_fade = self.pause_fade;
+
         {
             let Self { active, shim_by_line, shim_scratch, .. } = self;
             active.retain_mut(|a| {
@@ -709,29 +570,44 @@ impl Engine {
                 };
                 let automated_gain = v.vol_lane.is_some() || v.pan_lane.is_some();
 
+                let release_sec = a.env_state.as_ref().map_or(0.020, |s| s.release_end - s.release_start);
+                let actual_end = v.end + (release_sec * sr) as i64;
+
                 let (i_lo, i_hi) = if speed > 0 {
                     let lo = ((v.start - block_start) as f64 / speed as f64)
                     .ceil()
                     .max(0.0) as i64;
-                    let hi = ((v.end - block_start) as f64 / speed as f64)
+                    let hi = ((actual_end - block_start) as f64 / speed as f64)
                     .ceil()
                     .min(block_len as f64) as i64;
                     (lo, hi)
-                } else {
+                } else if speed < 0 {
                     let lo = (((v.end - block_start) as f64 / speed as f64)
                     .floor() as i64) + 1;
                     let hi = (((v.start - block_start) as f64 / speed as f64)
                     .floor() as i64) + 1;
                     (lo.max(0), hi.min(block_len))
+                } else {
+                    (0, block_len)
                 };
 
                 let first_shim: Option<u32> =
                 shim_by_line.get(&v.line).and_then(|s| s.first().copied());
 
-                // Live per-block lookup so scrolling the header affects
-                // notes already in flight, not just the next scheduled
-                // note.
                 let part_vol = crate::mixer::part_volume::get(&v.part_path);
+
+                let mut emit = |o: usize, cl: f32, cr: f32| {
+                    match first_shim.and_then(|id| shim_scratch.get_mut(&id)) {
+                        Some(buf) if o < buf.0.len() => {
+                            buf.0[o] += cl;
+                            buf.1[o] += cr;
+                        }
+                        _ => {
+                            out_l[o] += cl;
+                            out_r[o] += cr;
+                        }
+                    }
+                };
 
                 for i in i_lo..i_hi {
                     let f = block_start + i * speed;
@@ -763,13 +639,27 @@ impl Engine {
                         };
                         (gl * part_vol, gr * part_vol)
                     };
+
                     let env_gain = || -> f32 {
+                        let mut g = 1.0;
+                        if speed == 0 {
+                            g *= pause_fade;
+                        }
                         match &a.env_state {
                             Some(state) => {
                                 let t_sec = (f - state.start_sample) as f64 / sr;
-                                env_level_at(state, t_sec)
+                                g * env_level_at(state, t_sec)
                             }
-                            None => 1.0,
+                            None => {
+                                let t_sec = (f - v.start) as f64 / sr;
+                                let note_dur = (v.end - v.start) as f64 / sr;
+                                if t_sec > note_dur {
+                                    let over = (t_sec - note_dur) as f32;
+                                    g * (1.0 - over / 0.020).clamp(0.0, 1.0)
+                                } else {
+                                    g
+                                }
+                            }
                         }
                     };
 
@@ -780,17 +670,8 @@ impl Engine {
                         let o = i as usize;
                         let cl = sl * gl as f32 * eg;
                         let cr = sr_ * gr as f32 * eg;
-                        match first_shim.and_then(|id| shim_scratch.get_mut(&id)) {
-                            Some(buf) if o < buf.0.len() => {
-                                buf.0[o] += cl;
-                                buf.1[o] += cr;
-                            }
-                            _ => {
-                                out_l[o] += cl;
-                                out_r[o] += cr;
-                            }
-                        }
-                    } else if p >= len && loop_f.is_none() && a.env_state.is_some() && len > 0.0 {
+                        emit(o, cl, cr);
+                    } else if p >= len && loop_f.is_none() && len > 0.0 {
                         let over = p - len;
                         let fade_len = HOLD_TAIL_SECS * sr;
                         if over < fade_len {
@@ -803,16 +684,7 @@ impl Engine {
                             let o = i as usize;
                             let cl = sl * gl as f32 * eg * fade;
                             let cr = sr_ * gr as f32 * eg * fade;
-                            match first_shim.and_then(|id| shim_scratch.get_mut(&id)) {
-                                Some(buf) if o < buf.0.len() => {
-                                    buf.0[o] += cl;
-                                    buf.1[o] += cr;
-                                }
-                                _ => {
-                                    out_l[o] += cl;
-                                    out_r[o] += cr;
-                                }
-                            }
+                            emit(o, cl, cr);
                         }
                     }
 
@@ -820,20 +692,28 @@ impl Engine {
                 }
 
                 if speed > 0 {
-                    v.end > block_end
-                } else {
+                    actual_end > block_end
+                } else if speed < 0 {
                     block_end > v.start
+                } else {
+                    true
                 }
             });
         }
 
         if !self.hosts.is_empty() || !self.sf2_engines.is_empty() {
             if speed == 1 {
+                // If we are resuming, resync the VSTs to the exact playhead
                 if !self.vst_synced {
                     self.resync_vsts(block_start);
                 }
                 self.render_vsts(out_l, out_r, block_start);
                 self.vst_hist_head = self.vst_hist_head.max(block_end - 1);
+            } else if speed == 0 {
+                // If we are paused, DO NOT panic_hosts() or clear the VSTs.
+                // Just let them play into the master fade.
+                self.vst_synced = false;
+                self.render_vsts(out_l, out_r, block_start);
             } else {
                 if self.vst_synced {
                     self.panic_hosts();
@@ -847,16 +727,8 @@ impl Engine {
             self.process_shims(out_l, out_r);
         }
 
-        for s in out_l.iter_mut() {
-            if !s.is_finite() {
-                *s = 0.0;
-            }
-        }
-        for s in out_r.iter_mut() {
-            if !s.is_finite() {
-                *s = 0.0;
-            }
-        }
+        sanitize(out_l);
+        sanitize(out_r);
 
         if let Some(chain) = self.master_fx.as_mut() {
             if !chain.is_empty() {
@@ -869,24 +741,35 @@ impl Engine {
             }
         }
 
-        for s in out_l.iter_mut() {
-            if !s.is_finite() {
-                *s = 0.0;
-            }
-        }
-        for s in out_r.iter_mut() {
-            if !s.is_finite() {
-                *s = 0.0;
-            }
-        }
+        sanitize(out_l);
+        sanitize(out_r);
 
-        if speed != 1 {
+        if speed != 1 && speed != 0 {
             let scale = 1.0 / (speed.unsigned_abs() as f32);
             for s in out_l.iter_mut() { *s *= scale; }
             for s in out_r.iter_mut() { *s *= scale; }
         }
 
-        self.pos = block_end.clamp(0, self.total);
+        // Handle Pause Tail decrement and Final Fade
+        if speed == 0 {
+            self.tail_frames -= block_len;
+
+            // Fade raw samples over 100ms so they don't drone
+            self.pause_fade = (self.pause_fade - (block_len as f32 / (0.1 * sr) as f32)).max(0.0);
+
+            // Gently fade out the entire master bus (including VSTs/reverbs)
+            // over the entire 1-second tail.
+            let fade_frames = (self.sr * 1.0) as i64;
+            if self.tail_frames < fade_frames {
+                let fade = (self.tail_frames as f32 / fade_frames as f32).clamp(0.0, 1.0);
+                for i in 0..out_l.len() {
+                    out_l[i] *= fade;
+                    out_r[i] *= fade;
+                }
+            }
+        } else {
+            self.pos = block_end.clamp(0, self.total);
+        }
     }
 
     fn process_shims(&mut self, out_l: &mut [f32], out_r: &mut [f32]) {
@@ -1049,7 +932,7 @@ impl Engine {
                 }
             }
 
-            events.sort_by_key(|e| (e.0, e.1));
+            events.sort_unstable_by_key(|e| (e.0, e.1));
             for &(off, kind, iid, note, vel) in events.iter() {
                 if let Some(host) = hosts.get_mut(&iid) {
                     let bit = 1u128 << (note.min(127) as u32);
@@ -1070,17 +953,17 @@ impl Engine {
                 }
             }
 
-            for s in vst_scratch_l[..chunk_len].iter_mut() { *s = 0.0; }
-            for s in vst_scratch_r[..chunk_len].iter_mut() { *s = 0.0; }
+            vst_scratch_l[..chunk_len].fill(0.0);
+            vst_scratch_r[..chunk_len].fill(0.0);
             for buf in insert_scratch.values_mut() {
-                for s in buf.0[..chunk_len].iter_mut() { *s = 0.0; }
-                for s in buf.1[..chunk_len].iter_mut() { *s = 0.0; }
+                buf.0[..chunk_len].fill(0.0);
+                buf.1[..chunk_len].fill(0.0);
             }
 
             for (iid, host) in hosts.iter_mut() {
                 let Some((tl, tr)) = host_scratch.get_mut(iid) else { continue };
-                for s in tl[..chunk_len].iter_mut() { *s = 0.0; }
-                for s in tr[..chunk_len].iter_mut() { *s = 0.0; }
+                tl[..chunk_len].fill(0.0);
+                tr[..chunk_len].fill(0.0);
                 host.process(&mut tl[..chunk_len], &mut tr[..chunk_len]);
 
                 let host_gain = vst_gains.get(iid).copied().unwrap_or(1.0);
@@ -1098,18 +981,8 @@ impl Engine {
                 let insert = channel_to_insert.get(iid).copied();
 
                 match insert.and_then(|ins| insert_scratch.get_mut(&ins)) {
-                    Some(buf) => {
-                        for j in 0..chunk_len {
-                            buf.0[j] += tl[j] * gain;
-                            buf.1[j] += tr[j] * gain;
-                        }
-                    }
-                    None => {
-                        for j in 0..chunk_len {
-                            vst_scratch_l[j] += tl[j] * gain;
-                            vst_scratch_r[j] += tr[j] * gain;
-                        }
-                    }
+                    Some(buf) => mix_add(&mut buf.0[..chunk_len], &mut buf.1[..chunk_len], &tl[..chunk_len], &tr[..chunk_len], gain),
+                    None => mix_add(&mut vst_scratch_l[..chunk_len], &mut vst_scratch_r[..chunk_len], &tl[..chunk_len], &tr[..chunk_len], gain),
                 }
             }
 
@@ -1121,8 +994,8 @@ impl Engine {
                     sl.resize(chunk_len, 0.0);
                     sr.resize(chunk_len, 0.0);
                 }
-                for s in sl[..chunk_len].iter_mut() { *s = 0.0; }
-                for s in sr[..chunk_len].iter_mut() { *s = 0.0; }
+                sl[..chunk_len].fill(0.0);
+                sr[..chunk_len].fill(0.0);
                 eng.process(&mut sl[..chunk_len], &mut sr[..chunk_len]);
 
                 let part_scale = iid_to_part_path
@@ -1138,18 +1011,8 @@ impl Engine {
 
                 let insert = channel_to_insert.get(iid).copied();
                 match insert.and_then(|ins| insert_scratch.get_mut(&ins)) {
-                    Some(buf) => {
-                        for j in 0..chunk_len {
-                            buf.0[j] += sl[j] * part_scale;
-                            buf.1[j] += sr[j] * part_scale;
-                        }
-                    }
-                    None => {
-                        for j in 0..chunk_len {
-                            vst_scratch_l[j] += sl[j] * part_scale;
-                            vst_scratch_r[j] += sr[j] * part_scale;
-                        }
-                    }
+                    Some(buf) => mix_add(&mut buf.0[..chunk_len], &mut buf.1[..chunk_len], &sl[..chunk_len], &sr[..chunk_len], part_scale),
+                    None => mix_add(&mut vst_scratch_l[..chunk_len], &mut vst_scratch_r[..chunk_len], &sl[..chunk_len], &sr[..chunk_len], part_scale),
                 }
             }
 
@@ -1157,18 +1020,12 @@ impl Engine {
                 if chain.is_empty() { continue; }
                 if let Some(buf) = insert_scratch.get_mut(&insert) {
                     chain.process(&mut buf.0[..chunk_len], &mut buf.1[..chunk_len]);
-                    for j in 0..chunk_len {
-                        vst_scratch_l[j] += buf.0[j];
-                        vst_scratch_r[j] += buf.1[j];
-                    }
+                    mix_add(&mut vst_scratch_l[..chunk_len], &mut vst_scratch_r[..chunk_len], &buf.0[..chunk_len], &buf.1[..chunk_len], 1.0);
                 }
             }
 
             let out_off = (chunk_start - block_start) as usize;
-            for j in 0..chunk_len {
-                out_l[out_off + j] += vst_scratch_l[j];
-                out_r[out_off + j] += vst_scratch_r[j];
-            }
+            mix_add(&mut out_l[out_off..out_off + chunk_len], &mut out_r[out_off..out_off + chunk_len], &vst_scratch_l[..chunk_len], &vst_scratch_r[..chunk_len], 1.0);
 
             if !vst_hist_l.is_empty() {
                 for j in 0..chunk_len {

@@ -10,13 +10,12 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-// use std::time::Duration; // Removed unused
 
 use crate::formats::SourceKind;
 use crate::player::{self, Cache, Engine, Loader, Msg, Project, Transport};
 use crate::tui::{self, app::LoopOutcome};
-use crate::tui::config::Settings; // Removed Config
-use crate::tui::state::TEXT_W;    // Added TEXT_W
+use crate::tui::config::Settings;
+use crate::tui::state::TEXT_W;
 use crate::tui::state as queue;
 
 use super::audio::{soft_clip, Silence};
@@ -99,8 +98,8 @@ pub fn play_one(
     if queue.playing.is_none() {
         if let Some(name) = song.and_then(|p| p.file_stem()).and_then(|s| s.to_str()) {
             let row = queue.cursor.row.min(queue.lines.len().saturating_sub(1));
-                if queue.lines.get(row).map_or(false, |l| l.is_blank) {
-                let text: String = name.chars().take(TEXT_W as usize).collect(); // Fixed TEXT_W
+            if queue.lines.get(row).map_or(false, |l| l.is_blank) {
+                let text: String = name.chars().take(TEXT_W as usize).collect();
                 queue.lines[row].text = text;
                 queue.start_at(row);
             }
@@ -226,10 +225,7 @@ pub fn play_one(
                 tp.done.store(true, Ordering::Release);
                 return;
             }
-            if speed == 0 {
-                data.fill(0.0);
-                return;
-            }
+
             tp.done.store(false, Ordering::Release);
 
             let frames = data.len() / channels;
@@ -255,6 +251,8 @@ pub fn play_one(
                     head = rem;
                 }
             }
+            // Always call render. The engine handles the tail logic internally
+            // if speed == 0.
             engine.render(&mut l[head..], &mut r[head..], speed);
 
             if engine.pos <= 0 && speed < 0 {
@@ -357,7 +355,7 @@ pub fn play_one(
                                              sample_rate,
                                              queue,
                                              settings,
-                                             media_rx, // Pass the receiver
+                                             media_rx,
     )?;
     transport.stop.store(true, Ordering::Relaxed);
     drop(stream);

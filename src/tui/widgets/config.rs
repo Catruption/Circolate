@@ -194,7 +194,11 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, ui: &ConfigUi, settings: &Settings) {
     let w = 76u16.min(area.width.saturating_sub(4));
     let h = 30u16.min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
+
+    // FIXED: Biased vertical centering (60% top, 40% bottom)
+    let y = area.y + (area.height.saturating_sub(h) * 6) / 10;
+    let y = y.min(area.y + area.height.saturating_sub(h));
+
     let rect = Rect::new(x, y, w, h);
 
     f.render_widget(Clear, rect);
@@ -218,7 +222,7 @@ fn draw_list(f: &mut Frame<'_>, rect: Rect, ui: &ConfigUi, settings: &Settings) 
     let block = Block::default()
     .borders(Borders::ALL)
     .border_set(theme.border_set())
-    .border_style(Style::default().fg(theme.color(Token::HelpKey)))
+    .border_style(Style::default().fg(Color::Cyan)) // Tied to the ⇅ icon
     .title(title)
     .style(Style::default().bg(bg));
 
@@ -226,13 +230,13 @@ fn draw_list(f: &mut Frame<'_>, rect: Rect, ui: &ConfigUi, settings: &Settings) 
     f.render_widget(block, rect);
 
     let key_style = Style::default()
-    .fg(theme.color(Token::HelpKey))
+    .fg(Color::Cyan)
     .bg(bg)
     .add_modifier(Modifier::BOLD);
     let val_style = Style::default().fg(theme.color(Token::HelpFg)).bg(bg);
     let cursor_style = Style::default()
     .fg(bg)
-    .bg(theme.color(Token::HelpKey))
+    .bg(Color::Cyan)
     .add_modifier(Modifier::BOLD);
     let header_style = Style::default()
     .fg(theme.color(Token::HelpDim))
@@ -371,7 +375,7 @@ fn draw_colors(f: &mut Frame<'_>, rect: Rect, ui: &ConfigUi, settings: &Settings
     let block = Block::default()
     .borders(Borders::ALL)
     .border_set(theme.border_set())
-    .border_style(Style::default().fg(theme.color(Token::HelpKey)))
+    .border_style(Style::default().fg(Color::Cyan))
     .title(" Colors ")
     .style(Style::default().bg(bg));
 
@@ -379,13 +383,13 @@ fn draw_colors(f: &mut Frame<'_>, rect: Rect, ui: &ConfigUi, settings: &Settings
     f.render_widget(block, rect);
 
     let key_style = Style::default()
-    .fg(theme.color(Token::HelpKey))
+    .fg(Color::Cyan)
     .bg(bg)
     .add_modifier(Modifier::BOLD);
     let val_style = Style::default().fg(theme.color(Token::HelpFg)).bg(bg);
     let cursor_style = Style::default()
     .fg(bg)
-    .bg(theme.color(Token::HelpKey))
+    .bg(Color::Cyan)
     .add_modifier(Modifier::BOLD);
     let dim_style = Style::default().fg(theme.color(Token::HelpDim)).bg(bg);
 
@@ -443,7 +447,7 @@ fn draw_picker(f: &mut Frame<'_>, rect: Rect, ui: &ConfigUi, settings: &Settings
     let block = Block::default()
     .borders(Borders::ALL)
     .border_set(theme.border_set())
-    .border_style(Style::default().fg(theme.color(Token::HelpKey)))
+    .border_style(Style::default().fg(Color::Cyan))
     .title(format!(" Pick: {} ", token_name(token)))
     .style(Style::default().bg(bg));
 
@@ -453,7 +457,7 @@ fn draw_picker(f: &mut Frame<'_>, rect: Rect, ui: &ConfigUi, settings: &Settings
     let val_style = Style::default().fg(theme.color(Token::HelpFg)).bg(bg);
     let dim_style = Style::default().fg(theme.color(Token::HelpDim)).bg(bg);
     let key_style = Style::default()
-    .fg(theme.color(Token::HelpKey))
+    .fg(Color::Cyan)
     .bg(bg)
     .add_modifier(Modifier::BOLD);
 
