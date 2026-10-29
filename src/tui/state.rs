@@ -169,14 +169,24 @@ impl QueueState {
     }
 
     pub fn cycle_loop(&mut self, dir: i32) {
+        const MAX_LOOP: i32 = 9;
+
         let row = self.cursor.row;
         if row >= self.lines.len() { return; }
+
         let line = &mut self.lines[row];
-        if dir > 0 {
-            line.count = line.count.saturating_add(1);
-        } else {
-            line.count = line.count.saturating_sub(1);
-        }
+
+        // If we are currently playing this line, we can go down to 0 (which means skip).
+        // Otherwise, the minimum is 1.
+        let lo: i32 = if self.playing == Some(row) { 0 } else { 1 };
+        let span = MAX_LOOP - lo + 1;
+
+        let mut n = line.count as i32 + dir;
+
+        while n < lo { n += span; }
+        while n > MAX_LOOP { n -= span; }
+
+        line.count = n as usize;
     }
 
     pub fn advance(&mut self) -> Option<String> {

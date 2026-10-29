@@ -23,10 +23,10 @@ use crate::mixer::{mute, part_volume, volume};
 use crate::player::{Project, Transport};
 use crate::tui::config::Settings;
 use crate::tui::shared::hit::{
-    dispatch, hit_from_horizontal, hit_from_notch, hit_from_spiral,
+    dispatch, hit_from_horizontal, hit_from_notch, hit_from_queue, hit_from_spiral,
     hit_from_vertical, HitAction,
 };
-use crate::tui::state::{Click, QueueState, RenderState};
+use crate::tui::state::{QueueState, RenderState};
 use crate::tui::views;
 
 const TICK_MS: u64 = 50;
@@ -615,18 +615,37 @@ fn handle_mouse(m: MouseEvent, tp: &Arc<Transport>, p: &Project, state: &mut Ren
         _ => return,
     };
 
-    let in_queue = state.queue_placed.map_or(false, |q| {
-        let r = q.box_rect;
-        m.column >= r.x && m.column < r.x + r.width
-        && m.row >= r.y && m.row < r.y + r.height
-    });
-    if in_queue {
-        if let Some(q) = state.queue_placed {
-            match state.queue.click(&q, m.column, m.row, button == MouseButton::Right) {
-                Click::Rewind => handle_direction(KeyCode::Left, state, tp),
-                Click::Play => handle_direction(KeyCode::Right, state, tp),
-                Click::None => {}
+    // 1. Queue first. If hit_from_queue returns Some(), we handle it and return.
+    if let Some(action) = hit_from_queue(state, m) {
+        if matches!(button, MouseButton::Left) {
+            state.queue.focused = true;
+        }
+        match action {
+            HitAction::QueueRewind => {
+                if matches!(button, MouseButton::Left) {
+                    handle_direction(KeyCode::Left, state, tp);
+                }
             }
+            HitAction::QueuePlay => {
+                if matches!(button, MouseButton::Left) {
+                    handle_direction(KeyCode::Right, state, tp);
+                }
+            }
+            HitAction::QueueLine { row, col } => {
+                if matches!(button, MouseButton::Left) {
+                    state.queue.cursor.row = row;
+                    // Clamp column to the actual text length so typing works
+                    let text_len = state.queue.lines.get(row).map(|l| l.text.chars().count()).unwrap_or(0);
+                    state.queue.cursor.col = col.min(text_len);
+                }
+            }
+            HitAction::QueueGutter { row } => {
+                if matches!(button, MouseButton::Left) || matches!(button, MouseButton::Right) {
+                    state.queue.cursor.row = row;
+                    state.queue.cycle_loop(if button == MouseButton::Right { -1 } else { 1 });
+                }
+            }
+            _ => {}
         }
         return;
     }

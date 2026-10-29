@@ -168,7 +168,7 @@ pub fn analyze(project: &Project, tp: &Transport, line_idx: usize) -> AnalysisRe
     // 3. Measure Context
     let mut scale = "Empty".to_string();
     let mut contour = "Flat".to_string();
-    let mut motif = None;
+    let motif = None;
 
     if !measure_pitches.is_empty() {
         measure_pitches.sort_unstable();

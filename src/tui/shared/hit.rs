@@ -73,9 +73,10 @@ pub enum HitAction {
     QueuePlay,
     /// A buffer line was clicked.  `row` is the absolute line index
     /// (already offset by `first_line`), `col` is the cursor column
-    /// within the text field (0 = first character).  `col` is 0 when
-    /// the gutter was clicked.
+    /// within the text field (0 = first character).
     QueueLine { row: usize, col: usize },
+    /// The gutter `[0]` was clicked.  Cycles the loop count.
+    QueueGutter { row: usize },
 }
 
 pub fn hit_from_spiral(state: &RenderState, m: MouseEvent) -> Option<HitAction> {
@@ -232,17 +233,15 @@ pub fn hit_from_queue(state: &RenderState, m: MouseEvent) -> Option<HitAction> {
         if in_rect(q.lines) {
             let rel_y = (m.row - q.lines.y) as usize;
             if rel_y < VISIBLE_LINES {
-                // `GUTTER_W` and `TEXT_W` are `u16` (ratatui coordinates);
-                // `QueueLine.col` is `usize` (cursor position in text).
-                // Keep the arithmetic in `u16`, then cast once.
+                let row = q.first_line + rel_y;
                 let rel_x = m.column.saturating_sub(q.lines.x);
-                let col = rel_x
-                .saturating_sub(GUTTER_W)
-                .min(TEXT_W.saturating_sub(1)) as usize;
-                return Some(HitAction::QueueLine {
-                    row: q.first_line + rel_y,
-                    col,
-                });
+                if rel_x < GUTTER_W {
+                    return Some(HitAction::QueueGutter { row });
+                } else {
+                    let col = ((rel_x - GUTTER_W) as usize)
+                    .min(TEXT_W.saturating_sub(1) as usize);
+                    return Some(HitAction::QueueLine { row, col });
+                }
             }
         }
         Some(HitAction::QueueConsume)
@@ -365,6 +364,7 @@ pub fn dispatch(
         HitAction::QueueConsume
         | HitAction::QueueLine { .. }
         | HitAction::QueueRewind
-        | HitAction::QueuePlay => {}
+        | HitAction::QueuePlay
+        | HitAction::QueueGutter { .. } => {}
     }
 }
