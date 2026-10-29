@@ -1,63 +1,34 @@
 //! Capture everything written to fd 2 (Rust `eprintln!` *and* C++
-//! `fprintf(stderr, …)` from VST3 plugins) into a ring buffer while the
-//! TUI owns the terminal.  Without this, any diagnostic corrupts the
+//! `fprintf(stderr, …)` from VST3 plugins) and route it into the log
+//! bus as `ffi.stderr`.  Without this, any diagnostic corrupts the
 //! alternate screen — DPF plugins in particular print teardown warnings
 //! every time a track is unloaded.
+//!
+//! After the call-site migration finishes, Rust no longer touches fd 2
+//! in TUI mode, so this capture only carries C++ output.  It feeds the
+//! bus uniformly; the widget reads from `log::ring()`.
 
-use std::collections::VecDeque;
 use std::os::unix::io::RawFd;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
-pub struct LogBuffer {
-    lines: Mutex<VecDeque<String>>,
-    capacity: usize,
-}
-
-impl LogBuffer {
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            lines: Mutex::new(VecDeque::with_capacity(capacity)),
-            capacity,
-        }
-    }
-
-    pub fn push(&self, line: String) {
-        let Ok(mut buf) = self.lines.lock() else { return };
-        if buf.len() >= self.capacity {
-            buf.pop_front();
-        }
-        buf.push_back(line);
-    }
-
-    pub fn snapshot(&self) -> Vec<String> {
-        let Ok(buf) = self.lines.lock() else { return Vec::new() };
-        buf.iter().cloned().collect()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.lines.lock().map_or(true, |b| b.is_empty())
-    }
-}
-
-static BUFFER: OnceLock<Arc<LogBuffer>> = OnceLock::new();
 static CAPTURE: OnceLock<Mutex<Option<StderrCapture>>> = OnceLock::new();
 
-pub fn buffer() -> Arc<LogBuffer> {
-    BUFFER
-    .get_or_init(|| Arc::new(LogBuffer::new(400)))
-    .clone()
-}
-
 pub struct StderrCapture {
-    saved_fd: RawFd,
-    pipe_read: RawFd,
+    saved_fd:   RawFd,
+    pipe_read:  RawFd,
     pipe_write: RawFd,
-    reader: Option<std::thread::JoinHandle<()>>,
+    reader:     Option<std::thread::JoinHandle<()>>,
 }
 
 pub fn install() -> Option<()> {
-    let buf = buffer();
-    let cap = StderrCapture::install(buf)?;
+    if std::env::var_os("CIRCOLATE_NO_LOG_CAPTURE").is_some() {
+        return None;
+    }
+    use std::io::IsTerminal;
+    if !std::io::stderr().is_terminal() {
+        return None;
+    }
+    let cap = StderrCapture::install()?;
     let cell = CAPTURE.get_or_init(|| Mutex::new(None));
     *cell.lock().ok()? = Some(cap);
     Some(())
@@ -72,7 +43,7 @@ pub fn uninstall() {
 }
 
 impl StderrCapture {
-    fn install(buffer: Arc<LogBuffer>) -> Option<Self> {
+    fn install() -> Option<Self> {
         // Setup: all fd manipulation in one tight `unsafe` block.
         let (pipe_read, pipe_write, saved_fd) = unsafe {
             let mut fds = [0i32; 2];
@@ -99,10 +70,8 @@ impl StderrCapture {
             (pipe_read, pipe_write, saved_fd)
         };
 
-        // Reader thread.  `libc::read` / `libc::close` get their own
-        // scoped `unsafe` blocks — the outer one above has already ended,
-        // so this isn't a nested `unsafe` and `#[warn(unused_unsafe)]`
-        // stays quiet.
+        // Reader thread.  Each line goes through the log bus as
+        // `ffi.stderr`; in TUI mode there is no StderrSink, so no loop.
         let reader = std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
             let mut carry = Vec::new();
@@ -118,11 +87,17 @@ impl StderrCapture {
                     let line: Vec<u8> = carry.drain(..=nl).collect();
                     let text =
                     String::from_utf8_lossy(&line[..line.len().saturating_sub(1)]);
-                    buffer.push(strip_ansi(&text));
+                    let clean = strip_ansi(&text);
+                    if !clean.is_empty() {
+                        crate::log_event!("ffi.stderr", line: clean);
+                    }
                 }
             }
             if !carry.is_empty() {
-                buffer.push(strip_ansi(&String::from_utf8_lossy(&carry)));
+                let clean = strip_ansi(&String::from_utf8_lossy(&carry));
+                if !clean.is_empty() {
+                    crate::log_event!("ffi.stderr", line: clean);
+                }
             }
             unsafe {
                 libc::close(pipe_read);

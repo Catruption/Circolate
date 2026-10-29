@@ -25,6 +25,10 @@
     "Acid 5": [{ "name": "TAL-NoiseMaker", "kind": "vst3", "category": null }],
     "Acoustic nylon": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
     "Dream Piano": [{ "name": "rdpiano_juce", "kind": "vst3", "category": null }],
+    "Vital": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "Vital #2": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "Vital #3": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
+    "Vital #4": [{ "name": "Surge XT", "kind": "vst3", "category": null }],
     "Piano Wide": [{ "name": "rdpiano_juce", "kind": "vst3", "category": null }],
     "DX7 Toy Piano": [{ "name": "Dexed", "kind": "vst3", "category": null }],
     "DX100 Funk Bass": [{ "name": "Dexed", "kind": "vst3", "category": null }],
@@ -143,13 +147,13 @@
       "match": "Fruity Soft Clipper",
       "fallback": { "name": "PeakEater", "kind": "vst3", "gain": 1.0 }
     },
-    {
+        {
       "match": "Fruity Squeeze",
-      "fallback": { "name": "MaBitcrush", "kind": "vst3", "gain": 1.0 }
+      "fallback": { "name": "Floe", "kind": "vst3", "gain": 1.0 }
     },
     {
       "match": "Effector",
-      "fallback": { "name": "MaBitcrush", "kind": "vst3", "gain": 1.0 }
+      "fallback": { "name": "Floe", "kind": "vst3", "gain": 1.0 }
     },
     {
       "match": "Transient Processor",
@@ -165,7 +169,7 @@
     },
     {
       "match": "Fruity Limiter",
-      "fallback": { "name": "ProM", "kind": "vst3", "gain": 1.0 }
+      "fallback": { "name": "x42-limiter", "kind": "vst3", "gain": 1.0 }
     },
     {
       "match": "Fruity Compressor",
@@ -185,7 +189,7 @@
     },
     {
       "match": "Fruity Filter",
-      "fallback": { "name": "lsp-plugins", "kind": "vst3", "gain": 1.0 }
+      "fallback": { "name": "TAL-Filter-2", "kind": "vst3", "gain": 1.0 }
     },
     {
       "match": "Fruity Free Filter",

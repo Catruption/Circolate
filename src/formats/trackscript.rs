@@ -42,8 +42,8 @@ use std::sync::OnceLock;
 
 use crate::spec::{
     active_event_prefix_glyphs, parse_greek_slot, FIELD_DURATION, FIELD_FINE_PITCH,
-    FIELD_MIX, FIELD_MOD_X, FIELD_MOD_Y, FIELD_PAN, FIELD_PITCH, FIELD_POSITION,
-    FIELD_RELEASE, FIELD_SOURCE, FIELD_VOLUME, PART_HEADER_SIGIL,
+    FIELD_LYRIC, FIELD_MIX, FIELD_MOD_X, FIELD_MOD_Y, FIELD_PAN, FIELD_PITCH,
+    FIELD_POSITION, FIELD_RELEASE, FIELD_SOURCE, FIELD_VOLUME, PART_HEADER_SIGIL,
 };
 
 pub const C5_HZ: f64 = 523.2511306;
@@ -70,6 +70,7 @@ pub struct TrackscriptEvent {
     pub release: Option<i16>,
     pub mod_x: Option<i16>,
     pub mod_y: Option<i16>,
+    pub lyric: Option<String>,
     pub raw: String,
 }
 
@@ -200,6 +201,19 @@ pub struct Config {
     pub raw: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct LyricSegment {
+    pub row: f64,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LyricEvent {
+    pub start_row: f64,
+    pub end_row: f64,
+    pub segments: Vec<LyricSegment>,
+}
+
 #[derive(Debug, Default, Serialize)]
 #[allow(dead_code)]
 pub struct TrackscriptFile {
@@ -210,6 +224,7 @@ pub struct TrackscriptFile {
     pub blocks: HashMap<String, Vec<String>>,
     pub parts: HashMap<String, TrackscriptPart>,
     pub notes: Vec<NoteEvent>,
+    pub lyrics: Vec<LyricEvent>,
 }
 
 impl Default for Config {
@@ -907,6 +922,7 @@ fn parse_part_events(
             release: None,
             mod_x: None,
             mod_y: None,
+            lyric: None,
             raw: format!("<{}>", inner),
         };
 
@@ -950,6 +966,12 @@ fn parse_part_events(
                 ev.mod_x = rest.trim().parse::<i16>().ok();
             } else if let Some(rest) = f.strip_prefix(FIELD_MOD_Y) {
                 ev.mod_y = rest.trim().parse::<i16>().ok();
+            } else if let Some(rest) = f.strip_prefix(FIELD_LYRIC) {
+                // Strip straight quotes ("), smart quotes (”/“), and single quotes (')
+                let trimmed = rest.trim().trim_matches(|c| c == '"' || c == '”' || c == '“' || c == '\'');
+                if !trimmed.is_empty() {
+                    ev.lyric = Some(trimmed.to_string());
+                }
             } else if f.starts_with(FIELD_SOURCE) {
                 if let Some(c) = src_rx.captures(&f) {
                     ev.sample_override = Some(c[1].to_string());
@@ -1467,6 +1489,50 @@ pub fn parse_str(text: &str) -> Result<TrackscriptFile> {
     .map(parse_block_array)
     .unwrap_or_default();
 
+    let mut lyrics = Vec::new();
+    let lyrics_rx = section_rx("Lyrics");
+    if let Some(block) = extract_block(&text, &lyrics_rx) {
+        let frame_len = 4.0 * config.subdivisions as f64; // Assumes 4/4 time
+        let mut row_offset = 0.0;
+
+        // Process the Lyrics block line by line
+        for raw_line in block.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            // A semicolon means "skip one measure"
+            if line == ";" {
+                row_offset += frame_len;
+                continue;
+            }
+
+            // Parse the events on this line
+            let events = parse_part_events(line, config.subdivisions, 4, row_offset);
+            let mut segments = Vec::new();
+            for ev in events {
+                if let Some(text) = ev.lyric {
+                    segments.push(LyricSegment {
+                        row: ev.row, // ev.row already has row_offset added by parse_part_events
+                        text,
+                    });
+                }
+            }
+
+            // If the line had lyrics, save it as an active line
+            if !segments.is_empty() {
+                lyrics.push(LyricEvent {
+                    start_row: row_offset,
+                    end_row: row_offset + frame_len,
+                    segments,
+                });
+            }
+
+            // Move to the next measure
+            row_offset += frame_len;
+        }
+    }
+
     let mut notes = Vec::new();
     for (placement_index, calls) in block_list.iter().enumerate() {
         for call in calls {
@@ -1523,6 +1589,7 @@ pub fn parse_str(text: &str) -> Result<TrackscriptFile> {
        blocks,
        parts,
        notes,
+       lyrics,
     })
 }
 

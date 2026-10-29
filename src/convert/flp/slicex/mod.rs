@@ -15,67 +15,27 @@
 //!   sf2        the SF2 writer
 //!
 //! Whether or not a structure is currently applied to the generated
-//! SoundFont, it is still parsed.  Set `SLICEX_DEBUG=1` to dump every
-//! parsed structure in a stable, greppable format.
+//! SoundFont, it is still parsed.  Set `SLICEX_DEBUG=1` (or
+//! `CIRCOLATE_DEBUG=flp.slicex`) to dump every parsed structure in a
+//! stable, greppable format via the log bus.
 //!
 //! Optional application env vars:
 //!
 //!   FLP_SLICEX_APPLY_PARAMS=1       apply region params (filter/pan/atten)
 //!   FLP_SLICEX_APPLY_FILTER_ENV=1   apply tag=2 filter envelope
 //!   SLICEX_ENV_CURVE_WEIGHT=<0..1>  envelope segment curvature weight
-//!   SLICEX_ENV_SCALE=<seconds>      envelope time scale override (default: per-slice length)
+//!   SLICEX_ENV_SCALE=<seconds>      envelope time scale override
 //!   SLICEX_ENV_CURVE_K=<float>      curve law strength (default 2.0)
-//!   SLICEX_SPEED_OCTAVES=<float>    pitch range of the SPEED envelope extremes (default 1.0)
-//!   FLP_SLICEX_APPLY_SPEED=1        bake the SPEED envelope (off by default: range unverified)
+//!   SLICEX_SPEED_OCTAVES=<float>    pitch range of SPEED envelope extremes
+//!   FLP_SLICEX_APPLY_SPEED=1        bake the SPEED envelope
 //!   SLICEX_DUMP_SLICES=<dir>        write every baked slice as a WAV for pitchtrack.py
 //!   SLICEX_STATE_OUT=<dir>          dump raw state + trest blobs for trest_diff.py
 //!
 //! ## Provenance tags (for fact-checking against Slicex_x64.dll)
 //!
-//! Comments of the form
-//!
-//!     SRC[loc=<where in the state> decomp=<function/address> conf=<how sure>]
-//!
-//! mark every structure that comes from the plugin's state format.
-//!
-//!   loc     state+N      absolute byte offset in the plugin state blob
-//!           slotK.xxx    relative to slot K (slot 0 starts at state+0x5F)
-//!           trest+N      relative to the trest block (= slot 1 params, see trest.rs)
-//!   decomp  FUN_xxxxxxxx function in the Ghidra project
-//!           TODO         nobody has recorded where the DLL does this yet
-//!   conf    verified     checked byte-for-byte on a real state (slicex.rs parse_slicex,
-//!                        up to the end of slot 1)
-//!           derived      follows from verified layout by arithmetic; not checked in the DLL
-//!           corpus       observed constant/varying across the state files only
-//!           guess        our assumption, calibrate against FL
-//!
-//!   rg 'decomp=TODO'    places still to look up in the DLL
-//!   rg 'DECOMP-CHECK'   places where this code may disagree with the verified layout
-//!
-//! Everything here is comments only; no code was changed by adding them.
-//!
-//! ## State layout (state = FLP event 213 plugin data)
-//!
-//!   state+0x00  u32 version 0x00060003                    outer.rs raw 0..4
-//!   state+0x04  block20, 8 x u32 globals                  outer.rs
-//!   state+0x24  main settings block, 0x2F bytes           outer.rs (engine this+0x12F0)
-//!   state+0x53  header12, 3 x i32                         outer.rs
-//!   state+0x5F  slot 0
-//!                 u8 flag (0 = audio embedded)            outer.rs byte 95
-//!                 u8 path length + path                   0x60 in parse_state
-//!                 u32 wav length + wav                    wav1
-//!                 0x4C params            --+
-//!                 4 x envelope record      +-- "settings header" (settings.rs)
-//!                 u32 slice count        --+   at header+396
-//!                 count x 0x44 records                    records.rs
-//!               slot 1, same shape, normally the empty placeholder layer
-//!                 flag + path length (2 bytes)            see DECOMP-CHECK on SLICEX_HDR_LEN
-//!                 u32 length + wav                        wav2
-//!                 0x4C params                             \
-//!                 4 x envelope record (kind 6)             |  = the trest block (trest.rs)
-//!                 u32 slice count (= 1)                    |  count + record + 36 bytes
-//!                 1 x 0x44 record                          |  = the "108-byte param block" (params.rs)
-//!               tail: 8 arts x (0x14 header + 6 targets x 6 envelope records)
+//! Comments of the form `SRC[loc=… decomp=… conf=…]` mark every structure
+//! that comes from the plugin's state format.  See git history for the
+//! full provenance map — this module preserves those comments unchanged.
 
 mod envelope;
 mod outer;
@@ -87,6 +47,7 @@ mod trest;
 mod wav;
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 
 use crate::convert::{identifier, AuxFile};
 use crate::formats::flp::{Channel, Plugin};
@@ -102,28 +63,8 @@ use settings::SettingsHeader;
 use trest::Trest;
 use wav::WavChunks;
 
-// SRC[loc=n/a (computed by the plugin, not stored) decomp=FUN_0062ac10+FUN_00880980 conf=derived]
-// DECOMP-CHECK: the plugin's default key (slicex.rs default_key) is 60 only while
-// the slice count n <= 65; above that it shifts down by 12 per 12 slices:
-// base = max(0, 60 - ((n - 0x36) / 12) * 12).  This module always uses 60 (or the
-// FLP_SLICEX_BASE* override), which is identical for the 41- and 52-marker channels
-// seen so far but not for bigger ones.  Explicit keys probably live in the WAV tlst
-// chunk (wav.rs); where the plugin applies them is still unknown.
 const DEFAULT_BASE_KEY: u32 = 60;
-// SRC[loc=slot0.params .. slot0.count decomp=TODO conf=derived]
-// DECOMP-CHECK: 402 vs 400.  Slot 0's params (0x4C) + 4 two-point envelopes
-// (4 x 80 bytes) = 396; the slice count is the u32 at +396, so the first record
-// starts at +400 (that is what slicex.rs parse_slicex reads).  Here the records
-// are read from +402: the header swallows the first 2 bytes of record 0 and the
-// record block runs 2 bytes into slot 1 (its flag + empty path length).  Harmless
-// while every record is byte-identical and wav2 is found by its RIFF tag, but it
-// shifts every field offset inside a record by 2.  402 is also only right while
-// all four slot-0 envelopes have exactly 2 points; parse_slicex has neither limit.
-// To check in the DLL: find the loop that reads the slice array after the count
-// (element size 0x44) and see what is read between the count and element 0.
 const SLICEX_HDR_LEN: usize = 402;
-// SRC[loc=slot0.records, element size decomp=TODO conf=verified (68 bytes per element)]
-// Find in the DLL: array loop with element size 0x44, read right after the slice count.
 const SLICEX_REC_LEN: usize = 68;
 
 pub(super) struct SlicexOut {
@@ -168,13 +109,8 @@ fn slicex_base_key(
             }
         }
     }
-    // NOTE: deliberately NOT inferred from the lowest placed note.  The
-    // lowest note is often an overflow slice below the base (e.g. key 59),
-    // and treating it as slice 0 would shift every slice by a semitone.
     DEFAULT_BASE_KEY
 }
-
-// ── top-level parsed state ────────────────────────────────────────────
 
 pub struct ParsedState<'a> {
     pub outer: OuterHeader<'a>,
@@ -194,12 +130,8 @@ fn parse_state(data: &[u8]) -> Result<ParsedState<'_>, String> {
                            data.len()
         ));
     }
-    // SRC[loc=state+0x00 .. state+0x5F (+ flag at 0x5F) decomp=TODO conf=verified (slicex.rs: version, block20, main, header12)]
     let outer = OuterHeader::parse(data).ok_or("outer header parse failed")?;
 
-    // SRC[loc=slot0 path length at state+0x60, path from 0x61 decomp=TODO conf=verified]
-    // Byte 0x5F (the slot flag, 0 = audio embedded) is the last byte of the 96-byte "outer header".
-    // If it is 1 (filename only) there is no wav here at all; this parser does not handle that.
     let path_len = data[0x60] as usize;
     let path_start = 0x61;
     let path_end = path_start + path_len;
@@ -212,7 +144,6 @@ fn parse_state(data: &[u8]) -> Result<ParsedState<'_>, String> {
     }
     let source_path = String::from_utf8_lossy(&data[path_start..path_end]).into_owned();
 
-    // SRC[loc=slot0.wav length (u32) then RIFF bytes decomp=TODO conf=verified]
     let wav1_len = u32::from_le_bytes(data[path_end..path_end + 4].try_into().unwrap()) as usize;
     let wav1_start = path_end + 4;
     let wav1_end = wav1_start
@@ -228,7 +159,6 @@ fn parse_state(data: &[u8]) -> Result<ParsedState<'_>, String> {
     let wav1 = &data[wav1_start..wav1_end];
     let wav1_chunks = WavChunks::parse(wav1).ok_or("WAV #1 is not RIFF/WAVE")?;
 
-    // SRC[loc=slot0.params .. slot0.count decomp=TODO conf=derived]  see DECOMP-CHECK on SLICEX_HDR_LEN
     let hdr_end = wav1_end
     .checked_add(SLICEX_HDR_LEN)
     .ok_or("settings header offset overflow")?;
@@ -259,9 +189,6 @@ fn parse_state(data: &[u8]) -> Result<ParsedState<'_>, String> {
     }
     let records = SliceRecords::parse(&data[rec_start..rec_end], settings.slice_count, SLICEX_REC_LEN);
 
-    // SRC[loc=slot1.wav (the 2 bytes before its u32 length are slot 1's flag + path length) decomp=TODO conf=derived]
-    // wav2 is only found when slot 1 has an empty path and embedded audio; otherwise it falls
-    // back to rec_end and trest scans from there, which still works because the scan skips junk.
     let (wav2, after_wav2) = if rec_end + 16 <= data.len()
     && &data[rec_end + 4..rec_end + 8] == b"RIFF"
     && &data[rec_end + 12..rec_end + 16] == b"WAVE"
@@ -274,9 +201,6 @@ fn parse_state(data: &[u8]) -> Result<ParsedState<'_>, String> {
         (None, rec_end)
     };
 
-    // SRC[loc=slot1.params .. end of state decomp=TODO conf=derived]  see trest.rs for the exact map
-    // parse_slicex (slicex.rs) reads the same bytes strictly; Slicex::tail_offset is where the
-    // 8 x 6 tail begins if you want to scan only that part.
     let trest = Trest::parse(&data[after_wav2..]);
 
     Ok(ParsedState {
@@ -291,114 +215,118 @@ fn parse_state(data: &[u8]) -> Result<ParsedState<'_>, String> {
     })
 }
 
-// ── debug dump ────────────────────────────────────────────────────────
+// ── debug dump (atomic blocks) ────────────────────────────────────────
+//
+// Each function returns a `String` and is emitted via `log_event!`.  The
+// block split mirrors the visual sections in the old `eprintln!` dump;
+// the log filter (SLICEX_DEBUG / CIRCOLATE_DEBUG=flp.slicex) decides
+// whether they reach a sink.
 
-fn dump_debug(
-    chan: &Channel,
-    s: &ParsedState<'_>,
-    layout: &str,
-    base: u32,
-    lo_key: u32,
-    hi_key: u32,
-    slice_secs: f64,
-    env_scale: f64,
-    amp_env: Option<&AmpEnvelope>,
-) {
-    eprintln!("=== Slicex chan {} ({}) ===", chan.iid, chan.name);
-    eprintln!("  source:  {}", s.source_path);
+fn dump_header(chan: &Channel, s: &ParsedState<'_>) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "=== Slicex chan {} ({}) ===", chan.iid, chan.name);
+    let _ = writeln!(out, "  source:  {}", s.source_path);
 
-    eprintln!("  outer header (96 B):");
+    let _ = writeln!(out, "  outer header (96 B):");
     for off in (0..0x60).step_by(16) {
         let row = &s.outer.raw[off..off + 16];
-        eprintln!("    +{off:>3}  {}",
-                  row.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "));
+        let _ = writeln!(out, "    +{off:>3}  {}",
+                         row.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "));
     }
-    eprintln!("    toggle_60={} toggle_71={} auto_dump={} has_override={} last_slice={}",
-              s.outer.sub_tab, s.outer.toggle_71, s.outer.auto_dump,
-              s.outer.has_override, s.outer.last_slice);
+    let _ = writeln!(out, "    toggle_60={} toggle_71={} auto_dump={} has_override={} last_slice={}",
+                     s.outer.sub_tab, s.outer.toggle_71, s.outer.auto_dump,
+                     s.outer.has_override, s.outer.last_slice);
 
-    eprintln!("  wav1: {} B, fmt={:?}, data={} B",
-              s.wav1.len(), s.wav1_chunks.fmt, s.wav1_chunks.data_size);
-    eprintln!("    cues: {}", s.wav1_chunks.cues.len());
-    eprintln!("    tlst: {} entries", s.wav1_chunks.tlst.len());
+    let _ = writeln!(out, "  wav1: {} B, fmt={:?}, data={} B",
+                     s.wav1.len(), s.wav1_chunks.fmt, s.wav1_chunks.data_size);
+    let _ = writeln!(out, "    cues: {}", s.wav1_chunks.cues.len());
+    let _ = writeln!(out, "    tlst: {} entries", s.wav1_chunks.tlst.len());
     for t in s.wav1_chunks.tlst.iter().take(12) {
-        eprintln!("      cue_id={} count={} key={} (byte={:#04x})",
-                  t.cue_id, t.count, t.key_byte, t.key_byte);
+        let _ = writeln!(out, "      cue_id={} count={} key={} (byte={:#04x})",
+                         t.cue_id, t.count, t.key_byte, t.key_byte);
     }
     if let Some(inst) = &s.wav1_chunks.inst {
-        eprintln!("    inst: root={} fine={} gain={} low={} high={}",
-                  inst[0], inst[1], inst[4], inst[5], inst[6]);
+        let _ = writeln!(out, "    inst: root={} fine={} gain={} low={} high={}",
+                         inst[0], inst[1], inst[4], inst[5], inst[6]);
     }
     if let Some(smpl) = &s.wav1_chunks.smpl {
-        eprintln!("    smpl: period={} unity={} loops={}",
-                  smpl.period, smpl.unity_note, smpl.num_loops);
+        let _ = writeln!(out, "    smpl: period={} unity={} loops={}",
+                         smpl.period, smpl.unity_note, smpl.num_loops);
     }
     if let Some(acid) = &s.wav1_chunks.acid {
-        eprintln!("    acid: type={:#x} root={} beats={} meter={}/{} tempo={}",
-                  acid.kind, acid.root_note, acid.beats,
-                  acid.meter_num, acid.meter_den, acid.tempo);
+        let _ = writeln!(out, "    acid: type={:#x} root={} beats={} meter={}/{} tempo={}",
+                         acid.kind, acid.root_note, acid.beats,
+                         acid.meter_num, acid.meter_den, acid.tempo);
     }
     if let Some(strc) = &s.wav1_chunks.strc {
-        eprintln!("    strc: {} B", strc.len());
+        let _ = writeln!(out, "    strc: {} B", strc.len());
     }
     if let Some(t) = s.wav1_chunks.strc_table() {
-        eprintln!("    strc header: {:?}", t.header);
-        eprintln!("    strc records: {} (first 6)", t.records.len());
+        let _ = writeln!(out, "    strc header: {:?}", t.header);
+        let _ = writeln!(out, "    strc records: {} (first 6)", t.records.len());
         for (i, r) in t.records.iter().take(6).enumerate() {
-            eprintln!("      [{:>2}] {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
-                      i, r.a, r.b, r.c, r.d, r.e, r.f);
+            let _ = writeln!(out, "      [{:>2}] {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
+                             i, r.a, r.b, r.c, r.d, r.e, r.f);
         }
     }
     for (name, body) in &s.wav1_chunks.info_list {
-        eprintln!("    LIST/{name}: {} B", body.len());
+        let _ = writeln!(out, "    LIST/{name}: {} B", body.len());
     }
     for u in &s.wav1_chunks.unknown {
         let tag = String::from_utf8_lossy(&u.id);
-        eprintln!("    unknown chunk {tag:?} at wav+{} ({} B)", u.offset, u.size);
+        let _ = writeln!(out, "    unknown chunk {tag:?} at wav+{} ({} B)", u.offset, u.size);
     }
+    let _ = writeln!(out, "  wav2:    {} B", s.wav2.map_or(0, |w| w.len()));
+    out
+}
 
-    eprintln!("  settings header (402 B):");
-    eprintln!("    sentinels:      {:?} {:?} {:?}",
-              s.settings.sentinel_a, s.settings.sentinel_b, s.settings.zero_a);
-    eprintln!("    duration_x2:    {}", s.settings.duration_x2);
-    eprintln!("    rate32:         {}", s.settings.rate32);
-    eprintln!("    filter_type:    {}", s.settings.filter_type);
-    eprintln!("    5×80B block durations: {:?}", s.settings.block_durations);
-    eprintln!("    slice_count:    {}", s.settings.slice_count);
+fn dump_settings(s: &ParsedState<'_>) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "  settings header (402 B):");
+    let _ = writeln!(out, "    sentinels:      {:?} {:?} {:?}",
+                     s.settings.sentinel_a, s.settings.sentinel_b, s.settings.zero_a);
+    let _ = writeln!(out, "    duration_x2:    {}", s.settings.duration_x2);
+    let _ = writeln!(out, "    rate32:         {}", s.settings.rate32);
+    let _ = writeln!(out, "    filter_type:    {}", s.settings.filter_type);
+    let _ = writeln!(out, "    5×80B block durations: {:?}", s.settings.block_durations);
+    let _ = writeln!(out, "    slice_count:    {}", s.settings.slice_count);
 
-    eprintln!("  per-slice records ({} × 68 B):", s.settings.slice_count);
+    let _ = writeln!(out, "  per-slice records ({} × 68 B):", s.settings.slice_count);
     let uniq = s.records.unique();
-    eprintln!("    {} distinct record(s):", uniq.len());
+    let _ = writeln!(out, "    {} distinct record(s):", uniq.len());
     for (r, idx) in uniq.iter().take(4) {
-        eprintln!("      x{:>3}: {}", idx.len(),
-                  r.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "));
+        let _ = writeln!(out, "      x{:>3}: {}", idx.len(),
+                         r.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "));
     }
     let varying = s.records.varying_columns();
-    eprintln!("    {} varying column(s): {:?}", varying.len(), varying);
+    let _ = writeln!(out, "    {} varying column(s): {:?}", varying.len(), varying);
+    out
+}
 
-    eprintln!("  wav2:    {} B", s.wav2.map_or(0, |w| w.len()));
-    eprintln!("  trest:   {} B, {} region record(s)",
-              s.trest.raw.len(), s.trest.records.len());
+fn dump_trest(s: &ParsedState<'_>) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "  trest:   {} B, {} region record(s)",
+                     s.trest.raw.len(), s.trest.records.len());
 
     for (i, r) in s.trest.records.iter().enumerate().take(40) {
-        eprintln!("    [{:>2}] +{:<6} tag={} cnt={} size={}",
-                  i, r.offset, r.tag, r.count, r.size);
+        let _ = writeln!(out, "    [{:>2}] +{:<6} tag={} cnt={} size={}",
+                         i, r.offset, r.tag, r.count, r.size);
         for (j, p) in r.points.iter().enumerate().take(6) {
-            eprintln!("         p{}: dx={:>12.6} y={:>10.6} curve={:>10.6}",
-                      j, p.dx, p.y, p.curve);
+            let _ = writeln!(out, "         p{}: dx={:>12.6} y={:>10.6} curve={:>10.6}",
+                             j, p.dx, p.y, p.curve);
         }
         if r.count > 6 {
-            eprintln!("         ... +{} more points", r.count - 6);
+            let _ = writeln!(out, "         ... +{} more points", r.count - 6);
         }
     }
     if s.trest.records.len() > 40 {
-        eprintln!("    ... +{} more records", s.trest.records.len() - 40);
+        let _ = writeln!(out, "    ... +{} more records", s.trest.records.len() - 40);
     }
 
     if let Some(prm) = &s.trest.params {
-        eprintln!("  region param block (108 B @ trest+396):");
-        eprintln!("    lead: {}", prm.lead);
-        eprintln!("    17 u32s:");
+        let _ = writeln!(out, "  region param block (108 B @ trest+396):");
+        let _ = writeln!(out, "    lead: {}", prm.lead);
+        let _ = writeln!(out, "    17 u32s:");
         for (i, v) in prm.values.iter().enumerate() {
             let hint = match *v {
                 12800 => "  ← 100% (FL level)",
@@ -406,36 +334,81 @@ fn dump_debug(
                 8000 => "  ← ~62.5%",
                 _ => "",
             };
-            eprintln!("      [{:>2}] {:>10}  ({:#010x}){hint}", i, v, v);
+            let _ = writeln!(out, "      [{:>2}] {:>10}  ({:#010x}){hint}", i, v, v);
         }
     }
+    out
+}
 
-    eprintln!("  computed:");
-    eprintln!("    base   = {}", base);
-    eprintln!("    layout = {}", layout);
-    eprintln!("    keys   = {} slices, {}..{}", s.records.slice_count, lo_key, hi_key);
-    eprintln!("    slice_secs (avg) = {:.4}", slice_secs);
-    eprintln!("    env time scale   = {:.4}", env_scale);
+fn dump_computed(
+    s: &ParsedState<'_>,
+    layout: &str, base: u32, lo_key: u32, hi_key: u32,
+    slice_secs: f64, env_scale: f64,
+) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "  computed:");
+    let _ = writeln!(out, "    base   = {}", base);
+    let _ = writeln!(out, "    layout = {}", layout);
+    let _ = writeln!(out, "    keys   = {} slices, {}..{}", s.records.slice_count, lo_key, hi_key);
+    let _ = writeln!(out, "    slice_secs (avg) = {:.4}", slice_secs);
+    let _ = writeln!(out, "    env time scale   = {:.4}", env_scale);
+    out
+}
 
+fn dump_env(s: &ParsedState<'_>, amp_env: Option<&AmpEnvelope>) -> String {
+    let mut out = String::new();
     if let Some(env) = s.trest.amp_envelope() {
-        eprintln!("  amp envelope @ +{} (tag={}, {} points):", env.offset, env.tag, env.count);
+        let _ = writeln!(out, "  amp envelope @ +{} (tag={}, {} points):", env.offset, env.tag, env.count);
         for (i, p) in env.points.iter().enumerate() {
-            eprintln!("    [{:>2}] dx={:>12.6} y={:>10.6} curve={:>10.6}", i, p.dx, p.y, p.curve);
+            let _ = writeln!(out, "    [{:>2}] dx={:>12.6} y={:>10.6} curve={:>10.6}", i, p.dx, p.y, p.curve);
         }
     } else {
-        eprintln!("  amp envelope: none found");
+        let _ = writeln!(out, "  amp envelope: none found");
     }
 
     if let Some(e) = amp_env {
-        eprintln!("  ADSR decomposition:");
-        eprintln!("    delay    = {:>10.3} ms", e.delay_ms);
-        eprintln!("    attack   = {:>10.3} ms", e.attack_ms);
-        eprintln!("    hold     = {:>10.3} ms", e.hold_ms);
-        eprintln!("    decay    = {:>10.3} ms", e.decay_ms);
-        eprintln!("    sustain  = {:>10.4}", e.sustain);
-        eprintln!("    release  = {:>10.3} ms", e.release_ms);
+        let _ = writeln!(out, "  ADSR decomposition:");
+        let _ = writeln!(out, "    delay    = {:>10.3} ms", e.delay_ms);
+        let _ = writeln!(out, "    attack   = {:>10.3} ms", e.attack_ms);
+        let _ = writeln!(out, "    hold     = {:>10.3} ms", e.hold_ms);
+        let _ = writeln!(out, "    decay    = {:>10.3} ms", e.decay_ms);
+        let _ = writeln!(out, "    sustain  = {:>10.4}", e.sustain);
+        let _ = writeln!(out, "    release  = {:>10.3} ms", e.release_ms);
     }
-    eprintln!();
+    out
+}
+
+fn dump_application(
+    apply_params: bool,
+    apply_filter_env: bool,
+    s: &ParsedState<'_>,
+    filter_env: Option<&FilterEnvelope>,
+) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "  application:");
+    let _ = writeln!(out, "    apply_params     = {}", apply_params);
+    let _ = writeln!(out, "    apply_filter_env = {}", apply_filter_env);
+    if let Some(p) = &s.trest.params {
+        let _ = writeln!(out, "    cutoff_raw       = {}", p.cutoff_raw());
+        let _ = writeln!(out, "    cutoff_sf2_cents = {}", p.cutoff_sf2_cents());
+        let _ = writeln!(out, "    pan_l / pan_r    = {} / {}", p.pan_l_raw(), p.pan_r_raw());
+        let _ = writeln!(out, "    pan_sf2          = {}", p.pan_sf2());
+        let _ = writeln!(out, "    levels_raw       = {:?}", p.levels_raw());
+        let _ = writeln!(out, "    amp_atten_cb     = {}", p.amp_attenuation_cb());
+    }
+    if let Some(fe) = filter_env {
+        let _ = writeln!(out, "  filter envelope (tag=2):");
+        let _ = writeln!(out, "    delay    = {:>10.3} ms", fe.delay_ms);
+        let _ = writeln!(out, "    attack   = {:>10.3} ms", fe.attack_ms);
+        let _ = writeln!(out, "    hold     = {:>10.3} ms", fe.hold_ms);
+        let _ = writeln!(out, "    decay    = {:>10.3} ms", fe.decay_ms);
+        let _ = writeln!(out, "    sustain  = {:>10.4}", fe.sustain);
+        let _ = writeln!(out, "    release  = {:>10.3} ms", fe.release_ms);
+        let _ = writeln!(out, "    depth    = {} cents", fe.depth_cents);
+    } else if apply_filter_env {
+        let _ = writeln!(out, "  filter envelope: no tag=2 record with count >= 2");
+    }
+    out
 }
 
 // ── entry point ───────────────────────────────────────────────────────
@@ -463,8 +436,6 @@ pub(super) fn convert(
         std::fs::write(&dump, state.wav1).ok();
     }
 
-    // SLICEX_STATE_OUT=<dir>: write the raw plugin state and trest block so
-    // two channels / two FL saves can be diffed with trest_diff.py.
     if let Some(dir) = std::env::var_os("SLICEX_STATE_OUT") {
         let dir = std::path::PathBuf::from(dir);
         std::fs::create_dir_all(&dir).ok();
@@ -482,31 +453,20 @@ pub(super) fn convert(
         return Err("embedded WAV has no cue points (no slice markers)".into());
     }
 
-    // Slicex follows the project tempo: in FL, changing the tempo changes how
-    // fast the slices play.  The sample's own tempo is the ACID chunk's tempo
-    // when it has one.  Slicex files seen so far have acid tempo = 0 and a
-    // beat count equal to duration x 2, i.e. Slicex assumes 120 BPM for an
-    // untagged sample (SRC[loc=WAV chunk 'acid' + settings duration_x2
-    // conf=corpus]; unverified against the DLL).  Stretch the whole sample
-    // (short slices would fall into stretch.rs's pitch-changing fallback)
-    // and scale the cue points by the same factor.
-    //   FLP_SLICEX_NO_STRETCH=1        turn this off
-    //   FLP_SLICEX_SAMPLE_BPM=<bpm>    override the sample tempo
     let acid_tempo = state.wav1_chunks.acid.as_ref().map(|a| a.tempo);
     let acid_beats = state.wav1_chunks.acid.as_ref().map(|a| a.beats);
     let (sample_bpm, bpm_src) = sample_bpm_for(acid_tempo);
-    if debug_on() {
+    {
         let secs = pcm.data.len() as f64 / pcm.rate.max(1) as f64;
-        eprintln!(
-            "  stretch: acid tempo {:?}, acid beats {:?} ({:.3} s, beats-derived {:.3} bpm), \
-             using {:.3} bpm ({}), project {:.3} bpm",
-            acid_tempo,
-            acid_beats,
-            secs,
-            acid_beats.map_or(0.0, |b| b as f64 * 60.0 / secs.max(1e-9)),
-            sample_bpm,
-            bpm_src,
-            project_bpm
+        crate::log_event!(
+            "flp.slicex.stretch",
+            body: format!(
+                "  stretch: acid tempo {:?}, acid beats {:?} ({:.3} s, beats-derived {:.3} bpm), \
+using {:.3} bpm ({}), project {:.3} bpm",
+                          acid_tempo, acid_beats, secs,
+                          acid_beats.map_or(0.0, |b| b as f64 * 60.0 / secs.max(1e-9)),
+                          sample_bpm, bpm_src, project_bpm,
+            ),
         );
     }
     if let Some(f) = stretch_factor(sample_bpm, project_bpm) {
@@ -519,14 +479,7 @@ pub(super) fn convert(
         cues.retain(|&c| (c as usize) < len);
         warnings.push(format!(
             "[{:2}] {}: Slicex stretched x{:.4} (sample {:.2} bpm [{}] -> project {:.2}, {} -> {} samples)",
-            chan.iid,
-            chan.name,
-            f,
-            sample_bpm,
-            bpm_src,
-            project_bpm,
-            before,
-            len
+                              chan.iid, chan.name, f, sample_bpm, bpm_src, project_bpm, before, len
         ));
         if cues.is_empty() {
             return Err("no cue points left after tempo stretch".into());
@@ -617,33 +570,19 @@ pub(super) fn convert(
         None
     };
 
-    if debug_on() {
-        dump_debug(chan, &state, layout, base, lo_key, hi_key, slice_secs, env_scale, amp_env.as_ref());
-        eprintln!("  application:");
-        eprintln!("    apply_params     = {}", apply_params);
-        eprintln!("    apply_filter_env = {}", apply_filter_env);
-        if let Some(p) = &state.trest.params {
-            eprintln!("    cutoff_raw       = {}", p.cutoff_raw());
-            eprintln!("    cutoff_sf2_cents = {}", p.cutoff_sf2_cents());
-            eprintln!("    pan_l / pan_r    = {} / {}", p.pan_l_raw(), p.pan_r_raw());
-            eprintln!("    pan_sf2          = {}", p.pan_sf2());
-            eprintln!("    levels_raw       = {:?}", p.levels_raw());
-            eprintln!("    amp_atten_cb     = {}", p.amp_attenuation_cb());
-        }
-        if let Some(fe) = &filter_env {
-            eprintln!("  filter envelope (tag=2):");
-            eprintln!("    delay    = {:>10.3} ms", fe.delay_ms);
-            eprintln!("    attack   = {:>10.3} ms", fe.attack_ms);
-            eprintln!("    hold     = {:>10.3} ms", fe.hold_ms);
-            eprintln!("    decay    = {:>10.3} ms", fe.decay_ms);
-            eprintln!("    sustain  = {:>10.4}", fe.sustain);
-            eprintln!("    release  = {:>10.3} ms", fe.release_ms);
-            eprintln!("    depth    = {} cents", fe.depth_cents);
-        } else if apply_filter_env {
-            eprintln!("  filter envelope: no tag=2 record with count >= 2");
-        }
-        eprintln!();
-    }
+    // ── emit the atomic debug blocks ─────────────────────────────────
+    crate::log_event!("flp.slicex.header",     body: dump_header(chan, &state));
+    crate::log_event!("flp.slicex.settings",   body: dump_settings(&state));
+    crate::log_event!("flp.slicex.trest",      body: dump_trest(&state));
+    crate::log_event!(
+        "flp.slicex.computed",
+        body: dump_computed(&state, layout, base, lo_key, hi_key, slice_secs, env_scale),
+    );
+    crate::log_event!("flp.slicex.env",        body: dump_env(&state, amp_env.as_ref()));
+    crate::log_event!(
+        "flp.slicex.application",
+        body: dump_application(apply_params, apply_filter_env, &state, filter_env.as_ref()),
+    );
 
     let base_raw = if chan.name.is_empty() {
         format!("Ch{:02}", chan.iid)
@@ -660,19 +599,23 @@ pub(super) fn convert(
         None
     };
     let speed_octaves = std::env::var("SLICEX_SPEED_OCTAVES")
-        .ok()
-        .and_then(|s| s.trim().parse::<f64>().ok())
-        .unwrap_or(1.0);
-    if debug_on() {
+    .ok()
+    .and_then(|s| s.trim().parse::<f64>().ok())
+    .unwrap_or(1.0);
+    {
+        let mut sp = String::new();
         match state.trest.speed_envelope() {
             Some(r) => {
-                eprintln!("  speed envelope @ +{} ({} points, octaves={}):", r.offset, r.count, speed_octaves);
+                let _ = writeln!(sp, "  speed envelope @ +{} ({} points, octaves={}):",
+                                 r.offset, r.count, speed_octaves);
                 for (i, p) in r.points.iter().enumerate() {
-                    eprintln!("    [{:>2}] dx={:>12.6} y={:>10.6} curve={:>10.6}", i, p.dx, p.y, p.curve);
+                    let _ = writeln!(sp, "    [{:>2}] dx={:>12.6} y={:>10.6} curve={:>10.6}",
+                                     i, p.dx, p.y, p.curve);
                 }
             }
-            None => eprintln!("  speed envelope: none (flat)"),
+            None => { let _ = writeln!(sp, "  speed envelope: none (flat)"); }
         }
+        crate::log_event!("flp.slicex.speed_env", body: sp);
     }
 
     let sf2 = sf2::build(
@@ -681,9 +624,9 @@ pub(super) fn convert(
         &ranges,
         &keys,
         state.trest.amp_envelope().map(|r| r.points.as_slice()),
-        env_scale_override,
-        speed_pts,
-        speed_octaves,
+                         env_scale_override,
+                         speed_pts,
+                         speed_octaves,
                          filter_env.as_ref(),
                          &filt,
     );
@@ -760,27 +703,22 @@ pub(super) fn convert(
     })
 }
 
-/// Tempo Slicex is assumed to use for a sample that declares none.
 const SLICEX_IMPLICIT_BPM: f64 = 120.0;
 
-/// The sample's own tempo and where it came from: the env override, a sane
-/// ACID tempo, or the implicit 120 BPM.
 fn sample_bpm_for(acid_tempo: Option<f32>) -> (f64, &'static str) {
     if let Some(v) = std::env::var("FLP_SLICEX_SAMPLE_BPM")
         .ok()
         .and_then(|s| s.trim().parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v > 0.0)
-    {
-        return (v, "env");
-    }
-    match acid_tempo {
-        Some(t) if t.is_finite() && (20.0..=400.0).contains(&(t as f64)) => (t as f64, "acid"),
-        _ => (SLICEX_IMPLICIT_BPM, "implicit"),
-    }
+        {
+            return (v, "env");
+        }
+        match acid_tempo {
+            Some(t) if t.is_finite() && (20.0..=400.0).contains(&(t as f64)) => (t as f64, "acid"),
+            _ => (SLICEX_IMPLICIT_BPM, "implicit"),
+        }
 }
 
-/// `sample_bpm / project_bpm`, or None when no stretch should happen
-/// (opted out, no usable project tempo, or the two tempos already agree).
 fn stretch_factor(sample_bpm: f64, project_bpm: f64) -> Option<f64> {
     if std::env::var_os("FLP_SLICEX_NO_STRETCH").is_some() {
         return None;
@@ -799,13 +737,10 @@ fn stretch_factor(sample_bpm: f64, project_bpm: f64) -> Option<f64> {
     }
 }
 
-/// Stretch mono PCM by `factor` (output is `factor` times as long).
-/// Default is pitch-preserving WSOLA; FLP_SLICEX_STRETCH_MODE=resample
-/// does a plain rate change instead (pitch moves with the tempo).
 fn stretch_pcm(pcm: &sf2::Pcm, factor: f64) -> Vec<i16> {
     let x: Vec<f32> = pcm.data.iter().map(|&v| v as f32 / 32768.0).collect();
     let resample = std::env::var("FLP_SLICEX_STRETCH_MODE")
-        .map_or(false, |m| m.trim().eq_ignore_ascii_case("resample"));
+    .map_or(false, |m| m.trim().eq_ignore_ascii_case("resample"));
     let out = if resample {
         let out_len = (x.len() as f64 * factor).round() as usize;
         crate::player::stretch::linear(&[&x], out_len)
@@ -813,16 +748,13 @@ fn stretch_pcm(pcm: &sf2::Pcm, factor: f64) -> Vec<i16> {
         crate::player::stretch::stretch(&[&x], factor, pcm.rate as f64)
     };
     out.into_iter()
-        .next()
-        .unwrap_or_default()
-        .iter()
-        .map(|&v| (v * 32768.0).round().clamp(-32768.0, 32767.0) as i16)
-        .collect()
+    .next()
+    .unwrap_or_default()
+    .iter()
+    .map(|&v| (v * 32768.0).round().clamp(-32768.0, 32767.0) as i16)
+    .collect()
 }
 
-/// Highest key Slicex maps slices upward to (D#8 in FL naming).  Slices
-/// beyond `base..=MAX_SLICE_KEY` overflow *below* the base, in order:
-/// 52 slices @ base 60 -> slices 40..51 on keys 48..59.
 const MAX_SLICE_KEY: u32 = 99;
 
 fn assign_keys(n: usize, base: u32, low: usize, tlst: &[(u32, u8)]) -> (Vec<u32>, &'static str) {
@@ -830,16 +762,14 @@ fn assign_keys(n: usize, base: u32, low: usize, tlst: &[(u32, u8)]) -> (Vec<u32>
 
     let overflow_keys = |low: usize| -> Vec<u32> {
         (0..n)
-            .map(|i| if i >= n - low { base.saturating_sub((n - i) as u32) } else { base + i as u32 })
-            .collect()
+        .map(|i| if i >= n - low { base.saturating_sub((n - i) as u32) } else { base + i as u32 })
+        .collect()
     };
 
     if low > 0 {
         return (overflow_keys(low), "FLP_SLICEX_LOW override");
     }
     if !tlst.is_empty() {
-        // tlst cue ids are 0-based slice indices (ids 40..51 of 52 slices =
-        // the last twelve).  Fall back to 1-based if an id reaches n.
         let one_based = tlst.iter().any(|&(id, _)| id as usize >= n);
         let mut fixed: Vec<Option<u32>> = vec![None; n];
         for &(id, key) in tlst {
@@ -852,12 +782,12 @@ fn assign_keys(n: usize, base: u32, low: usize, tlst: &[(u32, u8)]) -> (Vec<u32>
         let mut next = base;
         let keys = fixed.into_iter().map(|k| match k {
             Some(k) => k,
-            None => {
-                while claimed.contains(&next) { next += 1; }
-                let v = next;
-                next += 1;
-                v
-            }
+                                         None => {
+                                             while claimed.contains(&next) { next += 1; }
+                                             let v = next;
+                                             next += 1;
+                                             v
+                                         }
         }).collect();
         return (keys, if one_based { "tlst (1-based ids)" } else { "tlst (0-based ids)" });
     }

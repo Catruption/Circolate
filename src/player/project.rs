@@ -29,12 +29,8 @@ pub(crate) use super::loader::Loader;
 pub(crate) use super::types::{Sample, Sf2VoiceEnvelope};
 
 const TAIL_SECONDS: f64 = 0.05;
-
 const VST_TRIM: f32 = 0.6;
-
 const FALLBACK_VST_TRIM: f32 = 0.7;
-
-// ── cover image ────────────────────────────────────────────────────────
 
 fn cover_cache_dir() -> PathBuf {
     crate::paths::user_cache().join("covers")
@@ -103,8 +99,6 @@ fn fallback_cover_path(source: &dyn AssetSource) -> Option<PathBuf> {
     pick
 }
 
-// ── embedded plugin cache ──────────────────────────────────────────────
-
 fn plugins_cache_dir() -> PathBuf {
     crate::paths::user_cache().join("plugins")
 }
@@ -146,8 +140,6 @@ fn extract_embedded_plugins(
     }
     Ok(map)
 }
-
-// ── SF2 cache ──────────────────────────────────────────────────────────
 
 fn sf2_cache_dir() -> PathBuf {
     crate::paths::user_cache().join("sf2")
@@ -220,8 +212,6 @@ fn materialize_sf2_reference(
     Ok(())
 }
 
-// ── samples.json ───────────────────────────────────────────────────────
-
 #[derive(Deserialize, Debug)]
 struct SampleEntry {
     id: u32,
@@ -249,7 +239,18 @@ struct SampleLibrary {
     samples: Vec<SampleEntry>,
 }
 
-// ── Project ────────────────────────────────────────────────────────────
+#[derive(Debug, Clone)]
+pub struct LyricSegment {
+    pub time_sec: f64,
+    pub text: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct LyricLine {
+    pub start_sec: f64,
+    pub end_sec: f64,
+    pub segments: Vec<LyricSegment>,
+}
 
 pub(crate) struct Project {
     pub(crate) source_dir: PathBuf,
@@ -278,14 +279,13 @@ pub(crate) struct Project {
     pub(crate) voice_count: usize,
     pub(crate) requires: Option<Requires>,
     pub(crate) shims: Vec<ShimEvent>,
+    pub(crate) lyrics: Vec<LyricLine>,
     pub(crate) chains: BTreeMap<u8, ProjectInsertChain>,
     pub(crate) channel_to_insert: BTreeMap<u16, u8>,
 }
 
 impl Project {
-    pub(crate) fn line_count(&self) -> usize {
-        self.lines.len()
-    }
+    pub(crate) fn line_count(&self) -> usize { self.lines.len() }
 
     pub(crate) fn empty(sample_rate: u32) -> Self {
         Project {
@@ -315,6 +315,7 @@ impl Project {
             voice_count: 0,
             requires: None,
             shims: Vec::new(),
+            lyrics: Vec::new(),
             chains: BTreeMap::new(),
             channel_to_insert: BTreeMap::new(),
         }
@@ -328,24 +329,20 @@ impl Project {
 
     pub(crate) fn preview_sample_for_part(&self, part_name: &str) -> Option<Arc<Sample>> {
         let part = self.parts.get(part_name)?;
-
         if let Some(id) = self.path_to_id.get(&part.sample_path) {
             if let Some(s) = self.samples.get(id) {
                 return Some(s.clone());
             }
         }
-
         if let Some(inst) = self.sf2_instruments.get(&part.sample_path) {
             let sid = inst.first_zone_sample_id()?;
             return self.samples.get(&sid).cloned();
         }
-
         None
     }
 
     pub(crate) fn iid_for_part(&self, part_name: &str) -> Option<u16> {
         let part = self.parts.get(part_name)?;
-
         if let Some(inst) = self.vst_instruments.get(&part.sample_path) {
             return Some(inst.iid);
         }
@@ -355,14 +352,6 @@ impl Project {
         None
     }
 
-    /// Walk part path → iid → insert bus → chain.  Returns `None` when
-    /// the part has no chain or when `routing.json` was absent (the
-    /// current converter doesn't emit it, so this is mostly `None` today).
-    ///
-    /// The **inline shim chains** that appear in every trackscript
-    /// (`ƒpianoer(2)@<ƒFruity_Limiter()>@…`) are a separate data path —
-    /// see `shims_for_line_path`.  `chain_for_part` is for the
-    /// future `inserts/` sidecar format, which isn't emitted yet.
     pub(crate) fn chain_for_part(&self, part_path: &str) -> Option<&ProjectInsertChain> {
         let iid = if let Some(inst) = self.vst_instruments.get(part_path) {
             inst.iid
@@ -375,23 +364,13 @@ impl Project {
         self.chains.get(bus)
     }
 
-    /// Inline shims attached to the given part path on the given
-    /// BlockList line.  Filters out `Tempo` (those become tempo events,
-    /// not display data) and dedupes by target name so `ƒFruity_Limiter()`
-    /// appears once even if the same shim is duplicated across multiple
-    /// LineCalls of the same part.
-    ///
-    /// This is the visual data source.  `p.shims` holds the parsed
-    /// `@<ƒTarget()>` events; `attached_call` is an index into the
-    /// BlockList line's `calls`, which `LineCall.call_index` matches.
     pub(crate) fn shims_for_line_path(
         &self,
         li: usize,
         path: &str,
     ) -> Vec<&ShimEvent> {
-        let debug = std::env::var_os("SHIMS_DEBUG").is_some();
         let Some(line) = self.lines.get(li) else {
-            if debug { eprintln!("shims: no line {li}"); }
+            crate::log_event!("player.shims.no_line", li: li);
             return Vec::new();
         };
         let call_indices: Vec<usize> = line
@@ -405,14 +384,15 @@ impl Project {
         })
         .map(|c| c.call_index)
         .collect();
-        if debug {
-            eprintln!(
+        crate::log_event!(
+            "player.shims.debug",
+            body: format!(
                 "shims: li={} path={:?} calls={:?} call_indices={:?}",
                 li, path,
                 line.parts.iter().map(|c| (c.name.as_str(), c.call_index)).collect::<Vec<_>>(),
-                      call_indices,
-            );
-        }
+                          call_indices,
+            ),
+        );
         if call_indices.is_empty() {
             return Vec::new();
         }
@@ -429,20 +409,18 @@ impl Project {
         })
         .filter(|s| seen.insert(s.target.clone()))
         .collect();
-        if debug {
-            eprintln!(
+        crate::log_event!(
+            "player.shims.debug",
+            body: format!(
                 "shims: {} match(es) on line {}: {:?}",
-                      out.len(),
-                      li,
-                      out.iter().map(|s| s.target.as_str()).collect::<Vec<_>>(),
-            );
-        }
+                          out.len(), li,
+                          out.iter().map(|s| s.target.as_str()).collect::<Vec<_>>(),
+            ),
+        );
         out
     }
 
-    pub(crate) fn cover_path(&self) -> Option<&Path> {
-        self.cover_path.as_deref()
-    }
+    pub(crate) fn cover_path(&self) -> Option<&Path> { self.cover_path.as_deref() }
 
     pub(crate) fn part_path(&self, name: &str) -> Option<&str> {
         self.parts.get(name).map(|p| p.sample_path.as_str())
@@ -455,12 +433,8 @@ impl Project {
             {
                 return true;
             }
-            if self.vst_instruments.contains_key(part_path) {
-                return true;
-            }
-            if self.sf2_engine_specs.contains_key(part_path) {
-                return true;
-            }
+            if self.vst_instruments.contains_key(part_path) { return true; }
+            if self.sf2_engine_specs.contains_key(part_path) { return true; }
             false
     }
 
@@ -480,10 +454,8 @@ impl Project {
     }
 
     pub(crate) fn line_block_title(&self, i: usize, part_name: &str) -> Option<&str> {
-        self.lines
-        .get(i)?
-        .parts
-        .iter()
+        self.lines.get(i)?
+        .parts.iter()
         .find(|call| call.name == part_name)
         .map(|call| call.block_title.as_str())
     }
@@ -508,9 +480,7 @@ impl Project {
         if self.lines[li].max_end > pos { Some(li) } else { None }
     }
 
-    pub(crate) fn rows_per_measure(&self) -> f64 {
-        self.rows_per_measure
-    }
+    pub(crate) fn rows_per_measure(&self) -> f64 { self.rows_per_measure }
 
     pub(crate) fn line_start_sample(&self, li: usize) -> i64 {
         self.lines.get(li).map(|l| l.min_start).unwrap_or(0)
@@ -536,9 +506,7 @@ impl Project {
         self.parts.get(name).map(|p| p.sample_offset).unwrap_or(0)
     }
 
-    pub(crate) fn part_hash_map(&self) -> &HashMap<String, u64> {
-        &self.part_hash
-    }
+    pub(crate) fn part_hash_map(&self) -> &HashMap<String, u64> { &self.part_hash }
 
     pub(crate) fn line_measure_samples(&self, li: usize) -> i64 {
         let start_row = self.line_start_row(li);
@@ -547,8 +515,6 @@ impl Project {
         ((self.tempo.time_at_row(end_row) - self.tempo.time_at_row(start_row)) * sr) as i64
     }
 }
-
-// ── load_project ───────────────────────────────────────────────────────
 
 pub(crate) fn load_project_from_source(
     source: &dyn AssetSource,
@@ -571,35 +537,42 @@ pub(crate) fn load_project_from_source(
         Some(text) => match Fidelity::from_json(&text) {
             Ok(f) => {
                 if !quiet {
-                    println!(
-                        "  fidelity: {} channels, {} automation lanes, {} playlist items, {} insert buses, {} multi-sample groups",
-                        f.channels.len(), f.channel_automation.len(),
-                             f.playlist.len(), f.inserts.len(), f.multi_sample.len(),
+                    crate::log_event!(
+                        "player.load.fidelity_summary",
+                        channels: f.channels.len(),
+                                      automation: f.channel_automation.len(),
+                                      playlist: f.playlist.len(),
+                                      inserts: f.inserts.len(),
+                                      multisample: f.multi_sample.len(),
                     );
                 }
                 Some(f)
             }
             Err(e) => {
-                if !quiet { eprintln!("  fidelity: {:#}, ignoring", e); }
+                crate::log_event!(
+                    "player.load.fidelity_ignored",
+                    err: format!("{:#}", e),
+                );
                 None
             }
         },
         None => None,
     };
 
-    let embedded_plugins: HashMap<String, PathBuf> = if quiet {
-        extract_embedded_plugins(source).unwrap_or_default()
-    } else {
-        match extract_embedded_plugins(source) {
-            Ok(m) if !m.is_empty() => {
-                println!("  extracted {} embedded plugin bundle(s)", m.len());
-                m
+    let embedded_plugins: HashMap<String, PathBuf> = match extract_embedded_plugins(source) {
+        Ok(m) if !m.is_empty() => {
+            if !quiet {
+                crate::log_event!("player.load.embed_extracted", count: m.len());
             }
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("  embedded plugin extraction failed: {:#}", e);
-                HashMap::new()
-            }
+            m
+        }
+        Ok(m) => m,
+        Err(e) => {
+            crate::log_event!(
+                "player.embed.extract_failed",
+                err: format!("{:#}", e),
+            );
+            HashMap::new()
         }
     };
 
@@ -617,9 +590,11 @@ pub(crate) fn load_project_from_source(
                 let decoded = match decode_audio(&bytes, &rel) {
                     Ok(d) => d,
                     Err(e) => {
-                        if !quiet {
-                            eprintln!("  sample {} failed to decode: {:#}", rel, e);
-                        }
+                        crate::log_event!(
+                            "player.sample.decode_failed",
+                            rel: rel.clone(),
+                                          err: format!("{:#}", e),
+                        );
                         continue;
                     }
                 };
@@ -643,13 +618,14 @@ pub(crate) fn load_project_from_source(
             }
         }
         _ => {
-            if !quiet {
-                eprintln!("  (no samples.json in {})", source.describe());
-            }
+            crate::log_event!(
+                "player.load.no_samples_json",
+                source: source.describe(),
+            );
         }
     }
     if !quiet {
-        println!("  loaded {} samples", samples.len());
+        crate::log_event!("player.load.samples_count", count: samples.len());
     }
 
     let mut multi_sample_instruments: HashMap<String, Arc<MultiSampleInstrument>> =
@@ -666,7 +642,10 @@ pub(crate) fn load_project_from_source(
         }
     }
     if !quiet && !multi_sample_instruments.is_empty() {
-        println!("  multi-sample: {} instrument(s)", multi_sample_instruments.len());
+        crate::log_event!(
+            "player.load.multi_sample_count",
+            count: multi_sample_instruments.len(),
+        );
     }
 
     let mut sf2_instruments: HashMap<String, Arc<Sf2Instrument>> = HashMap::new();
@@ -682,7 +661,10 @@ pub(crate) fn load_project_from_source(
             format!("instruments/{}", entry)
         };
         let Some(text) = source.read_text(&rel)? else {
-            eprintln!("  (sidecar unreadable: {})", rel);
+            crate::log_event!(
+                "player.load.sidecar_unreadable",
+                rel: rel.clone(),
+            );
             continue;
         };
         let Ok(inst) = crate::deps::instruments::parse(&text, &rel) else { continue };
@@ -701,17 +683,27 @@ pub(crate) fn load_project_from_source(
             .to_string();
 
             let Some(sf2_bytes) = source.read_bytes(&sf2_rel)? else {
-                if !quiet { eprintln!("  (SF2 {} not in source)", sf2_rel); }
+                crate::log_event!(
+                    "player.load.sf2_not_in_source",
+                    rel: sf2_rel.clone(),
+                );
                 continue;
             };
             let sf2_on_disk = match materialize_sf2_file(source, &sf2_rel) {
                 Ok(Some(p)) => p,
                 Ok(None) => {
-                    if !quiet { eprintln!("  (SF2 {} not in source)", sf2_rel); }
+                    crate::log_event!(
+                        "player.load.sf2_not_in_source",
+                        rel: sf2_rel.clone(),
+                    );
                     continue;
                 }
                 Err(e) => {
-                    if !quiet { eprintln!("  (SF2 {} materialize failed: {:#})", sf2_rel, e); }
+                    crate::log_event!(
+                        "player.sf2.materialize_failed",
+                        rel: sf2_rel.clone(),
+                                      err: format!("{:#}", e),
+                    );
                     continue;
                 }
             };
@@ -774,12 +766,11 @@ pub(crate) fn load_project_from_source(
             });
 
             let Some(plugin_path) = plugin_path else {
-                if !quiet {
-                    eprintln!(
-                        "  (VST {:?} not installed, skipping; sidecar {})",
-                              inst.plugin, sidecar_rel
-                    );
-                }
+                crate::log_event!(
+                    "player.load.vst_not_installed",
+                    plugin: inst.plugin.clone(),
+                                  sidecar: sidecar_rel.clone(),
+                );
                 continue;
             };
 
@@ -797,9 +788,11 @@ pub(crate) fn load_project_from_source(
 
             if inst.plugin == "SFLT" && !state_bytes.is_empty() {
                 if let Err(e) = materialize_sf2_reference(source, &mut state_bytes) {
-                    if !quiet {
-                        eprintln!("  SF2 materialize failed for {}: {:#}", sidecar_rel, e);
-                    }
+                    crate::log_event!(
+                        "player.sf2.materialize_failed",
+                        rel: sidecar_rel.clone(),
+                                      err: format!("{:#}", e),
+                    );
                 }
             }
 
@@ -836,19 +829,19 @@ pub(crate) fn load_project_from_source(
             *v = scaled;
         }
         if !quiet {
-            println!(
-                "  {} stand-in plugins: trimmed {:.1} dB each so they sit as backing",
-                n_fallback,
-                -20.0 * spread.log10(),
+            crate::log_event!(
+                "player.load.fallback_trim",
+                count: n_fallback,
+                db: -20.0 * spread.log10(),
             );
         }
     }
     if !quiet {
-        println!(
-            "  loaded {} sf2 instruments, {} sf2 engines, {} vst instruments",
-            sf2_instruments.len(),
-                 sf2_engine_specs.len(),
-                 vst_instruments.len()
+        crate::log_event!(
+            "player.load.summary",
+            sf2s: sf2_instruments.len(),
+                          engines: sf2_engine_specs.len(),
+                          vsts: vst_instruments.len(),
         );
     }
 
@@ -856,9 +849,10 @@ pub(crate) fn load_project_from_source(
         Some(text) => match requires::parse(&text) {
             Ok(r) => Some(r),
             Err(e) => {
-                if !quiet {
-                    eprintln!("  requires: {:#}, ignoring", e);
-                }
+                crate::log_event!(
+                    "player.load.requires_ignored",
+                    err: format!("{:#}", e),
+                );
                 None
             }
         },
@@ -868,10 +862,10 @@ pub(crate) fn load_project_from_source(
     let (chains, channel_to_insert) = inserts::load_chain_metadata(source);
     if !quiet && !chains.is_empty() {
         let total: usize = chains.values().map(|c| c.slots.len()).sum();
-        println!(
-            "  loaded {} insert chain(s), {} slot(s) total",
-                 chains.len(),
-                 total
+        crate::log_event!(
+            "player.load.insert_chains",
+            chains: chains.len(),
+                          slots: total,
         );
     }
 
@@ -890,7 +884,7 @@ pub(crate) fn load_project_from_source(
     let shim_tempo = tempo_shims_to_events(&parsed.shims, rows_per_measure);
     if !shim_tempo.is_empty() {
         if !quiet {
-            println!("  tempo shims: {} event(s)", shim_tempo.len());
+            crate::log_event!("player.load.tempo_shims", count: shim_tempo.len());
         }
         tempo_events.extend(shim_tempo);
         tempo_events.sort_by(|a, b| {
@@ -900,6 +894,16 @@ pub(crate) fn load_project_from_source(
 
     let tempo = TempoMap::new(cfg.bpm, &tempo_events, cfg.subdivisions);
     tempo.prepare(total_arrangement_rows);
+
+    let lyrics = parsed.lyrics.into_iter().map(|line| LyricLine {
+        start_sec: tempo.time_at_row(line.start_row),
+                                               end_sec: tempo.time_at_row(line.end_row),
+                                               segments: line.segments.into_iter().map(|s| LyricSegment {
+                                                   time_sec: tempo.time_at_row(s.row),
+                                                                                       text: s.text,
+                                               }).collect(),
+    }).collect();
+
     let render_end_sec = tempo.time_at_row(total_arrangement_rows) + TAIL_SECONDS;
     let total_samples = (render_end_sec * sr) as i64;
 
@@ -976,10 +980,12 @@ pub(crate) fn load_project_from_source(
     order.sort_by_key(|&i| (lines[i].min_start, i));
 
     if !quiet {
-        println!(
-            "  parsed {} parts, {} blocks, {} BlockList lines, {} voices",
-            parsed.parts.len(), parsed.blocks.len(),
-                 parsed.block_list.len(), total_voices
+        crate::log_event!(
+            "player.load.parsed",
+            parts: parsed.parts.len(),
+                          blocks: parsed.blocks.len(),
+                          lines: parsed.block_list.len(),
+                          voices: total_voices,
         );
     }
 
@@ -1014,13 +1020,12 @@ pub(crate) fn load_project_from_source(
         fidelity,
         requires,
         shims: parsed.shims,
+        lyrics,
         chains,
         channel_to_insert,
     };
     Ok((Arc::new(project), cache))
 }
-
-// ── convenience wrappers ──────────────────────────────────────────────
 
 pub(crate) fn load_project_from_dir(
     ts_path: &Path,

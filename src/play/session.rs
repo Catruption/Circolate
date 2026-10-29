@@ -10,12 +10,13 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+// use std::time::Duration; // Removed unused
 
 use crate::formats::SourceKind;
 use crate::player::{self, Cache, Engine, Loader, Msg, Project, Transport};
-use crate::tui;
-use crate::tui::config::{Config, Settings};
+use crate::tui::{self, app::LoopOutcome};
+use crate::tui::config::Settings; // Removed Config
+use crate::tui::state::TEXT_W;    // Added TEXT_W
 use crate::tui::state as queue;
 
 use super::audio::{soft_clip, Silence};
@@ -27,70 +28,13 @@ use super::install::{
 use super::resolve::{is_archive, resolve_source};
 use super::worker::{watch_for_changes, worker, ReloadSlot};
 
-enum Outcome {
-    Quit,
-    Next {
-        name: String,
-        queue: queue::QueueState,
-        notes: Vec<String>,
-    },
-}
-
-pub fn run(args: Args) -> Result<()> {
-    let mut term = tui::setup()?;
-    let mut song = args.song.clone();
-    let mut queue = queue::QueueState::new();
-    let mut pending_notes: Vec<String> = Vec::new();
-
-    let result = (|| -> Result<()> {
-        loop {
-            let dir = song.as_deref().and_then(|p| p.parent());
-            let settings = Config::load_layered(dir).resolve();
-
-            let msg = match &song {
-                Some(p) => format!("loading {}...", p.display()),
-                  None => "no song — queue box is focused; type a name and press enter".into(),
-            };
-            let notes: Vec<String> = pending_notes.drain(..).collect();
-            tui::show_loading(&mut term, &queue, &settings, &msg, &notes)?;
-
-            match play_one(
-                &mut term,
-                &args,
-                song.as_deref(),
-                           queue.clone(),
-                           settings.clone(),
-            ) {
-                Ok(Outcome::Quit) => return Ok(()),
-                  Ok(Outcome::Next { name, queue: q, notes: n }) => {
-                      queue = q;
-                      pending_notes = n;
-                      match crate::paths::resolve_track(&name) {
-                          Ok(p) => song = Some(p),
-                  Err(_) => song = None,
-                      }
-                  }
-                  Err(e) => {
-                      let msg = format!("load failed: {e:#}");
-                      tui::show_loading(&mut term, &queue, &settings, &msg, &[])?;
-                      std::thread::sleep(Duration::from_secs(3));
-                      song = None;
-                  }
-            }
-        }
-    })();
-
-    let _ = tui::restore(&mut term);
-    result
-}
-
-fn play_one(
+pub fn play_one(
     term: &mut Terminal<CrosstermBackend<Stdout>>,
     args: &Args,
     song: Option<&Path>,
     queue: queue::QueueState,
     settings: Settings,
-) -> Result<Outcome> {
+) -> Result<LoopOutcome> {
     let host = cpal::default_host();
     let device = host
     .default_output_device()
@@ -143,14 +87,8 @@ fn play_one(
         }
     };
 
-    // ── share the cache across pre-warm and worker ────────────────────
     let cache = Arc::new(Mutex::new(cache_owned));
 
-    // ── pre-warm: walk the entire project and force template builds and
-    //     stretches *before* playback starts.  This moves WSOLA clusters
-    //     from "first 3s of playback" to "loading screen".  Runs on the
-    //     main thread with the terminal in loading state, so any silence
-    //     the OS produces goes unnoticed.
     if project.order.len() > 0 {
         let _s = Silence::new();
         let mut prewarm = Loader::with_shared_cache(Arc::clone(&project), Arc::clone(&cache));
@@ -161,8 +99,8 @@ fn play_one(
     if queue.playing.is_none() {
         if let Some(name) = song.and_then(|p| p.file_stem()).and_then(|s| s.to_str()) {
             let row = queue.cursor.row.min(queue.lines.len().saturating_sub(1));
-            if queue.lines.get(row).map_or(false, |l| l.is_blank()) {
-                let text: String = name.chars().take(queue::TEXT_W as usize).collect();
+                if queue.lines.get(row).map_or(false, |l| l.is_blank) {
+                let text: String = name.chars().take(TEXT_W as usize).collect(); // Fixed TEXT_W
                 queue.lines[row].text = text;
                 queue.start_at(row);
             }
@@ -214,9 +152,6 @@ fn play_one(
     let (tx, rx): (Sender<Msg>, Receiver<Msg>) = channel();
     let (wrap_tx, wrap_rx): (Sender<Msg>, Receiver<Msg>) = channel();
 
-    // 2-second lookahead gives the worker ~8× more slack to absorb cold
-    // template builds or stretch clusters without the audio thread's
-    // pending queue draining.
     let lookahead = sample_rate as i64 * 2;
     {
         let loader = Loader::with_shared_cache(Arc::clone(&project), Arc::clone(&cache));
@@ -226,7 +161,15 @@ fn play_one(
     }
 
     let mut engine = Engine::new(&project);
+
+    // --- Logging: session setup phases ---
+    crate::log_event!("play.session.init_started");
+
     install_vst_hosts(&mut engine, &project);
+
+    crate::log_event!("play.session.init_done");
+    // -------------------------------------
+
     install_sf2_engines(&mut engine, &project, args.sf2_override.as_deref());
     install_master_fx(&mut engine, &project, args.no_master_fx);
     install_shims(&mut engine, &project, find_share_dir().as_deref());
@@ -337,25 +280,87 @@ fn play_one(
 
     stream.play()?;
 
-    let notes: Vec<String> = project
+    let _notes: Vec<String> = project
     .requires
     .as_ref()
     .map(|r| crate::deps::requires::report_lines(r))
     .unwrap_or_default();
 
-    let (request, queue) = tui::run_against(
+    // ── SYSTEM MEDIA CONTROLS (MPRIS) ──
+    let (media_tx, media_rx) = channel();
+    let tp_media = Arc::clone(&transport);
+    let title = project.title.clone();
+    let total_secs = project.total_secs();
+    let thread_sr = sample_rate;
+
+    std::thread::spawn(move || {
+        use souvlaki::{MediaControls, PlatformConfig, MediaMetadata, MediaPlayback, MediaPosition};
+        use std::time::Duration;
+        use std::sync::atomic::Ordering;
+
+        let config = PlatformConfig {
+            dbus_name: "circolate",
+            display_name: "Circolate",
+            hwnd: None,
+        };
+
+        let mut controls = match MediaControls::new(config) {
+            Ok(c) => c,
+                       Err(_) => return, // Gracefully fail if OS doesn't support it
+        };
+
+        let _ = controls.attach(move |event| {
+            let _ = media_tx.send(event);
+        });
+
+        let _ = controls.set_metadata(MediaMetadata {
+            title: Some(&title),
+                                      duration: Some(Duration::from_secs_f64(total_secs)),
+                                      ..Default::default()
+        });
+
+        let mut last_pos = 0.0;
+        let mut last_speed = -1;
+
+        loop {
+            if tp_media.stop.load(Ordering::Relaxed) {
+                break; // Session ended, drop the MPRIS handle
+            }
+
+            let speed = tp_media.speed.load(Ordering::Relaxed);
+            let pos = tp_media.position.load(Ordering::Relaxed).max(0) as f64 / thread_sr as f64;
+            let progress = Some(MediaPosition(Duration::from_secs_f64(pos)));
+
+            // Souvlaki 0.7 takes progress inside the Playback enum
+            let status = if speed == 0 {
+                MediaPlayback::Paused { progress }
+            } else {
+                MediaPlayback::Playing { progress }
+            };
+
+            // Update the OS if speed changed, or if we've moved significantly
+            if speed != last_speed || (pos - last_pos).abs() > 0.5 {
+                let _ = controls.set_playback(status);
+                last_speed = speed;
+                last_pos = pos;
+            }
+
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    });
+    // ───────────────────────────────────
+
+    let (outcome, _queue) = tui::run_against(
         term,
         Arc::clone(&transport),
-                                            Arc::clone(&project),
-                                            sample_rate,
-                                            queue,
-                                            settings,
+                                             Arc::clone(&project),
+                                             sample_rate,
+                                             queue,
+                                             settings,
+                                             media_rx, // Pass the receiver
     )?;
     transport.stop.store(true, Ordering::Relaxed);
     drop(stream);
 
-    match request {
-        None => Ok(Outcome::Quit),
-        Some(name) => Ok(Outcome::Next { name, queue, notes }),
-    }
+    Ok(outcome)
 }

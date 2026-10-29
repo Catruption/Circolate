@@ -45,7 +45,7 @@ impl EffectChain {
     }
 
     /// Load `master_fx.json`.  Missing file = empty chain.  Individual
-    /// load failures are warned and skipped.
+    /// load failures are reported through the log bus and skipped.
     pub fn load_default(sample_rate: u32) -> Result<Self> {
         let Some(path) = find_config() else {
             return Ok(EffectChain::empty());
@@ -63,18 +63,22 @@ impl EffectChain {
 
         for entry in cfg.chain {
             let Some(plugin_path) = resolve_relative(&entry.path, config_dir) else {
-                eprintln!("  master fx: missing {}", entry.path);
+                crate::log_event!("player.master_fx.missing", path: entry.path.clone());
                 continue;
             };
 
             let state_bytes = match &entry.state {
                 Some(s) => match resolve_relative(s, config_dir) {
                     Some(p) => std::fs::read(&p).unwrap_or_else(|e| {
-                        eprintln!("  master fx: cannot read state {}: {}", p.display(), e);
+                        crate::log_event!(
+                            "player.master_fx.state_read",
+                            path: p.display(),
+                                          err: e,
+                        );
                         Vec::new()
                     }),
                     None => {
-                        eprintln!("  master fx: state file missing: {}", s);
+                        crate::log_event!("player.master_fx.state_file_missing", path: s.clone());
                         Vec::new()
                     }
                 },
@@ -82,18 +86,22 @@ impl EffectChain {
             };
 
             let Some(path_str) = plugin_path.to_str() else {
-                eprintln!("  master fx: non-UTF8 path for {}", entry.name);
+                crate::log_event!("player.master_fx.non_utf8", name: entry.name);
                 continue;
             };
 
             match VstHost::load(path_str, &state_bytes, sample_rate) {
                 Ok(host) => {
-                    println!("  master fx: loaded {}", entry.name);
+                    crate::log_event!("player.master_fx.loaded", name: entry.name.clone());
                     hosts.push(host);
                     labels.push(entry.name);
                 }
                 Err(e) => {
-                    eprintln!("  master fx: failed to load {}: {:#}", entry.name, e);
+                    crate::log_event!(
+                        "player.master_fx.load_failed",
+                        name: entry.name,
+                        err: format!("{:#}", e),
+                    );
                 }
             }
         }

@@ -2,13 +2,15 @@
 //! describing *what* was clicked; `dispatch` is the single place that
 //! turns a click into a state mutation.  Views are responsible only for
 //! populating `RenderState::tracker_hit` / `vertical_hit` / `spiral`
-//! / `notch` each frame — they never mutate anything in response to a
-//! mouse event themselves.
+//! / `notch` / `queue_placed` each frame — they never mutate anything
+//! in response to a mouse event themselves.
 //!
 //! ## Focus policy
 //!
-//! Clicking anywhere outside the queue box unfocuses the queue's text
-//! input.  This is enforced in `app.rs`'s `handle_mouse`, not here.
+//! Clicking anywhere inside the queue box focuses the queue.  Clicking
+//! on a text line also places the cursor there.  Clicking outside the
+//! box (in `app.rs::handle_mouse`) clears focus.  Esc inside the queue
+//! handler clears focus.
 //!
 //! ## Mute policy
 //!
@@ -35,7 +37,9 @@ use crossterm::event::{MouseButton, MouseEvent};
 
 use crate::mixer::mute;
 use crate::player::{Project, Transport};
-use crate::tui::state::{NotchTag, RenderState, VerticalRow};
+use crate::tui::state::{
+    GUTTER_W, NotchTag, RenderState, TEXT_W, VerticalRow, VISIBLE_LINES,
+};
 
 pub enum HitAction {
     /// A spiral cell was clicked.  `measure` is the measure index the
@@ -59,6 +63,19 @@ pub enum HitAction {
     /// The `@` / `↴` chain marker was clicked.  Left toggles expanded,
     /// right toggles disabled (visual-only for now).
     ChainToggle { path: String },
+    /// A click landed inside the queue box but not on a specific target
+    /// (border, spiral cell, gap between lines).  `app.rs::handle_mouse`
+    /// uses this to focus the queue without placing a cursor.
+    QueueConsume,
+    /// Rewind (`◀`) transport button.
+    QueueRewind,
+    /// Play (`▶`) transport button.
+    QueuePlay,
+    /// A buffer line was clicked.  `row` is the absolute line index
+    /// (already offset by `first_line`), `col` is the cursor column
+    /// within the text field (0 = first character).  `col` is 0 when
+    /// the gutter was clicked.
+    QueueLine { row: usize, col: usize },
 }
 
 pub fn hit_from_spiral(state: &RenderState, m: MouseEvent) -> Option<HitAction> {
@@ -178,6 +195,59 @@ pub fn hit_from_notch(state: &RenderState, m: MouseEvent) -> Option<HitAction> {
     None
 }
 
+/// Queue box hit-testing.  Mirrors the `Placed` struct returned by
+/// `widgets::queue::render`:
+///
+/// * click outside `box_rect` → `None` (fall through to other views)
+/// * click on `rewind` → `QueueRewind`
+/// * click on `play` → `QueuePlay`
+/// * click anywhere on a buffer line's row → `QueueLine` (gutter and
+///   text both work; the cursor column is clamped)
+/// * any other click inside the box → `QueueConsume` (event swallowed
+///   and queue focused)
+pub fn hit_from_queue(state: &RenderState, m: MouseEvent) -> Option<HitAction> {
+    let q = state.queue_placed.as_ref()?;
+    let r = q.box_rect;
+    if m.column < r.x
+        || m.column >= r.x + r.width
+        || m.row < r.y
+        || m.row >= r.y + r.height
+        {
+            return None;
+        }
+
+        let in_rect = |rr: ratatui::layout::Rect| {
+            m.column >= rr.x
+            && m.column < rr.x + rr.width
+            && m.row >= rr.y
+            && m.row < rr.y + rr.height
+        };
+
+        if in_rect(q.rewind) {
+            return Some(HitAction::QueueRewind);
+        }
+        if in_rect(q.play) {
+            return Some(HitAction::QueuePlay);
+        }
+        if in_rect(q.lines) {
+            let rel_y = (m.row - q.lines.y) as usize;
+            if rel_y < VISIBLE_LINES {
+                // `GUTTER_W` and `TEXT_W` are `u16` (ratatui coordinates);
+                // `QueueLine.col` is `usize` (cursor position in text).
+                // Keep the arithmetic in `u16`, then cast once.
+                let rel_x = m.column.saturating_sub(q.lines.x);
+                let col = rel_x
+                .saturating_sub(GUTTER_W)
+                .min(TEXT_W.saturating_sub(1)) as usize;
+                return Some(HitAction::QueueLine {
+                    row: q.first_line + rel_y,
+                    col,
+                });
+            }
+        }
+        Some(HitAction::QueueConsume)
+}
+
 /// Seek to a note given its (block_line, start_row).  Shared by the
 /// vertical and horizontal note-click paths.
 fn seek_to_note(
@@ -251,6 +321,7 @@ pub fn dispatch(
                     state.player.show_help = !state.player.show_help;
                     if state.player.show_help {
                         state.player.show_config = false;
+                        state.player.show_analysis = false;
                     }
                 }
                 NotchTag::Settings => {
@@ -260,6 +331,16 @@ pub fn dispatch(
                         state.config_ui.open(&state.settings);
                         state.player.show_config = true;
                         state.player.show_help = false;
+                        state.player.show_analysis = false;
+                    }
+                }
+                NotchTag::Analysis => {
+                    if state.player.show_analysis {
+                        state.player.show_analysis = false;
+                    } else {
+                        state.player.show_analysis = true;
+                        state.player.show_help = false;
+                        state.player.show_config = false;
                     }
                 }
             }
@@ -278,5 +359,12 @@ pub fn dispatch(
             }
             _ => {}
         },
+        // Queue actions need the `MouseEventKind` (Down vs Drag) and
+        // call functions that live in `app.rs`, so they're handled there.
+        // These arms exist only so the match is exhaustive.
+        HitAction::QueueConsume
+        | HitAction::QueueLine { .. }
+        | HitAction::QueueRewind
+        | HitAction::QueuePlay => {}
     }
 }

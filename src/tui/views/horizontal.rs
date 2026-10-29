@@ -64,7 +64,7 @@ pub fn draw(
     let outer = theme.block().title(title);
 
     let Some(li) = current else {
-        f.render_widget(Paragraph::new("(silence)").block(outer), area);
+        crate::tui::widgets::menu::draw(f, area, state);
         state.tracker_hit = None;
         return;
     };

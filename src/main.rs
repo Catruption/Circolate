@@ -2,6 +2,12 @@
 
 #![allow(dead_code)]
 
+// Logging must be declared before any module that uses `log_event!`,
+// because `#[macro_use]` makes the macro visible only to subsequent
+// module declarations.
+#[macro_use]
+mod log;
+
 mod archive;
 mod asset;
 mod audio_decode;
@@ -29,6 +35,7 @@ mod tui;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "circolate")]
@@ -50,29 +57,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Play a song
-    Play { #[arg(trailing_var_arg = true, allow_hyphen_values = true)] args: Vec<String> },
-    /// Convert a source file to trackscript
-    Export { #[arg(trailing_var_arg = true, allow_hyphen_values = true)] args: Vec<String> },
-    /// Print a file's parsed structure as JSON
-    Dump { #[arg(trailing_var_arg = true, allow_hyphen_values = true)] args: Vec<String> },
-    /// Run diagnostics
-    Test { #[arg(trailing_var_arg = true, allow_hyphen_values = true)] args: Vec<String> },
-    /// Recursively probe .flp files for missing deps
-    Check { #[arg(trailing_var_arg = true, allow_hyphen_values = true)] args: Vec<String> },
-    /// Tally plugin names across all .flp files
-    Census { #[arg(trailing_var_arg = true, allow_hyphen_values = true)] args: Vec<String> },
-    /// Measure plugin default output levels
+    Play    { #[arg(trailing_var_arg = true, allow_hyphen_values = true)] args: Vec<String> },
+    Export  { #[arg(trailing_var_arg = true, allow_hyphen_values = true)] args: Vec<String> },
+    Dump    { #[arg(trailing_var_arg = true, allow_hyphen_values = true)] args: Vec<String> },
+    Test    { #[arg(trailing_var_arg = true, allow_hyphen_values = true)] args: Vec<String> },
+    Check   { #[arg(trailing_var_arg = true, allow_hyphen_values = true)] args: Vec<String> },
+    Census  { #[arg(trailing_var_arg = true, allow_hyphen_values = true)] args: Vec<String> },
     Measure { #[arg(trailing_var_arg = true, allow_hyphen_values = true)] args: Vec<String> },
-    /// List discovered VST3 / LV2 / CLAP
     Plugins { #[arg(trailing_var_arg = true, allow_hyphen_values = true)] args: Vec<String> },
-    /// Download missing fallback plugins
-    Fetch { #[arg(trailing_var_arg = true, allow_hyphen_values = true)] args: Vec<String> },
-    /// Load a VST3, play a note, report peak
+    Fetch   { #[arg(trailing_var_arg = true, allow_hyphen_values = true)] args: Vec<String> },
     VstSmoke { #[arg(trailing_var_arg = true, allow_hyphen_values = true)] args: Vec<String> },
-    /// Play a note through the native SF2 engine
     Sf2Smoke { #[arg(trailing_var_arg = true, allow_hyphen_values = true)] args: Vec<String> },
-    /// List available trackscripts
     List,
 }
 
@@ -84,60 +79,110 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let result = match cli.command {
-        Some(Command::Play { args }) => play::run(&pick_if_empty(
-            args,
-            cli.no_pick,
-            pick::FILTER_TRACKSCRIPT,
-            "Open Trackscript",
-        )),
-        Some(Command::Export { args }) => export::run(&pick_if_empty(
-            args,
-            cli.no_pick,
-            pick::FILTER_SOURCE,
-            "Export source",
-        )),
-        Some(Command::Dump { args }) => dump::run(&pick_if_empty(
-            args,
-            cli.no_pick,
-            pick::FILTER_TRACKSCRIPT,
-            "Dump trackscript",
-        )),
-        Some(Command::Test { args }) => test::run(&pick_if_empty(
-            args,
-            cli.no_pick,
-            pick::FILTER_TRACKSCRIPT,
-            "Test trackscript",
-        )),
-        Some(Command::Check { args }) => check::run(&args),
-        Some(Command::Census { args }) => check::run_census(&args),
-        Some(Command::Measure { args }) => measure::run(&args),
-        Some(Command::Plugins { args }) => deps::index::run(&args),
-        Some(Command::Fetch { args }) => deps::fetch::run(&args),
-        Some(Command::VstSmoke { args }) => hosting::vst::smoke::run(&args),
-        Some(Command::Sf2Smoke { args }) => hosting::sf2::smoke::run(&args),
-        Some(Command::List) => cmd_list(),
-        None => {
-            if let Some(file) = cli.file {
-                play::run(&[file])
-            } else {
-                play::run(&[])
-            }
-        }
+    // Install the log bus before any subcommand runs.  Filter is seeded
+    // from CIRCOLATE_LOG / CIRCOLATE_DEBUG / CIRCOLATE_QUIET; the TUI can
+    // swap it later via `log::set_filter`.
+    //
+    // The ring sink is only needed by the player/menu (in-memory scrollback
+    // for the log widget).  Line-oriented subcommands get stderr + file only.
+    //
+    // `StderrSink` is installed only when the ring is absent.  With the
+    // ring present, TUI mode captures fd 2 into the ring as `ffi.stderr`;
+    // installing `StderrSink` there would make every log line feed back
+    // into the ring through the capture thread (infinite loop).
+    let wants_ring = match &cli.command {
+        Some(Command::Play { .. }) | None => true,
+        Some(_) => false,
     };
+    let ring = wants_ring.then(|| std::sync::Arc::new(log::RingSink::new(400)));
+    let mut sinks: Vec<Box<dyn log::Sink>> = Vec::new();
+    if ring.is_none() {
+        sinks.push(Box::new(log::StderrSink));
+    }
+    if let Some(f) = log::FileSink::from_env() {
+        sinks.push(Box::new(f));
+    }
+    log::init_with_ring(sinks, ring, None);
 
-    if cli.pause {
-        eprintln!("\npress enter to close...");
-        let mut s = String::new();
-        let _ = std::io::stdin().read_line(&mut s);
+    if let Some(cmd) = cli.command {
+        let result = match cmd {
+            Command::Play    { args } => run_app(&args, cli.no_pick),
+            Command::Export  { args } => export::run(&pick_if_empty(args, cli.no_pick, pick::FILTER_SOURCE, "Export source")),
+            Command::Dump    { args } => dump::run(&pick_if_empty(args, cli.no_pick, pick::FILTER_TRACKSCRIPT, "Dump trackscript")),
+            Command::Test    { args } => test::run(&pick_if_empty(args, cli.no_pick, pick::FILTER_TRACKSCRIPT, "Test trackscript")),
+            Command::Check   { args } => check::run(&args),
+            Command::Census  { args } => check::run_census(&args),
+            Command::Measure { args } => measure::run(&args),
+            Command::Plugins { args } => deps::index::run(&args),
+            Command::Fetch   { args } => deps::fetch::run(&args),
+            Command::VstSmoke { args } => hosting::vst::smoke::run(&args),
+            Command::Sf2Smoke { args } => hosting::sf2::smoke::run(&args),
+            Command::List => cmd_list(),
+        };
+
+        if cli.pause {
+            // Interactive UI prompt, not a log — stays on eprintln.
+            eprintln!("\npress enter to close...");
+            let mut s = String::new();
+            let _ = std::io::stdin().read_line(&mut s);
+        }
+        return result;
     }
 
+    let args = cli.file.map(|f| vec![f]).unwrap_or_default();
+    run_app(&args, cli.no_pick)
+}
+
+fn run_app(args: &[String], _no_pick: bool) -> Result<()> {
+    let play_args = play::cli::parse_args(args)?;
+    let mut term = tui::setup()?;
+
+    let mut current_song = play_args.song.clone();
+    let queue = tui::state::QueueState::new();
+
+    let result = (|| -> Result<()> {
+        loop {
+            let dir = current_song.as_deref().and_then(|p| p.parent());
+            let settings = tui::config::Config::load_layered(dir).resolve();
+
+            let msg = match &current_song {
+                Some(p) => format!("loading {}...", p.display()),
+                  None => "".into(), // Menu renders instead
+            };
+            tui::show_loading(&mut term, &queue, &settings, &msg, &[])?;
+
+            match play::session::play_one(
+                &mut term,
+                &play_args,
+                current_song.as_deref(),
+                                          queue.clone(),
+                                          settings.clone(),
+            ) {
+                Ok(tui::app::LoopOutcome::Quit) => return Ok(()),
+                  Ok(tui::app::LoopOutcome::Home) => {
+                      // Hit 'q' -> go back to the menu
+                      current_song = None;
+                  }
+                  Ok(tui::app::LoopOutcome::Next(name)) => {
+                      match paths::resolve_track(&name) {
+                          Ok(p) => current_song = Some(p),
+                  Err(_) => current_song = None,
+                      }
+                  }
+                  Err(e) => {
+                      let msg = format!("load failed: {e:#}");
+                      tui::show_loading(&mut term, &queue, &settings, &msg, &[])?;
+                      std::thread::sleep(Duration::from_secs(3));
+                      current_song = None;
+                  }
+            }
+        }
+    })();
+
+    let _ = tui::restore(&mut term);
     result
 }
 
-/// If `args` is empty and the picker is enabled, prompt for a file and
-/// append it. Cancelling returns the original empty vec; downstream
-/// verbs treat that as "nothing to do" and exit cleanly.
 fn pick_if_empty(mut args: Vec<String>, no_pick: bool, filter: &str, title: &str) -> Vec<String> {
     if no_pick || !args.is_empty() {
         return args;
@@ -148,8 +193,6 @@ fn pick_if_empty(mut args: Vec<String>, no_pick: bool, filter: &str, title: &str
     args
 }
 
-/// Where the file picker opens: first trackscripts root that has any
-/// entries, else $HOME, else cwd.
 fn picker_start_dir() -> PathBuf {
     let user = paths::user_trackscripts();
     if dir_has_entries(&user) {
@@ -176,7 +219,6 @@ fn cmd_list() -> Result<()> {
     let mut any = false;
     let mut seen: HashSet<String> = HashSet::new();
 
-    // User first, so shadow dedupe lets user-tracked names hide bundled.
     for (tag, dir) in [
         ("user ", paths::user_trackscripts()),
         ("share", paths::bundled_trackscripts()),

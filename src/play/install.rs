@@ -24,22 +24,6 @@ use crate::player::{self, Engine};
 
 // ── VST3 instruments ──────────────────────────────────────────────────
 
-/// Attach every VST3 instrument the trackscript references.
-///
-/// Name resolution:
-///
-///   1. `vinst.plugin_name` if the parser populates it (future)
-///   2. `plugin_path.file_stem()` — the plugin bundle name from the
-///      recorded path, e.g. `"Odin2"` from
-///      `.../Odin2.4.1Linux/Odin2.vst3`.  This is the transitional
-///      bridge for old trackscripts.
-///   3. `vinst.name` — the *part* name, as a last resort.  Usually
-///      wrong (part names like `"ZENOLOGY_2"` don't match bundle
-///      names), but harmless to try.
-///
-/// The path is never printed.  If the plugin is missing, the error
-/// names the plugin, not a filesystem location — no dox, no leaking
-/// the original author's home directory into logs.
 pub fn install_vst_hosts(engine: &mut Engine, project: &player::Project) {
     if project.vst_instruments.is_empty() {
         return;
@@ -60,9 +44,10 @@ pub fn install_vst_hosts(engine: &mut Engine, project: &player::Project) {
         .cloned();
 
         let Some(path) = resolved else {
-            eprintln!(
-                "vst [{}] not found (looked up by name {:?})",
-                      name, stem
+            crate::log_event!(
+                "player.install.vst_not_found",
+                name: name.clone(),
+                              stem: format!("{:?}", stem),
             );
             continue;
         };
@@ -73,7 +58,11 @@ pub fn install_vst_hosts(engine: &mut Engine, project: &player::Project) {
                 engine.register_part_path(vinst.iid, name.clone());
             }
             Err(e) => {
-                eprintln!("vst [{}] failed to load: {:#}", name, e);
+                crate::log_event!(
+                    "vst.load_failed",
+                    name: name.clone(),
+                                  err: format!("{:#}", e),
+                );
             }
         }
     }
@@ -93,20 +82,23 @@ pub fn install_sf2_engines(
 
         let mut sf2 = crate::hosting::sf2::engine::Sf2Engine::new(project.sample_rate);
         if let Err(e) = sf2.load(&path) {
-            eprintln!(
-                "sf2 [{}]: failed to load {}: {:#}",
-                name,
-                path.display(),
-                      e,
+            crate::log_event!(
+                "player.install.sf2_load_failed",
+                name: name.clone(),
+                              path: path.display(),
+                              err: format!("{:#}", e),
             );
             continue;
         }
         sf2.set_preset(spec.bank, spec.preset);
         let effective = default_gain * spec.gain;
         if sf2_debug {
-            eprintln!(
-                "  sf2 [iid={:>3}] {:<44} DEFAULT_GAIN={:.3} spec.gain={:.3} effective={:.3}",
-                spec.iid, name, default_gain, spec.gain, effective
+            crate::log_event!(
+                "player.install.sf2_debug",
+                body: format!(
+                    "  sf2 [iid={:>3}] {:<44} DEFAULT_GAIN={:.3} spec.gain={:.3} effective={:.3}",
+                    spec.iid, name, default_gain, spec.gain, effective,
+                ),
             );
         }
         sf2.set_gain(effective);
@@ -121,9 +113,17 @@ pub fn install_master_fx(engine: &mut Engine, project: &player::Project, disable
     if disabled {
         return;
     }
-    if let Ok(chain) = EffectChain::load_default(project.sample_rate) {
-        if !chain.is_empty() {
-            engine.install_master_fx(chain);
+    match EffectChain::load_default(project.sample_rate) {
+        Ok(chain) => {
+            if !chain.is_empty() {
+                engine.install_master_fx(chain);
+            }
+        }
+        Err(e) => {
+            crate::log_event!(
+                "player.master_fx.chain_failed",
+                err: format!("{:#}", e),
+            );
         }
     }
 }
@@ -154,14 +154,7 @@ fn normalize_slug(s: &str) -> String {
 }
 
 /// Resolve an effect-shim target name to a concrete plugin path.
-///
-/// `fallbacks.json` maps a missing plugin (e.g. `"Fruity Reeverb 2"`)
-/// to a substitute name (e.g. `"Dragonfly Hall Reverb"`).  The
-/// inventory is no longer consulted for a *path* — the substitute name
-/// is passed through `paths::find_plugin`, the same resolver every
-/// other load site uses.
 fn resolve_effect_path(target: &str, share_dir: &Path) -> Option<PathBuf> {
-    let debug = std::env::var_os("SHIM_DEBUG").is_some();
     let target_norm = normalize_slug(target);
 
     let fallback_path = share_dir.join("fallbacks.json");
@@ -181,18 +174,19 @@ fn resolve_effect_path(target: &str, share_dir: &Path) -> Option<PathBuf> {
     .and_then(|f| f.get("name"))
     .and_then(|v| v.as_str())?;
 
-    if debug {
-        eprintln!(
-            "shim-debug: {:?} → {:?}",
-            target_norm, display_name
-        );
-    }
+    crate::log_event!(
+        "player.install.shims_debug",
+        body: format!("shim-debug: {:?} → {:?}", target_norm, display_name),
+    );
 
     let resolved = paths::find_plugin(display_name);
-    if resolved.is_none() && debug {
-        eprintln!(
-            "shim-debug: fallback {:?} not installed on this machine",
-            display_name
+    if resolved.is_none() {
+        crate::log_event!(
+            "player.install.shims_debug",
+            body: format!(
+                "shim-debug: fallback {:?} not installed on this machine",
+                display_name,
+            ),
         );
     }
     resolved
@@ -206,21 +200,20 @@ pub fn install_shims(
     if project.shims.is_empty() {
         return;
     }
-    let debug = std::env::var_os("SHIM_DEBUG").is_some();
     let Some(share_dir) = share_dir else {
-        eprintln!(
-            "  shims: share/ not found; {} shim(s) skipped",
-                  project.shims.len()
+        crate::log_event!(
+            "player.install.shims_no_share",
+            count: project.shims.len(),
         );
         return;
     };
-    if debug {
-        eprintln!(
+    crate::log_event!(
+        "player.install.shims_debug",
+        body: format!(
             "shim-debug: share_dir={:?} ({} shim(s) to attach)",
-                  share_dir,
-                  project.shims.len()
-        );
-    }
+                      share_dir, project.shims.len(),
+        ),
+    );
 
     type ShimKey = (String, Vec<(u32, u64)>, u64, u64, u64);
     let mut hosts_by_key: HashMap<ShimKey, u32> = HashMap::new();
@@ -264,7 +257,11 @@ pub fn install_shims(
         let mut host = match VstHost::load(path.to_str().unwrap_or(""), &[], project.sample_rate) {
             Ok(h) => h,
             Err(e) => {
-                eprintln!("  shim: failed to load '{}': {:#}", shim.target, e);
+                crate::log_event!(
+                    "vst.shim.load_failed",
+                    target: shim.target.clone(),
+                                  err: format!("{:#}", e),
+                );
                 skipped += 1;
                 continue;
             }
@@ -277,12 +274,13 @@ pub fn install_shims(
             let index = (param.slot - 1) as u32;
             let normalized = (param.value / 100.0).clamp(0.0, 1.0);
             let ok = host.set_param_by_index(index, normalized);
-            if debug {
-                eprintln!(
+            crate::log_event!(
+                "player.install.shims_debug",
+                body: format!(
                     "shim-debug: set_param({} idx={} val={:.3}) = {}",
-                          shim.target, index, normalized, ok
-                );
-            }
+                              shim.target, index, normalized, ok,
+                ),
+            );
         }
 
         let id = next_shim_id;
@@ -297,14 +295,18 @@ pub fn install_shims(
         engine.attach_shim_line(shim.line as u32, id);
         hosts_by_key.insert(key, id);
         attached += 1;
-        eprintln!(
-            "  shim {:02}: loaded '{}'",
-            id, shim.target,
+        crate::log_event!(
+            "player.install.shim_loaded",
+            id: format!("{:02}", id),
+                          target: shim.target.clone(),
         );
     }
 
-    eprintln!(
-        "  shims: {} attachment(s), {} skipped, {} unique VST3 host(s) (from {} shim event(s))",
-              attached, skipped, next_shim_id, total_shims,
+    crate::log_event!(
+        "player.install.shims_summary",
+        attached: attached,
+        skipped: skipped,
+        unique: next_shim_id,
+        total: total_shims,
     );
 }

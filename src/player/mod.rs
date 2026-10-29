@@ -14,6 +14,7 @@ pub mod template;
 pub mod transport;
 pub mod types;
 pub mod inserts;
+pub mod analysis;
 
 // Re-exports for call sites that say `player::X` instead of the full
 // submodule path.  `pub(crate) use` rather than `pub use` because the

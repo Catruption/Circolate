@@ -13,23 +13,6 @@ use crate::hosting::vst::ffi::VstHost;
 
 const BLOCK: usize = 4096;
 
-/// Environment-driven attenuation applied to *fallback* VST
-/// substitutions only (never to exact matches).
-///
-/// Fallback substitutes (e.g. Surge XT standing in for `FNF Boyfriend`)
-/// do not receive the original plugin's state blob — parameter IDs are
-/// incompatible — so they run at their own defaults. Surge XT's default
-/// patch is roughly 8–12 dB hotter than the level at which a typical
-/// FL Studio project mixes a synth channel. Unlike the SF2 path, which
-/// already multiplies in `hosting::sf2::engine::DEFAULT_GAIN`, fallback
-/// VSTs currently have no equivalent attenuation stage.
-///
-/// Set `VST_FALLBACK_GAIN=0.30` (or similar) to bring fallback channels
-/// into a listenable range while insert-effect reconstruction
-/// (`share/native_fx/*.lut.bin`, `registry.json` fallback rules) is
-/// still being built out. This is a stopgap — once fallbacks load real
-/// state or are guided by an explicit per-plugin `gain` in the registry,
-/// the env var can be retired (or the default retuned).
 const DEFAULT_VST_FALLBACK_GAIN: f32 = 1.0;
 
 fn vst_fallback_gain() -> f32 {
@@ -53,20 +36,6 @@ pub(crate) fn render_offline(
     let mut loader = Loader::new(Arc::clone(project), cache);
     let mut engine = Engine::new(project);
 
-    // Install VST hosts before any rendering.  One per channel iid.
-    //
-    // Name-only resolution: the recorded `plugin_path` is stale and may
-    // leak the original author's home directory, so it's used solely as
-    // a **transitional bridge** to recover the plugin name (via
-    // `file_stem`).  The actual load path comes from the local plugin
-    // scan.  New trackscripts that stop emitting `Path:` will need a
-    // `plugin_name` field on `VstInstrument`; until then this is the
-    // workable fallback for both old and new sidecars.
-    //
-    // Fallback hosts receive an extra attenuation stage driven by
-    // VST_FALLBACK_GAIN (see the constant's doc comment). Exact
-    // matches get `vinst.gain` verbatim — they carry the original
-    // plugin and its state, so no fudge is needed.
     let fb = vst_fallback_gain();
     let index = PluginIndex::scan();
     for (name, vinst) in &project.vst_instruments {
@@ -81,9 +50,10 @@ pub(crate) fn render_offline(
         .cloned();
 
         let Some(plugin_path) = resolved else {
-            eprintln!(
-                "  (skipping VST [{}]: plugin {:?} not installed)",
-                      name, stem
+            crate::log_event!(
+                "player.render.vst_skipped",
+                name: name.clone(),
+                              stem: format!("{:?}", stem),
             );
             continue;
         };
@@ -108,68 +78,84 @@ pub(crate) fn render_offline(
                 } else {
                     "exact".to_string()
                 };
-                println!(
-                    "  loaded VST [{}] {} ({})",
-                         vinst.iid,
-                         if stem.is_empty() { name.as_str() } else { stem },
-                             tag
+                let display_name = if stem.is_empty() { name.as_str() } else { stem };
+                crate::log_event!(
+                    "player.render.vst_loaded",
+                    iid: vinst.iid,
+                    name: display_name,
+                    tag: tag,
                 );
                 engine.install_host_with_gain(vinst.iid, host, eff_gain);
                 engine.register_part_path(vinst.iid, name.clone());
             }
             Err(e) => {
-                eprintln!("  failed to load VST {} ({:#})", name, e);
+                crate::log_event!(
+                    "player.render.vst_load_failed",
+                    name: name.clone(),
+                                  err: format!("{:#}", e),
+                );
             }
         }
     }
-    println!("  installed {} VST host(s)", engine.host_count());
+    crate::log_event!(
+        "player.render.vst_hosts_installed",
+        count: engine.host_count(),
+    );
     if (fb - 1.0).abs() > 1e-4 {
-        println!("  VST fallback attenuation: {:.3} (VST_FALLBACK_GAIN)", fb);
+        crate::log_event!("player.render.vst_fallback_gain", gain: fb);
     }
 
-    // Native SF2 engines.  Same setup as `install_sf2_engines` in the live
-    // path; without this, every SF2 note in an offline render is dropped
-    // and the WAV comes out silent.
     let sf2_debug = std::env::var_os("FLP_DEBUG").is_some();
     let default_gain = crate::hosting::sf2::engine::DEFAULT_GAIN;
     for (name, spec) in &project.sf2_engine_specs {
         let path = sf2_override.unwrap_or(&spec.sf2_path);
         let mut sf2 = Sf2Engine::new(project.sample_rate);
         if let Err(e) = sf2.load(path) {
-            eprintln!("  sf2 engine failed to load {}: {:#}", name, e);
+            crate::log_event!(
+                "player.render.sf2_load_failed",
+                name: name.clone(),
+                              err: format!("{:#}", e),
+            );
             continue;
         }
         sf2.set_preset(spec.bank, spec.preset);
         let effective = default_gain * spec.gain;
         if sf2_debug {
-            eprintln!(
-                "  sf2 [iid={:>3}] {:<44} DEFAULT_GAIN={:.3} spec.gain={:.3} effective={:.3}",
-                spec.iid, name, default_gain, spec.gain, effective
+            crate::log_event!(
+                "player.render.sf2_debug",
+                body: format!(
+                    "  sf2 [iid={:>3}] {:<44} DEFAULT_GAIN={:.3} spec.gain={:.3} effective={:.3}",
+                    spec.iid, name, default_gain, spec.gain, effective,
+                ),
             );
         }
         sf2.set_gain(effective);
         engine.install_sf2_engine(spec.iid, sf2);
         engine.register_part_path(spec.iid, name.clone());
     }
-    println!("  installed {} SF2 engine(s)", engine.sf2_engine_count());
+    crate::log_event!(
+        "player.render.sf2_engines_installed",
+        count: engine.sf2_engine_count(),
+    );
 
-    // Insert chains: VST effects on mixer inserts, loaded from the
-    // `.instrument` sidecars the FLP converter wrote next to the
-    // trackscript.  The directory is passed via TRACKSCRIPT_INSERT_DIR
-    // for now; later this becomes a Project field.
     crate::player::inserts::install_chains(&mut engine, project, project.sample_rate);
 
-    // Master bus effects.  Silent if master_fx.json is missing or empty.
     if !no_master_fx {
         match EffectChain::load_default(project.sample_rate) {
             Ok(chain) => {
                 if !chain.is_empty() {
-                    println!("  {}", chain.describe());
+                    crate::log_event!(
+                        "player.master_fx.loaded",
+                        name: chain.describe(),
+                    );
                 }
                 engine.install_master_fx(chain);
             }
             Err(e) => {
-                eprintln!("  master fx: {:#}", e);
+                crate::log_event!(
+                    "player.master_fx.chain_failed",
+                    err: format!("{:#}", e),
+                );
             }
         }
     }
@@ -220,9 +206,10 @@ pub(crate) fn write_wav(path: &Path, l: &[f32], r: &[f32], sr: u32) -> Result<()
     }
     writer.finalize()?;
     if clipped > 0 {
-        println!(
-            "  warning: {} output samples clip at peak {:.3}",
-            clipped, peak
+        crate::log_event!(
+            "player.render.wav_clipped",
+            clipped: clipped,
+            peak: peak,
         );
     }
     Ok(())

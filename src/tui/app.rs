@@ -1,9 +1,8 @@
-//! Terminal lifecycle, event loop, key and mouse handling.  Everything
-//! that isn't drawing or state.
+//! Terminal lifecycle, event loop, key and mouse handling.
 
 use std::io::{self, Stdout};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -18,14 +17,14 @@ use crossterm::{
         disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
     },
 };
-use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
+use ratatui::{backend::CrosstermBackend, Terminal};
 
 use crate::mixer::{mute, part_volume, volume};
 use crate::player::{Project, Transport};
 use crate::tui::config::Settings;
 use crate::tui::shared::hit::{
-    dispatch, hit_from_horizontal, hit_from_notch, hit_from_spiral, hit_from_vertical,
-    HitAction,
+    dispatch, hit_from_horizontal, hit_from_notch, hit_from_spiral,
+    hit_from_vertical, HitAction,
 };
 use crate::tui::state::{Click, QueueState, RenderState};
 use crate::tui::views;
@@ -36,20 +35,16 @@ const SPEED_STEPS: &[i64] = &[1, 4, 16];
 const HOLD_WINDOW_MS: u128 = 250;
 const DOUBLE_CLICK_MS: u128 = 350;
 
-// ── diagnostics ────────────────────────────────────────────────────────
-
-/// Set `TUI_DEBUG=1` in the environment to enable input-event tracing.
-/// The prints are cheap to evaluate when disabled (a static bool load).
-fn tui_debug() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("TUI_DEBUG").is_some())
+#[derive(Debug, Clone)]
+pub enum LoopOutcome {
+    Quit,
+    Home,
+    Next(String),
 }
 
 macro_rules! tui_dbg {
     ($($arg:tt)*) => {
-        if tui_debug() {
-            eprintln!($($arg)*);
-        }
+        crate::log_event!("tui.debug", body: format!($($arg)*))
     };
 }
 
@@ -69,10 +64,26 @@ pub fn setup() -> Result<Terminal<CrosstermBackend<Stdout>>> {
 
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        crate::tui::logs::uninstall();
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture, Show);
         prev_hook(info);
     }));
+    crate::tui::logs::install();
+
+    if std::env::var_os("CIRCOLATE_QUIET").is_none() {
+        let mut f = (*crate::log::filter()).clone();
+        let mut changed = false;
+        for cat in [crate::log::Category::Tui, crate::log::Category::Player] {
+            if f.get(cat) < crate::log::Level::Info {
+                f.set(cat, crate::log::Level::Info);
+                changed = true;
+            }
+        }
+        if changed {
+            crate::log::set_filter(f);
+        }
+    }
 
     Ok(Terminal::new(CrosstermBackend::new(out))?)
 }
@@ -80,6 +91,7 @@ pub fn setup() -> Result<Terminal<CrosstermBackend<Stdout>>> {
 #[cfg(unix)]
 extern "C" fn handle_signal(sig: libc::c_int) {
     unsafe {
+        crate::tui::logs::uninstall();
         libc::signal(sig, libc::SIG_IGN);
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture, Show);
@@ -89,6 +101,7 @@ extern "C" fn handle_signal(sig: libc::c_int) {
 }
 
 pub fn restore(t: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    crate::tui::logs::uninstall();
     disable_raw_mode()?;
     execute!(t.backend_mut(), LeaveAlternateScreen, DisableMouseCapture, Show)?;
     t.show_cursor()?;
@@ -104,19 +117,17 @@ pub fn show_loading(
     msg: &str,
     notes: &[String],
 ) -> Result<()> {
-    use std::sync::atomic::{AtomicBool, AtomicI64};
-
     let tp = Arc::new(Transport {
-        speed: AtomicI64::new(0),
-                      seek_to: AtomicI64::new(0),
-                      position: AtomicI64::new(0),
-                      done: AtomicBool::new(false),
-                      stop: AtomicBool::new(false),
-                      active_voices: AtomicI64::new(0),
-                      loaded_lines: AtomicI64::new(0),
-                      reload_count: AtomicI64::new(0),
-                      loop_next: AtomicBool::new(false),
-                      loop_wraps: AtomicI64::new(0),
+        speed: std::sync::atomic::AtomicI64::new(0),
+                      seek_to: std::sync::atomic::AtomicI64::new(0),
+                      position: std::sync::atomic::AtomicI64::new(0),
+                      done: std::sync::atomic::AtomicBool::new(false),
+                      stop: std::sync::atomic::AtomicBool::new(false),
+                      active_voices: std::sync::atomic::AtomicI64::new(0),
+                      loaded_lines: std::sync::atomic::AtomicI64::new(0),
+                      reload_count: std::sync::atomic::AtomicI64::new(0),
+                      loop_next: std::sync::atomic::AtomicBool::new(false),
+                      loop_wraps: std::sync::atomic::AtomicI64::new(0),
     });
     let project = Arc::new(Project::empty(44100));
     let mut state = RenderState::new(queue.clone(), settings.clone());
@@ -133,17 +144,12 @@ pub fn run_against(
     sample_rate: u32,
     queue: QueueState,
     settings: Settings,
-) -> Result<(Option<String>, QueueState)> {
+    media_rx: std::sync::mpsc::Receiver<souvlaki::MediaControlEvent>,
+) -> Result<(LoopOutcome, QueueState)> {
     let mut state = RenderState::new(queue, settings);
-
-    if project.voice_count == 0 {
-        state.queue.focused = true;
-    }
-
-    event_loop(term, &transport, &project, sample_rate, &mut state)?;
-    let request = state.play_request.take();
+    let outcome = event_loop(term, &transport, &project, sample_rate, &mut state, media_rx)?;
     let queue = state.queue;
-    Ok((request, queue))
+    Ok((outcome, queue))
 }
 
 // ── event loop ─────────────────────────────────────────────────────────
@@ -154,13 +160,53 @@ fn event_loop(
     project: &Arc<Project>,
     sample_rate: u32,
     state: &mut RenderState,
-) -> Result<()> {
+    media_rx: std::sync::mpsc::Receiver<souvlaki::MediaControlEvent>,
+) -> Result<LoopOutcome> {
     let tick = Duration::from_millis(TICK_MS);
     let mut seen_wraps = tp.loop_wraps.load(Ordering::Acquire);
 
     loop {
         term.draw(|f| views::draw(f, tp, project, sample_rate, state))?;
         loop_tick(tp, project, state);
+
+        // ── HANDLE SYSTEM MEDIA CONTROLS ──
+        while let Ok(ev) = media_rx.try_recv() {
+            use souvlaki::MediaControlEvent;
+            match ev {
+                MediaControlEvent::Play => {
+                    if tp.speed.load(Ordering::Relaxed) == 0 {
+                        tp.speed.store(1, Ordering::Release);
+                    }
+                }
+                MediaControlEvent::Pause => {
+                    tp.speed.store(0, Ordering::Release);
+                }
+                MediaControlEvent::Toggle => {
+                    let cur = tp.speed.load(Ordering::Relaxed);
+                    tp.speed.store(if cur == 0 { 1 } else { 0 }, Ordering::Release);
+                }
+                MediaControlEvent::Next => {
+                    if let Some(next) = state.queue.advance() {
+                        state.play_request = Some(next);
+                    }
+                }
+                MediaControlEvent::Previous => {
+                    tp.seek_to.store(0, Ordering::Release);
+                }
+                MediaControlEvent::Stop => {
+                    tp.speed.store(0, Ordering::Release);
+                    tp.seek_to.store(0, Ordering::Release);
+                }
+                MediaControlEvent::Seek(souvlaki::SeekDirection::Forward) => {
+                    handle_direction(KeyCode::Right, state, tp);
+                }
+                MediaControlEvent::Seek(souvlaki::SeekDirection::Backward) => {
+                    handle_direction(KeyCode::Left, state, tp);
+                }
+                _ => {}
+            }
+        }
+        // ──────────────────────────────────
 
         let wraps = tp.loop_wraps.load(Ordering::Acquire);
         while seen_wraps < wraps {
@@ -169,7 +215,10 @@ fn event_loop(
         }
         tp.loop_next.store(repeat_pending(state), Ordering::Release);
 
-        if state.play_request.is_some() { break; }
+        if state.play_request.is_some() {
+            let req = state.play_request.take().unwrap();
+            return Ok(LoopOutcome::Next(req));
+        }
 
         let speed = tp.speed.load(Ordering::Relaxed);
         let done = tp.done.load(Ordering::Acquire);
@@ -190,8 +239,7 @@ fn event_loop(
                         tp.seek_to.store(0, Ordering::Release);
                     }
                     Some(next) => {
-                        state.play_request = Some(next);
-                        break;
+                        return Ok(LoopOutcome::Next(next));
                     }
                     None => stop_at_start(tp),
                 }
@@ -205,6 +253,111 @@ fn event_loop(
                 Event::Key(k) => {
                     let is_ctrl_c = k.code == KeyCode::Char('c')
                     && k.modifiers.contains(KeyModifiers::CONTROL);
+
+                    // ── ANALYSIS MODAL ──
+                    if state.player.show_analysis {
+                        if k.kind != KeyEventKind::Release {
+                            if k.code == KeyCode::Esc || k.code == KeyCode::Char('A') || k.code == KeyCode::Char('a') {
+                                state.player.show_analysis = false;
+                            }
+                        }
+                        continue;
+                    }
+
+                    if k.kind != KeyEventKind::Release && (k.code == KeyCode::Char('A') || k.code == KeyCode::Char('a')) {
+                        state.player.show_analysis = true;
+                        state.player.show_help = false;
+                        state.player.show_config = false;
+                        continue;
+                    }
+                    // ────────────────────
+
+                    if project.voice_count == 0 {
+                        if state.queue.focused
+                            && state.menu.edit_mode.is_none()
+                            && k.kind != KeyEventKind::Release
+                            {
+                                handle_queue_key(k.code, k.modifiers, state);
+                                continue;
+                            }
+
+                            if k.kind == KeyEventKind::Press {
+                                if let Some(edit_idx) = state.menu.edit_mode {
+                                    match k.code {
+                                        KeyCode::Esc => state.menu.edit_mode = None,
+                                        KeyCode::Enter => state.menu.edit_mode = None,
+                                        KeyCode::Char(c) => state.menu.directories[edit_idx].push(c),
+                                        KeyCode::Backspace => { state.menu.directories[edit_idx].pop(); },
+                                        _ => {}
+                                    }
+                                } else {
+                                    match k.code {
+                                        KeyCode::Char('q') => return Ok(LoopOutcome::Quit),
+                                        KeyCode::Up => {
+                                            if state.menu.selected_index > 0 { state.menu.selected_index -= 1; }
+                                        }
+                                        KeyCode::Down => {
+                                            if state.menu.selected_index < 3 { state.menu.selected_index += 1; }
+                                        }
+                                        KeyCode::Enter => {
+                                            match state.menu.selected_index {
+                                                0 => {
+                                                    if let Some(p) = crate::pick::pick_file(
+                                                        &crate::paths::user_trackscripts(),
+                                                                                            crate::pick::FILTER_TRACKSCRIPT,
+                                                                                            "Open Trackscript",
+                                                    ) {
+                                                        return Ok(LoopOutcome::Next(p.to_string_lossy().into_owned()));
+                                                    }
+                                                }
+                                                1 => {
+                                                    if let Some(p) = crate::pick::pick_file(
+                                                        &crate::paths::user_trackscripts(),
+                                                                                            crate::pick::FILTER_TRACKSCRIPT,
+                                                                                            "Dump Trackscript",
+                                                    ) {
+                                                        let path_str = p.to_string_lossy().into_owned();
+                                                        crate::log_event!("tui.menu.dump_started", path: path_str.clone());
+                                                        std::thread::spawn(move || {
+                                                            let result = crate::dump::run(&[path_str.clone()]);
+                                                            match result {
+                                                                Ok(_) => crate::log_event!("tui.menu.dump_ok", path: path_str),
+                                                                           Err(e) => crate::log_event!("tui.menu.dump_failed", err: format!("{:#}", e)),
+                                                            }
+                                                        });
+                                                    }
+                                                }
+                                                2 => {
+                                                    if let Some(p) = crate::pick::pick_file(
+                                                        &crate::paths::export_dir(),
+                                                                                            crate::pick::FILTER_SOURCE,
+                                                                                            "Export Source",
+                                                    ) {
+                                                        let path_str = p.to_string_lossy().into_owned();
+                                                        crate::log_event!("tui.menu.export_started", path: path_str.clone());
+                                                        std::thread::spawn(move || {
+                                                            let result = crate::export::run(&[path_str.clone()]);
+                                                            match result {
+                                                                Ok(_) => crate::log_event!("tui.menu.export_ok", path: path_str),
+                                                                           Err(e) => crate::log_event!("tui.menu.export_failed", err: format!("{:#}", e)),
+                                                            }
+                                                        });
+                                                    }
+                                                }
+                                                3 => {
+                                                    state.menu.edit_mode = Some(0);
+                                                    state.queue.focused = false;
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            continue;
+                    }
+
                     let typing = state.queue.focused
                     && !state.player.show_help
                     && !state.player.show_config
@@ -239,14 +392,13 @@ fn event_loop(
                                 || is_ctrl_c)
                                 {
                                     state.player.show_help = false;
-                                } else if k.code == KeyCode::Char('q')
-                                    || k.code == KeyCode::Esc
-                                    || is_ctrl_c
-                                    {
-                                        break;
-                                    } else {
-                                        handle_key(k.code, k.modifiers, tp, project, state);
-                                    }
+                                } else if is_ctrl_c {
+                                    return Ok(LoopOutcome::Quit);
+                                } else if k.code == KeyCode::Char('q') || k.code == KeyCode::Esc {
+                                    return Ok(LoopOutcome::Home);
+                                } else {
+                                    handle_key(k.code, k.modifiers, tp, project, state);
+                                }
                         }
                 }
                 Event::Mouse(m) => handle_mouse(m, tp, project, state),
@@ -255,10 +407,7 @@ fn event_loop(
                 }
             }
         }
-
-        if state.play_request.is_some() { break; }
     }
-    Ok(())
 }
 
 fn repeat_pending(state: &RenderState) -> bool {
@@ -466,15 +615,14 @@ fn handle_mouse(m: MouseEvent, tp: &Arc<Transport>, p: &Project, state: &mut Ren
         _ => return,
     };
 
-    let has = |r: Rect| {
-        m.column >= r.x && m.column < r.x + r.width && m.row >= r.y && m.row < r.y + r.height
-    };
-    let in_box = state.queue_placed
-    .map_or(false, |q| has(q.box_rect) && !has(q.spiral));
-
-    if in_box {
-        if let (MouseEventKind::Down(b), Some(q)) = (m.kind, state.queue_placed) {
-            match state.queue.click(&q, m.column, m.row, b == MouseButton::Right) {
+    let in_queue = state.queue_placed.map_or(false, |q| {
+        let r = q.box_rect;
+        m.column >= r.x && m.column < r.x + r.width
+        && m.row >= r.y && m.row < r.y + r.height
+    });
+    if in_queue {
+        if let Some(q) = state.queue_placed {
+            match state.queue.click(&q, m.column, m.row, button == MouseButton::Right) {
                 Click::Rewind => handle_direction(KeyCode::Left, state, tp),
                 Click::Play => handle_direction(KeyCode::Right, state, tp),
                 Click::None => {}
@@ -482,10 +630,6 @@ fn handle_mouse(m: MouseEvent, tp: &Arc<Transport>, p: &Project, state: &mut Ren
         }
         return;
     }
-
-    // Any click that resolves *outside* the queue box pulls focus out
-    // of the queue's text input.  Clicks inside the box already went
-    // through `queue.click()` above and return early.
     state.queue.focused = false;
 
     let action = hit_from_notch(state, m)

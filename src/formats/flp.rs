@@ -1053,7 +1053,72 @@ pub fn parse(data: &[u8]) -> Result<Project> {
     }
 
     prj.events = events;
+    if prj.tempo <= 0.0 {
+        if let Some(tempo) = derive_tempo_from_clips(&prj) {
+            prj.tempo = tempo;
+            prj.parse_warnings.push(format!(
+                "tempo event missing; derived {} BPM from audio clip durations",
+                tempo
+            ));
+        }
+    }
     Ok(prj)
+}
+
+/// Derive project tempo from playlist audio clips whose source window
+/// equals their playlist window (i.e. clips that aren't stretched).
+/// Returns the modal value across all such clips, or `None` if no clip
+/// gives a plausible reading.
+fn derive_tempo_from_clips(prj: &Project) -> Option<f64> {
+    let ppq = prj.ppq as f64;
+    if ppq <= 0.0 {
+        return None;
+    }
+
+    // Drum one-shots are typically < 500 ms and are placed with a length
+    // that was snapped to the nearest tick, not to a musical unit.  Skip
+    // anything too short to be a whole-measure sample; long enough clips
+    // are almost always trimmed to a clean beat boundary.
+    const MIN_SOURCE_MS: f64 = 500.0;
+    // Allow only near-exact integer-beat clips (within 2% of a whole beat
+    // at the boundary).  A clip of 4.00 beats gives a precise reading;
+    // 0.51 or 6.83 beats does not.
+    const BEAT_TOLERANCE: f64 = 0.02;
+
+    let mut candidates: std::collections::BTreeMap<i32, usize> =
+    std::collections::BTreeMap::new();
+
+    for item in &prj.playlist {
+        if item.kind != "channel" || item.length == 0 {
+            continue;
+        }
+        if item.start_offset_ms < 0.0 || item.end_offset_ms <= 0.0 {
+            continue;
+        }
+        let window_ms = (item.end_offset_ms - item.start_offset_ms) as f64;
+        if window_ms < MIN_SOURCE_MS {
+            continue;
+        }
+        let beats = item.length as f64 / ppq;
+        if beats <= 0.0 {
+            continue;
+        }
+        let fract = beats.fract();
+        if fract > BEAT_TOLERANCE && fract < 1.0 - BEAT_TOLERANCE {
+            continue;
+        }
+        let implied_bpm = beats * 60_000.0 / window_ms;
+        if !(40.0..=300.0).contains(&implied_bpm) {
+            continue;
+        }
+        let rounded = implied_bpm.round() as i32;
+        *candidates.entry(rounded).or_insert(0) += 1;
+    }
+
+    candidates
+    .into_iter()
+    .max_by_key(|(_, count)| *count)
+    .map(|(bpm, _)| bpm as f64)
 }
 
 pub fn parse_file(path: &Path) -> Result<Project> {

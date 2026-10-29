@@ -75,7 +75,7 @@ pub fn render(
         let y = layout.lines.y + i as u16;
         let Some(line) = state.lines.get(idx) else { continue };
 
-        let st = if line.count > 0 && !line.is_blank() { counter } else { counter_dim };
+        let st = if line.count > 0 && !line.is_blank { counter } else { counter_dim };
         put(buf, layout.lines.x, y, &format!("[{}]", line.count), st);
 
         let text_style = if state.playing == Some(idx) { queue_playing } else { queue_text };

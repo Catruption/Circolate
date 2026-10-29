@@ -1,6 +1,4 @@
 //! Thin wrapper around a small C++ shim (vst_shim.cpp) that hosts VST3s.
-//!
-//! [unchanged header doc]
 
 use anyhow::Result;
 use std::ffi::CString;
@@ -39,7 +37,26 @@ impl VstHost {
     pub fn load(plugin_path: &str, state_bytes: &[u8], sr: u32) -> Result<Self> {
         let cpath = CString::new(plugin_path)?;
 
+        // 1. Save the current display environment variables
+        let old_display = std::env::var_os("DISPLAY");
+        let old_wayland = std::env::var_os("WAYLAND_DISPLAY");
+
+        // 2. Scrub them so JUCE-based plugins (Surge, Vital) think they are headless
+        // Note: set_var and remove_var are unsafe in Rust 2024 edition.
+        unsafe {
+            std::env::remove_var("DISPLAY");
+            std::env::remove_var("WAYLAND_DISPLAY");
+        }
+
+        // 3. Create the plugin instance (this is where the hang used to happen)
         let handle = unsafe { vst_shim_create(cpath.as_ptr(), sr as c_int, 512) };
+
+        // 4. Restore the environment for Circolate's own TUI usage
+        unsafe {
+            if let Some(d) = old_display { std::env::set_var("DISPLAY", d); }
+            if let Some(w) = old_wayland { std::env::set_var("WAYLAND_DISPLAY", w); }
+        }
+
         if handle.is_null() {
             return Err(anyhow::anyhow!("vst_shim_create failed for {}", plugin_path));
         }

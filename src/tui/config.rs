@@ -1,6 +1,4 @@
-//! `share/player_settings.json`.  Committed to the repo, layered over
-//! built-in defaults.  Optionally, a `player_settings.json` next to a
-//! `.trackscript` overrides it for that song.
+//! `share/player_settings.json`.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -146,16 +144,10 @@ pub struct Settings {
 impl Config {
     pub fn load_layered(trackscript_dir: Option<&Path>) -> Self {
         let mut cfg = Config::default();
-
-        // 1. System default (e.g., /usr/share/circolate/player_settings.json)
         let sys = crate::paths::system_data().join("player_settings.json");
         cfg.merge_from_file(&sys);
-
-        // 2. User override (e.g., ~/.config/circolate/player_settings.json)
         let user = crate::paths::user_config().join("player_settings.json");
         cfg.merge_from_file(&user);
-
-        // 3. Song override
         if let Some(dir) = trackscript_dir {
             cfg.merge_from_file(&dir.join("player_settings.json"));
         }
@@ -166,7 +158,11 @@ impl Config {
         let Ok(text) = std::fs::read_to_string(path) else { return };
         match serde_json::from_str::<Config>(&text) {
             Ok(next) => self.merge(next),
-            Err(e) => eprintln!("player_settings: {}: {}", path.display(), e),
+            Err(e) => crate::log_event!(
+                "tui.settings.parse_failed",
+                path: path.display(),
+                                        err: e,
+            ),
         }
     }
 
@@ -197,21 +193,25 @@ impl Config {
 
         if let Some(name) = self.preset.as_deref() {
             if let Err(e) = builtin::apply_preset(name, &mut colors) {
-                eprintln!("player_settings: {}", e);
+                crate::log_event!("tui.settings.preset_failed", err: e);
             }
         }
         if let Some(name) = self.theme.preset.as_deref() {
             if let Err(e) = builtin::apply_preset(name, &mut colors) {
-                eprintln!("player_settings: {}", e);
+                crate::log_event!("tui.settings.preset_failed", err: e);
             }
         }
         for (k, v) in &self.theme.overrides {
             let Some(tok) = token_from_name(k) else {
-                eprintln!("player_settings: unknown token `{}`", k);
+                crate::log_event!("tui.settings.unknown_token", token: k.clone());
                 continue;
             };
             let Some(col) = parse_color(v) else {
-                eprintln!("player_settings: bad color `{}` for {}", v, k);
+                crate::log_event!(
+                    "tui.settings.bad_color",
+                    value: v.clone(),
+                                  token: k.clone(),
+                );
                 continue;
             };
             colors.insert(tok, col);

@@ -55,6 +55,23 @@ pub fn draw(
     sample_rate: u32,
     state: &mut RenderState,
 ) {
+    // If we are loading, just draw the logs so we can see what's hanging!
+    if let Some(msg) = &state.loading {
+        let chunks = ratatui::layout::Layout::default()
+        .direction(ratatui::layout::Direction::Vertical)
+        .constraints([
+            ratatui::layout::Constraint::Length(3), // Top message
+                     ratatui::layout::Constraint::Min(0),    // Logs
+        ])
+        .split(f.area());
+
+        let header = ratatui::widgets::Paragraph::new(msg.as_str())
+        .block(state.settings.theme.block().title(" Loading "));
+        f.render_widget(header, chunks[0]);
+
+        crate::tui::widgets::logs::draw(f, chunks[1], state);
+        return; // Don't draw the tracker!
+    }
     let area = f.area();
 
     let rc = tp.reload_count.load(Ordering::Relaxed);
@@ -92,6 +109,9 @@ pub fn draw(
     }
 
     widgets::cover::paint_background(f.buffer_mut(), state.cover.as_ref());
+
+    // Draw lyrics overlay
+    widgets::lyrics::draw(f, chunks[1], tp, project);
 
     let spd = tp.speed.load(Ordering::Relaxed);
     state.queue.direction = match spd.signum() {
@@ -177,6 +197,14 @@ pub fn draw(
     if state.player.show_config {
         widgets::config::draw(f, area, &state.config_ui, &state.settings);
     }
+
+    if state.player.show_analysis {
+        let pos = tp.position.load(Ordering::Relaxed).max(0);
+        if let Some(li) = project.current_line(pos) {
+            let report = crate::player::analysis::analyze(project, tp, li);
+            widgets::analysis::draw(f, area, &theme, li, &report);
+        }
+    }
 }
 
 fn draw_header(
@@ -239,6 +267,12 @@ fn build_notch_segments(state: &RenderState) -> Vec<widgets::notch::Segment> {
             tag: Some(NotchTag::Settings),
             emphasized: false,
             color: Some(Color::Cyan),
+        },
+        Segment {
+            text: "Σ".into(),
+            tag: Some(NotchTag::Analysis),
+            emphasized: false,
+            color: Some(Color::Magenta),
         },
     ]
 }

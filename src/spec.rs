@@ -44,6 +44,9 @@ pub const FIELD_RELEASE:    &str = "₨";
 pub const FIELD_MOD_X:      &str = "₥";
 pub const FIELD_MOD_Y:      &str = "¥";
 pub const FIELD_MIX:        &str = "◊";
+pub const FIELD_LYRIC:      &str = "♫";
+pub const FIELD_PHONEME:    &str = "♪";
+
 
 // ── effect parameter slots ─────────────────────────────────────────────
 //
@@ -88,6 +91,7 @@ pub const EV_NOTE:       &str = "";
 pub const EV_WAYPOINT:   &str = "&";
 pub const EV_UNDOC_EQ:   &str = "=";
 pub const EV_UNDOC_TRI:  &str = "▲";
+#[deprecated(note = "Retired in 1.12; `♪` is now a field glyph (FIELD_PHONEME)")]
 pub const EV_UNDOC_NOTE: &str = "♪";
 pub const EV_SHIM:       &str = "@";
 
@@ -258,6 +262,8 @@ pub const FIELD_SYMBOLS: &[Symbol] = &[
     sym(FIELD_MOD_X, "mod X", "Modulation X, as a signed delta from the engine default of 128. Routes to the plugin's X destination (filter cutoff on simple plugins).", "1.11", Done),
     sym(FIELD_MOD_Y, "mod Y", "Modulation Y, as a signed delta from the engine default of 128. Routes to the plugin's Y destination (resonance on simple plugins).", "1.11", Done),
     sym(FIELD_MIX, "mix", "Dry/wet mix of an effect shim. 0 is fully dry, 1 is fully wet. Default 1.0 for a call-attached shim. Rampable with waypoints.", "1.11", Done),
+    sym(FIELD_LYRIC, "lyric", "Display text for this note's syllable. Double-quoted (`♫\"text\"`). Spliced with adjacent `♫` notes on the same source line into one subtitle run. Notes without `♫` contribute nothing to the subtitle. Renders as a one-cell `♫` mark on non-active lines and as a row of the active-line subtitle. Single quotes inside are literal; escape a literal double quote with `\\\"`.", "1.12", Plan),
+    sym(FIELD_PHONEME, "phoneme", "TTS syllable for this note. Double-quoted (`♪\"K AE N T\"`). Consumed per-note by a voice engine in `LyricMode: phoneme`; never shown on the subtitle row. Single quotes inside are literal (DECtalk uses `'` for primary stress: `♪\"'K AH N\"`). Escape a literal double quote with `\\\"`.", "1.12", Plan),
 ];
 
 pub const EVENT_PREFIXES: &[Symbol] = &[
@@ -265,7 +271,6 @@ pub const EVENT_PREFIXES: &[Symbol] = &[
     sym(EV_WAYPOINT, "waypoint", "Changes properties of the preceding note or shim at a later position instead of starting a new note. Waypoints cross section boundaries; a section header between them is a layout marker, not a break.", "1.10", Done),
     sym(EV_UNDOC_EQ, "(undocumented)", "Recognised by the parser; its meaning is not defined in trackscript.rs.", "1.10", Done),
     sym(EV_UNDOC_TRI, "(undocumented)", "Recognised by the parser; its meaning is not defined in trackscript.rs.", "1.10", Done),
-    sym(EV_UNDOC_NOTE, "(undocumented)", "Recognised by the parser; its meaning is not defined in trackscript.rs.", "1.10", Done),
     sym(EV_SHIM, "shim", "Attaches an effect or reserved-global automation to a window. The last field of `@<...>` is `ƒName(args)`; Name is an effect function or a reserved global. See the *Shim targets* table for what is currently consumed.", "1.11", Done),
 ];
 
@@ -287,7 +292,7 @@ pub struct Context {
 pub const CONTEXTS: &[Context] = &[
     Context {
         name: "note",
-        syntax: "<§pos, #pitch, ~dur, %vol, ¶pan, ƒsource>",
+        syntax: "<§pos, #pitch, ~dur, %vol, ¶pan, ƒsource, ♫lyric, ♪phoneme>",
         doc: "A note-on inside a part body. Fields describe this one note.",
         status: Done,
     },
@@ -440,13 +445,28 @@ FieldContextUse {
     call: "ignored",
     shim: "dry/wet mix of the effect, 0.0..1.0",
 },
+FieldContextUse {
+    glyph: FIELD_LYRIC, name: "lyric",
+    note: "display text for this note's syllable (spliced into the subtitle row)",
+    definition: "ignored",
+    call: "ignored",
+    shim: "ignored",
+},
+FieldContextUse {
+    glyph: FIELD_PHONEME, name: "phoneme",
+    note: "TTS syllable (voice engine only; not displayed)",
+    definition: "ignored",
+    call: "ignored",
+    shim: "ignored",
+},
 ];
 
 pub const DEFAULTS_NOTE: &str =
 "A field omitted from a note inherits the definition's default for that field. \
 A field omitted from a definition falls back to the engine default: 100% volume, \
 0 pan, 1-beat duration.  A field omitted from a call-attached shim falls back to: \
-start = call's start, length = call's duration, mix = 1.0, gain = 100%, pan = 0.";
+start = call's start, length = call's duration, mix = 1.0, gain = 100%, pan = 0.  A note without `♫` contributes nothing to the subtitle row; \
+a note without `♪` receives no TTS syllable (the voice engine skips it).";
 
     pub const CALL_LENGTH_SEMANTICS: &str =
     "A call's duration is the sum of the durations of the measures it selects.  \
@@ -637,30 +657,13 @@ pub struct Change {
 
 pub const CHANGELOG: &[Change] = &[
     Change {
-        version: "1.11 (planned)",
-        summary: "Unified `ƒName(<|N/D, args>)[ events ];` syntax for definitions and calls. \
-Section opener becomes `|`, freeing `@` for shim events. \
-The definition's argument list is a note-shaped default wrapped in `<...>`. \
-Multi-section part bodies: a part may declare `|N/D[...]` sections end to end, \
-one per measure. \
-Measure selection in calls: `ƒName(1,2,3)` plays just those measures, in that \
-order; `ƒName(1<%50>, 2<%75>)` applies per-measure overrides.  A call's \
-duration is the sum of its selected measures and advances the BlockList cursor. \
-Shim events (`@<...>`) attach an effect or reserved-global automation to a \
-window of song time. \
-Sections accumulate row offsets, so a waypoint chain crosses them. \
-Inline operators (`+ - * ±`, `^`, `:count`). \
-Per-note extended fields: `¢` fine pitch (cents delta), `₨` release (velocity \
-delta), `₥` mod X and `¥` mod Y (both deltas from 128).  Omitted when at \
-engine default. \
-The 1.10 `Tempo { ... }` section becomes the `ƒTempo` shim. \
-Effect shims: `@<§pos, ~len, ◊mix, %gain, ¶pan, ƒName(args)>;` attaches \
-an effect to a window of song time.  `◊` is a new universal field for \
-dry/wet mix; `~` in a shim is the effect's length. Effect parameters \
-are positional, indexed by a bijective base-10 run of Greek letters \
-(`α1` = slot 1, `αδ6.0` = slot 14).  Parameter names live in the plugin \
-registry.",
+        version: "1.12 (planned)",
+        summary: "Lyric and phoneme fields on notes. `♫\"text\"` is the display text for the subtitle row; `♪\"phonemes\"` is the TTS syllable string. Both are double-quoted, both are optional, and either can appear before or after the other in a note. Adjacent `♫` notes on the same source line splice into one subtitle run; a source line break ends the run. Phonemes are per-note and consumed by voice engines in `LyricMode: phoneme` (a sidecar field). The `♪` event prefix from 1.10 is retired — it was undocumented and unused, and `♪` is now a field glyph.",
     },
+Change {
+    version: "1.11 (planned)",
+    summary: "Unified `ƒName(<|N/D, args>)[ events ];` syntax for definitions and calls. Section opener becomes `|`, freeing `@` for shim events. The definition's argument list is a note-shaped default wrapped in `<...>`. Multi-section part bodies: a part may declare `|N/D[...]` sections end to end, one per measure. Measure selection in calls: `ƒName(1,2,3)` plays just those measures, in that order; `ƒName(1<%50>, 2<%75>)` applies per-measure overrides. A call's duration is the sum of its selected measures and advances the BlockList cursor. Shim events (`@<...>`) attach an effect or reserved-global automation to a window of song time. Sections accumulate row offsets, so a waypoint chain crosses them. Inline operators (`+ - * ±`, `^`, `:count`). Per-note extended fields: `¢` fine pitch (cents delta), `₨` release (velocity delta), `₥` mod X and `¥` mod Y (both deltas from 128). Omitted when at engine default. The 1.10 `Tempo { ... }` section becomes the `ƒTempo` shim. Effect shims: `@<§pos, ~len, ◊mix, %gain, ¶pan, ƒName(args)>;` attaches an effect to a window of song time. `◊` is a new universal field for dry/wet mix; `~` in a shim is the effect's length. Effect parameters are positional, indexed by a bijective base-10 run of Greek letters (`α1` = slot 1, `αδ6.0` = slot 14). Parameter names live in the plugin registry.",
+},
 Change {
     version: "1.10",
     summary: "Current format: `@4/4[` headers, `ƒ'path'(offset)` sources, waypoints with `&`.",
@@ -694,6 +697,11 @@ Example { title: "Effect shim: call-attached reverb", status: Plan, src: "ƒpian
 Example { title: "Effect shim: chained reverb + delay", status: Plan, src: "ƒpianoer(2)@<ƒFruity_Reeverb_2(α25, β5)>@<ƒFruity_Delay_3(α120)>;" },
 Example { title: "Effect shim: standalone reverb over a song", status: Plan, src: "@<§1/1,~8,◊0,ƒFruity_Reeverb_2(α25)>;\n&<§1/3,◊0.4>;\n&<§1/8,◊0>;" },
 Example { title: "Shim: reserved target (tempo)", status: Done, src: "@<§1/1,#110, ƒTempo>;" },
+Example { title: "Lyric and phoneme on a note", status: Plan, src: "<§1/1,#C#7,~0.5,♫\"can't\",♪\"K AE N T\">" },
+Example { title: "Lyric only (voice engine derives or skips TTS)", status: Plan, src: "<§1/1,#C#7,~0.5,♫\"can't\">" },
+Example { title: "Phoneme only (no subtitle contribution)", status: Plan, src: "<§1/1,#C#7,~0.5,♪\"K AE N T\">" },
+Example { title: "Phoneme with DECtalk stress marker", status: Plan, src: "<§1/1,#C#7,~0.5,♫\"Con\",♪\"'K AH N\">" },
+Example { title: "Lyric splicing across adjacent notes", status: Plan, src: "<§1/1,#C#7,~0.5,♫\"I-\",♪\"AY\">,\n<§1/3,#D7,~0.5,♫\"can't\",♪\"K AE N T\">,\n<§1/4,#E7,~0.5,♫\"feel-\",♪\"F IY L\">" },
 ];
 
 pub fn wrap_example(src: &str) -> String {

@@ -31,6 +31,7 @@
 #include <string>
 #include <sys/stat.h>
 #include <vector>
+#include <cstdlib>
 
 #include "public.sdk/source/vst/hosting/module.h"
 #include "public.sdk/source/vst/hosting/hostclasses.h"
@@ -487,6 +488,11 @@ do { if (shim_debug_enabled()) std::fprintf(stderr, __VA_ARGS__); } while (0)
 
         void* vst_shim_create(const char* path, int sr, int block) {
             try {
+                // 1. Strip the display variables so JUCE plugins (Surge, Vital)
+                //    skip X11 initialization entirely.
+                unsetenv("DISPLAY");
+                unsetenv("WAYLAND_DISPLAY");
+
                 std::string err;
                 auto* mod = load_module(path, err);
                 if (!mod) {

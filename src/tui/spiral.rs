@@ -51,7 +51,7 @@ pub fn spiral_path(n: usize, aspect_x: usize) -> Vec<(i32, i32)> {
     cells
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct SpiralLayout {
     /// Measures per coil cell.  Always 1.
     pub measures_per_cell: usize,
