@@ -22,6 +22,7 @@ pub struct AnalysisReport {
     pub motion_anchor: bool,
     pub motion_leap: i32,
     pub motion_register: String,
+    pub motion_highlight: Vec<(usize, i64)>,
 }
 
 fn midi_to_name(midi: i32) -> String {
@@ -217,6 +218,60 @@ pub fn analyze(project: &Project, tp: &Transport, line_idx: usize) -> AnalysisRe
 
     let prev_motion_feats = motion::calculate_motion(&prev_measure_notes_by_part.values().flatten().cloned().collect::<Vec<_>>());
 
+    // --- X-RAY MOTION HIGHLIGHTS (FIX: populate the field) ---
+    // Mark current-line notes that contribute to a big melodic leap (>=7
+    // semitones) or to the low pedal band. Keyed by (block_line, measure-local
+    // start) so it matches PreparedNote in measure.rs and the vertical view's
+    // DisplayNote.start_row.
+    let mut motion_highlight: Vec<(usize, i64)> = Vec::new();
+    {
+        let mut all_current: Vec<N> = measure_notes_by_part
+        .values()
+        .flatten()
+        .cloned()
+        .collect();
+        all_current.sort_by(|a, b| {
+            a.start
+            .partial_cmp(&b.start)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.pitch.cmp(&b.pitch))
+        });
+
+        // Melody extraction (highest note per onset) — mirrors motion::calculate_motion.
+        let mut melody: Vec<(f64, i32)> = Vec::new();
+        let mut last_time = -1.0_f64;
+        for n in &all_current {
+            if n.start > last_time + 0.1 {
+                melody.push((n.start, n.pitch));
+                last_time = n.start;
+            } else if let Some(last) = melody.last_mut() {
+                if n.pitch > last.1 {
+                    last.1 = n.pitch;
+                }
+            }
+        }
+
+        // Highlight notes participating in a leap of >= 7 semitones.
+        for w in melody.windows(2) {
+            if (w[1].1 - w[0].1).abs() >= 7 {
+                motion_highlight.push((line_idx, w[0].0 as i64));
+                motion_highlight.push((line_idx, w[1].0 as i64));
+            }
+        }
+
+        // Highlight the low pedal band (lowest pitch ± 2).
+        if motion_feats.is_pedal {
+            let lowest = motion_feats.lowest_pitch;
+            for n in &all_current {
+                if n.pitch <= lowest + 2 {
+                    motion_highlight.push((line_idx, n.start as i64));
+                }
+            }
+        }
+        motion_highlight.sort_unstable();
+        motion_highlight.dedup();
+    }
+
     let features = Features {
         chord: chord_obj.clone(),
         roman,
@@ -282,5 +337,6 @@ pub fn analyze(project: &Project, tp: &Transport, line_idx: usize) -> AnalysisRe
         motion_anchor: motion_feats.is_pedal,
         motion_leap: motion_feats.biggest_leap,
         motion_register,
+        motion_highlight,
     }
 }

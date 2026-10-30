@@ -262,6 +262,10 @@ pub fn draw(
                     (0.0, 0.0)
                 };
 
+                // Save the true start row (relative to the measure) before we
+                // zero it out for lookback notes.
+                let original_start = note.start_row as i64;
+
                 if !is_current {
                     note.start_row = 0.0;
                 }
@@ -290,16 +294,27 @@ pub fn draw(
                 } else {
                     NoteState::Waiting
                 };
-                let pitch =
-                value_at(&dn.note.pitch_points, dn.note.start_row).unwrap_or(440.0);
-                let vol =
-                value_at(&dn.note.vol_points, dn.note.start_row).unwrap_or(100.0);
+                let note_local_row = dn.value_offset + current_row;
+                let lookup_row = note_local_row.max(original_start as f64);
+
+                let pitch = value_at(&dn.note.pitch_points, lookup_row).unwrap_or(440.0);
+                let vol = value_at(&dn.note.vol_points, lookup_row).unwrap_or(100.0);
+
+                // FIX: X-Ray highlight. `is_current` == `*offset_rows == 0.0`;
+                // for those notes `dn.note.start_row` is measure-local and
+                // matches the (block_line, measure-local start) key that
+                // analysis.rs emits via state.motion_highlights.
+                let is_motion_highlight = *offset_rows == 0.0
+                && state
+                .motion_highlights
+                .contains(&(li, dn.note.start_row as i64));
+
                 let style = if col_off {
                     Style::default()
                     .fg(theme.color(Token::MutedFg))
                     .bg(theme.color(Token::MutedBg))
                 } else {
-                    note_style(pitch, vol, state_note, &theme, &synth)
+                    note_style(pitch, vol, state_note, &theme, &synth, is_motion_highlight)
                 };
                 staged.push(Staged { dn, text, style });
             }

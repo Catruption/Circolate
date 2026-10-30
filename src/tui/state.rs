@@ -327,6 +327,7 @@ pub struct PlayheadState {
 }
 
 pub struct RenderState {
+    pub motion_highlights: Vec<(usize, i64)>,
     pub settings: Settings,
     pub config_ui: ConfigUi,
     pub player: PlayerState,
@@ -404,6 +405,7 @@ impl RenderState {
             spiral_cache: None,
 
             menu: MenuState::new(),
+            motion_highlights: Vec::new(),
         }
     }
 }

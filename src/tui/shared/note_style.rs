@@ -26,8 +26,8 @@ pub fn hsv_to_rgb(h: f64, s: f64, v: f64) -> (u8, u8, u8) {
     };
     (
         ((r + m) * 255.0).clamp(0.0, 255.0) as u8,
-        ((g + m) * 255.0).clamp(0.0, 255.0) as u8,
-        ((b + m) * 255.0).clamp(0.0, 255.0) as u8,
+     ((g + m) * 255.0).clamp(0.0, 255.0) as u8,
+     ((b + m) * 255.0).clamp(0.0, 255.0) as u8,
     )
 }
 
@@ -41,19 +41,30 @@ pub enum NoteState {
 
 /// The pitch-driven background for a playing note, or `None` if
 /// synesthesia is disabled.  `pitch_hz` is in Hz; `vol` is 0..=100.
-fn synesthetic_bg(pitch_hz: f64, vol: f64, synth: &SynesthesiaConfig) -> Option<Color> {
+///
+/// Returns `(Color, is_bright)`. `is_bright` tells the caller whether
+/// to use black or white text for contrast.
+fn synesthetic_bg(pitch_hz: f64, vol: f64, synth: &SynesthesiaConfig) -> Option<(Color, bool)> {
     if !synth.enabled {
         return None;
     }
     let midi = crate::formats::trackscript::hz_to_note(pitch_hz);
     let hue = midi.rem_euclid(12) as f64 * synth.hue_step;
-    let sat = if synth.saturation_from_volume {
-        (vol / 100.0).clamp(0.0, 1.0) * synth.saturation_scale
-    } else {
-        synth.saturation_scale
-    };
-    let (r, g, b) = hsv_to_rgb(hue, sat, synth.value);
-    Some(Color::Rgb(r, g, b))
+
+    // Use volume to control brightness (value), not saturation.
+    // This fades to black on silence, which fits a dark theme perfectly.
+    let vol_ratio = (vol / 100.0).clamp(0.0, 1.0);
+    let val = (0.1 + (vol_ratio * 0.9)) * synth.value;
+
+    // Saturation now stays constant to keep the hue pure.
+    let sat = synth.saturation_scale;
+
+    let (r, g, b) = hsv_to_rgb(hue, sat, val);
+
+    // If the background is bright, we need black text. If dark, white text.
+    let is_bright = val > 0.6;
+
+    Some((Color::Rgb(r, g, b), is_bright))
 }
 
 pub fn note_style(
@@ -62,19 +73,31 @@ pub fn note_style(
     state: NoteState,
     theme: &Theme,
     synth: &SynesthesiaConfig,
+    is_motion_highlight: bool, // NEW: X-Ray flag
 ) -> Style {
     match state {
         NoteState::Playing => {
-            let bg = synesthetic_bg(pitch_hz, vol, synth)
-                .unwrap_or_else(|| theme.color(Token::NotePlayingBg));
+            let (bg, is_bright) = synesthetic_bg(pitch_hz, vol, synth)
+            .unwrap_or_else(|| (theme.color(Token::NotePlayingBg), false));
+
+            // X-Ray: Massive leaps get Red text.
+            // Otherwise, dynamic contrast (Black on bright, White on dark).
+            let fg = if is_motion_highlight {
+                Color::LightRed
+            } else if is_bright {
+                Color::Black
+            } else {
+                theme.color(Token::NotePlayingFg)
+            };
+
             Style::default()
-                .fg(theme.color(Token::NotePlayingFg))
-                .bg(bg)
-                .add_modifier(Modifier::BOLD)
+            .fg(fg)
+            .bg(bg)
+            .add_modifier(Modifier::BOLD)
         }
         NoteState::Played => Style::default().fg(theme.color(Token::Played)),
         NoteState::Waiting | NoteState::Future => Style::default()
-            .fg(theme.color(Token::Unplayed))
-            .add_modifier(Modifier::BOLD),
+        .fg(theme.color(Token::Unplayed))
+        .add_modifier(Modifier::BOLD),
     }
 }

@@ -1,12 +1,9 @@
 //! Horizontal tracker: one time-aligned column per part, with a braille
 //! waveform behind the note text and the playhead column highlighted.
-//! Reads like a tracker grid; splits parts side by side so they can be
-//! compared beat-by-beat.
 //!
-//! When a part has inline shims (`ƒpianoer(2)@<ƒFruity_Limiter()>@…`)
-//! and `state.expanded_chains` contains its path, one `ƒTarget` divider
-//! row is prepended per shim.  Braille and playhead are shifted down by
-//! the number of prepended rows so they still line up with the sample.
+//! All note collection, state resolution, and styling is done in
+//! `super::measure::prepare_measure`. This file is purely layout:
+//! column packing, braille waveform rasterization, and hit-test tracking.
 
 use ratatui::{
     layout::Rect,
@@ -16,26 +13,23 @@ use ratatui::{
     Frame,
 };
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 
-use crate::mixer::{mute, part_volume};
 use crate::player::envelope::{
     synth_envelope_live, synth_envelope_static, whole_sample_envelope, wrapped_pos,
 };
-use crate::player::notes::{split_notes, value_at, ColumnLine, DisplayNote};
+use crate::player::notes::{value_at, ColumnLine};
 use crate::player::scope::scope_snapshot;
 use crate::player::{Project, Transport};
 use crate::formats::trackscript::C5_HZ;
 use crate::tui::shared::braille::{braille_char, dot_bit};
 use crate::tui::shared::label;
 use crate::tui::shared::note_fmt::fmt_note;
-use crate::tui::shared::note_style::{note_style, NoteState};
+use crate::tui::shared::note_style::NoteState;
 use crate::tui::shared::waveform::rasterize_time_y;
 use crate::tui::state::{RenderState, TrackerColumnHit, TrackerHit};
 use crate::tui::theme::{Theme, Token};
-
-const PLAYHEAD_LOOKAHEAD_SECS: f64 = 0.05;
 
 pub fn draw(
     f: &mut Frame<'_>,
@@ -45,15 +39,15 @@ pub fn draw(
     state: &mut RenderState,
 ) {
     let theme: Theme = state.settings.theme.clone();
-    let synth = state.settings.synesthesia;
+    // FIX: `synth` was unused here — note styling is handled inside
+    // measure::prepare_measure, which reads state.settings.synesthesia itself.
     let labels_cfg = state.settings.labels;
     let min_col_w = state.settings.layout.min_col_w;
     let max_col_w = state.settings.layout.max_col_w;
-    let lookback_lines = state.settings.layout.lookback_lines;
     let playhead_marker = state.settings.layout.playhead_marker.clone();
 
     let sr_comp = p.sample_rate as f64;
-    let lookahead = (PLAYHEAD_LOOKAHEAD_SECS * sr_comp) as i64;
+    let lookahead = (super::measure::PLAYHEAD_LOOKAHEAD_SECS * sr_comp) as i64;
     let pos = (tp.position.load(Ordering::Relaxed) + lookahead).min(p.total_samples);
     let current = p.current_line(pos);
 
@@ -69,81 +63,11 @@ pub fn draw(
         return;
     };
 
-    let rpmeasure = p.rows_per_measure();
-    let lookback = lookback_lines.min(li);
-
-    let mut by_path: HashMap<String, Vec<(String, f64, f64, f64)>> = HashMap::new();
-    let mut discovery: Vec<String> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-
-    for call in p.line_calls(li) {
-        let Some(path) = p.part_path(&call.name) else { continue };
-        let key = path.to_string();
-        if seen.insert(key.clone()) {
-            discovery.push(key.clone());
-        }
-        by_path.entry(key).or_default().push((
-            call.name.clone(),
-                                              0.0,
-                                              call.pattern_measure_start,
-                                              call.pattern_measure_len,
-        ));
-    }
-
-    for k in 1..=lookback {
-        let prev_li = li - k;
-        let offset_rows = k as f64 * rpmeasure;
-        for call in p.line_calls(prev_li) {
-            let Some(path) = p.part_path(&call.name) else { continue };
-            let subs = p.part_subs_per_beat(&call.name);
-            let measure_end = call.pattern_measure_start + call.pattern_measure_len;
-            let still_on = split_notes(
-                p.part_events(&call.name),
-                                       subs,
-                                       p.part_sample_offset_u32(&call.name),
-            )
-            .iter()
-            .any(|n| {
-                n.start_row >= call.pattern_measure_start
-                && n.start_row < measure_end
-                && (n.end_row - call.pattern_measure_start) > offset_rows
-            });
-            if !still_on {
-                continue;
-            }
-            let key = path.to_string();
-            if seen.insert(key.clone()) {
-                discovery.push(key.clone());
-            }
-            by_path.entry(key).or_default().push((
-                call.name.clone(),
-                                                  offset_rows,
-                                                  call.pattern_measure_start,
-                                                  call.pattern_measure_len,
-            ));
-        }
-    }
-
-    if discovery.is_empty() {
+    let Some(prep) = super::measure::prepare_measure(p, tp, state, li, &theme) else {
         f.render_widget(Paragraph::new("(silence)").block(outer), area);
         state.tracker_hit = None;
         return;
-    }
-
-    let present: HashSet<&String> = discovery.iter().collect();
-    let mut merged: Vec<String> = state
-    .column_order
-    .iter()
-    .filter(|path| present.contains(path))
-    .cloned()
-    .collect();
-    for path in &discovery {
-        if !merged.iter().any(|m| m == path) {
-            merged.push(path.clone());
-        }
-    }
-    state.column_order = merged.clone();
-    let path_order = merged;
+    };
 
     let inner = outer.inner(area);
     let inner_w = inner.width as usize;
@@ -154,215 +78,75 @@ pub fn draw(
         return;
     }
 
-    let path_count = path_order.len();
+    let path_count = prep.parts.len();
     let max_visible = (inner_w / (min_col_w + 1)).max(1);
     let visible_cols = path_count.min(max_visible);
-    let col_w = (inner_w / visible_cols)
-    .saturating_sub(1)
-    .clamp(min_col_w, max_col_w);
+    let col_w = (inner_w / visible_cols).saturating_sub(1).clamp(min_col_w, max_col_w);
 
     let char_rows = inner_h.saturating_sub(1);
     let pixel_rows = char_rows * 4;
+    let current_row = prep.current_row;
 
-    let sr = p.sample_rate as f64;
-    let measure_samples = p.line_measure_samples(li).max(1);
-    let line_start = p.line_start_sample(li);
-    let elapsed = (pos - line_start).max(0);
-    let playhead_frac = (elapsed as f64 / measure_samples as f64).clamp(0.0, 1.0);
-    let current_row = playhead_frac * rpmeasure;
-
-    let header_names: Vec<Option<String>> = path_order
-    .iter()
-    .map(|path| by_path[path].first().map(|(n, _, _, _)| n.clone()))
-    .collect();
-
-    // Shim chains per column, from p.shims (inline `@<ƒTarget()>`).  Looked
-    // up on the BlockList line each source call came from, so a column fed
-    // by a carried-over note still shows its chain.
-    let chain_names_per_col: Vec<Vec<String>> = (0..visible_cols)
-    .map(|col| {
-        let path = &path_order[col];
-        by_path[path]
-        .iter()
-        .map(|(_, off, _, _)| li.saturating_sub((off / rpmeasure.max(1.0)).round() as usize))
-        .map(|l| p.shims_for_line_path(l, path))
-        .find(|v| !v.is_empty())
-        .map(|v| v.iter().map(|sh| sh.target.clone()).collect())
-        .unwrap_or_default()
-    })
-    .collect();
-
-    let chain_rows_per_col: Vec<usize> = (0..visible_cols)
-    .map(|col| {
-        let path = &path_order[col];
-        if state.expanded_chains.contains(path) {
-            chain_names_per_col[col].len()
-        } else {
-            0
-        }
-    })
-    .collect();
-
-    let snap = mute::snapshot();
-    let muted_parts = &snap.muted_parts;
-    let soloed_part = snap.soloed_part.as_deref();
-    let muted_notes = &snap.muted_notes;
-
+    // Build column entries (note lines + divider lines for shim chains).
     let mut columns: Vec<Vec<ColumnLine>> = Vec::with_capacity(visible_cols);
     let mut column_rows_hit: Vec<Vec<Option<(usize, i64)>>> = Vec::with_capacity(visible_cols);
 
     for col in 0..visible_cols {
-        let path = &path_order[col];
-        let sources = &by_path[path];
-        let mut notes: Vec<DisplayNote> = Vec::new();
-        let mut block_line_for_note: Vec<usize> = Vec::new();
+        let part = &prep.parts[col];
+        let expanded = state.expanded_chains.contains(part.path.as_str());
+        let chain_rows = if expanded { part.shim_names.len() } else { 0 };
 
-        for (name, offset_rows, measure_start, measure_len) in sources {
-            let subs = p.part_subs_per_beat(name);
-            let is_current = *offset_rows == 0.0;
-            let offset_lines = (offset_rows / rpmeasure).round() as usize;
-            let note_block_line = li.saturating_sub(offset_lines);
-            let measure_end = measure_start + measure_len;
+        let mut entries: Vec<ColumnLine> = Vec::with_capacity(part.notes.len() + chain_rows + 4);
+        let mut entries_bl: Vec<Option<(usize, i64)>> = Vec::with_capacity(part.notes.len() + chain_rows + 4);
 
-            for mut note in split_notes(
-                p.part_events(name),
-                                        subs,
-                                        p.part_sample_offset_u32(name),
-            ) {
-                if note.start_row < *measure_start || note.start_row >= measure_end {
-                    continue;
-                }
-
-                let ms = *measure_start;
-                note.start_row -= ms;
-                note.end_row -= ms;
-                for pt in &mut note.pitch_points { pt.row -= ms; }
-                for pt in &mut note.vol_points   { pt.row -= ms; }
-                for pt in &mut note.pan_points   { pt.row -= ms; }
-
-                let active = note.end_row > *offset_rows;
-                let has_vol_waypoints = note.vol_points.len() > 1;
-                let dur_beats = note.dur_beats.unwrap_or(1.0);
-                let is_sustained = dur_beats >= 2.0;
-                let end_vol = value_at(&note.vol_points, note.end_row).unwrap_or(0.0);
-                let still_fading = has_vol_waypoints && is_sustained && end_vol > 0.01;
-                if !active && !still_fading {
-                    continue;
-                }
-                let (display_start, display_end) = if is_current {
-                    (note.start_row, note.end_row)
-                } else if active {
-                    (0.0, (note.end_row - *offset_rows).min(rpmeasure))
-                } else {
-                    (0.0, 0.0)
-                };
-                notes.push(DisplayNote {
-                    note,
-                    subs,
-                    display_start,
-                    display_end,
-                    value_offset: *offset_rows,
-                    source_name: name.clone(),
-                });
-                block_line_for_note.push(note_block_line);
-            }
-        }
-
-        let mut idx: Vec<usize> = (0..notes.len()).collect();
-        idx.sort_by(|&a, &b| {
-            notes[a]
-            .value_offset
-            .partial_cmp(&notes[b].value_offset)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| {
-                notes[a]
-                .note
-                .start_row
-                .partial_cmp(&notes[b].note.start_row)
-                .unwrap_or(std::cmp::Ordering::Equal)
-            })
-        });
-        let notes: Vec<DisplayNote> = idx.iter().map(|&i| notes[i].clone()).collect();
-        let bl: Vec<usize> = idx.iter().map(|&i| block_line_for_note[i]).collect();
-
-        let header_name = header_names[col].clone();
-        let mut entries: Vec<ColumnLine> = Vec::with_capacity(notes.len() + 4);
-        let mut entries_bl: Vec<Option<(usize, i64)>> = Vec::with_capacity(notes.len() + 4);
-
-        // Expanded shim chain: prepend one divider row per shim.
-        if chain_rows_per_col[col] > 0 {
-            let n_chain = chain_names_per_col[col].len();
-            for (ci, name) in chain_names_per_col[col].iter().enumerate() {
-                let term = if ci + 1 == n_chain { ";" } else { "" };
+        if chain_rows > 0 {
+            for (ci, name) in part.shim_names.iter().enumerate() {
+                let term = if ci + 1 == part.shim_names.len() { ";" } else { "" };
                 let text = format!("<ƒ{}()>{}", name, term);
                 let truncated = if text.chars().count() > col_w {
                     let mut s: String = text.chars().take(col_w.saturating_sub(1)).collect();
                     s.push('…');
                     s
-                } else {
-                    text
-                };
+                } else { text };
                 entries.push(ColumnLine::Divider { label: truncated });
                 entries_bl.push(None);
             }
         }
 
         let mut last_name: Option<String> = None;
-        for (note, block_line) in notes.into_iter().zip(bl) {
-            let name = note.source_name.clone();
+        for pnote in &part.notes {
+            let name = &pnote.dn.source_name;
             let at_start = last_name.is_none();
             let changed = last_name.as_deref() != Some(name.as_str());
-            let is_header = header_name.as_deref() == Some(name.as_str());
+            let is_header = part.first_name == *name;
             if (at_start || changed) && !is_header {
                 entries.push(ColumnLine::Divider { label: name.clone() });
                 entries_bl.push(None);
             }
-            let start_row = note.note.start_row as i64;
-            entries.push(ColumnLine::Note(note));
-            entries_bl.push(Some((block_line, start_row)));
-            last_name = Some(name);
+            entries.push(ColumnLine::Note(pnote.dn.clone()));
+            entries_bl.push(Some((pnote.block_line, pnote.start_row)));
+            last_name = Some(name.clone());
         }
         columns.push(entries);
         column_rows_hit.push(entries_bl);
     }
 
-    let col_playing: Vec<bool> = (0..visible_cols)
-    .map(|col| {
-        columns[col].iter().any(|line| {
-            if let ColumnLine::Note(dn) = line {
-                dn.display_end > 0.0
-                && dn.display_start <= current_row
-                && current_row < dn.display_end
-            } else {
-                false
-            }
-        })
-    })
-    .collect();
-
+    // Per-column braille waveform + playhead.
     if state.last_synth_env.len() < visible_cols {
         state.last_synth_env.resize_with(visible_cols, Vec::new);
     }
     let mut dot_matrices: Vec<Vec<Vec<bool>>> = Vec::with_capacity(visible_cols);
     for col in 0..visible_cols {
-        let path = &path_order[col];
-        let Some((name, _, _, _)) = by_path[path].first() else {
-            dot_matrices.push(vec![vec![false; col_w * 2]; pixel_rows]);
-            continue;
-        };
-        let env: Vec<(f32, f32)> = if let Some(sample) = p.preview_sample_for_part(name) {
-            let key = (path.clone(), pixel_rows);
-            state
-            .sample_env_cache
-            .entry(key)
+        let part = &prep.parts[col];
+        let env: Vec<(f32, f32)> = if let Some(sample) = p.preview_sample_for_part(&part.first_name) {
+            let key = (part.path.clone(), pixel_rows);
+            state.sample_env_cache.entry(key)
             .or_insert_with(|| whole_sample_envelope(&sample, pixel_rows))
             .clone()
         } else {
-            let live = p.iid_for_part(name).and_then(|iid| {
+            let live = p.iid_for_part(&part.first_name).and_then(|iid| {
                 scope_snapshot(iid as usize, &mut state.snapshot);
-                if state.snapshot.is_empty() {
-                    None
-                } else {
+                if state.snapshot.is_empty() { None } else {
                     let e = synth_envelope_live(&state.snapshot, pixel_rows);
                     if e.is_empty() { None } else { Some(e) }
                 }
@@ -374,91 +158,67 @@ pub fn draw(
                 }
                 None => {
                     let cached = &state.last_synth_env[col];
-                    if cached.len() == pixel_rows {
-                        cached.clone()
-                    } else {
-                        synth_envelope_static(p, name, pixel_rows)
-                    }
+                    if cached.len() == pixel_rows { cached.clone() }
+                    else { synth_envelope_static(p, &part.first_name, pixel_rows) }
                 }
             }
         };
         dot_matrices.push(rasterize_time_y(&env, col_w * 2, pixel_rows));
     }
 
-    {
-        let present: HashSet<&String> = path_order.iter().collect();
-        state.playheads.retain(|k, _| present.contains(k));
-    }
-
+    // Playhead position per column (uses sample playhead tracking in state).
     let mut playhead_pys: Vec<Option<usize>> = Vec::with_capacity(visible_cols);
     for col in 0..visible_cols {
-        let path = &path_order[col];
-        let Some((name, _, _, _)) = by_path[path].first() else {
-            playhead_pys.push(None);
-            continue;
-        };
-        let Some(sample) = p.preview_sample_for_part(name) else {
+        let part = &prep.parts[col];
+        let Some(sample) = p.preview_sample_for_part(&part.first_name) else {
             playhead_pys.push(None);
             continue;
         };
         let n = sample.left.len();
-        if n == 0 {
-            playhead_pys.push(None);
-            continue;
-        }
+        if n == 0 { playhead_pys.push(None); continue; }
         let nf = n as f64;
         let loop_pts = sample.loop_pts;
         let sample_rate_f = sample.rate;
 
-        let active = columns[col].iter().find_map(|line| {
-            let ColumnLine::Note(dn) = line else { return None };
-            let local_row = dn.value_offset + current_row;
-            if dn.note.start_row <= local_row && local_row < dn.note.end_row {
-                Some(dn)
-            } else {
-                None
-            }
+        let active = part.notes.iter().find(|pn| {
+            pn.dn.display_end > 0.0
+            && pn.dn.display_start <= current_row
+            && current_row < pn.dn.display_end
         });
 
-        let ph = state.playheads.entry(path.clone()).or_default();
-
-        let Some(dn) = active else {
+        let ph = state.playheads.entry(part.path.clone()).or_default();
+        let Some(pn) = active else {
             ph.note_id = None;
             playhead_pys.push(None);
             continue;
         };
 
-        let lines_back = (dn.value_offset / rpmeasure).round() as usize;
-        let block_line = li.saturating_sub(lines_back);
+        let block_line = pn.block_line;
         let block_start_sample = p.line_start_sample(block_line);
+        let id = (pn.dn.source_name.clone(), pn.dn.note.start_row, block_start_sample);
 
-        let local_row = dn.value_offset + current_row;
-        let pitch = value_at(&dn.note.pitch_points, local_row).unwrap_or(C5_HZ);
-        let ratio = (pitch / C5_HZ).max(1e-6);
-
-        let id = (dn.source_name.clone(), dn.note.start_row, block_start_sample);
         if ph.note_id.as_ref() != Some(&id) {
-            ph.position = dn.note.offset as f64;
+            ph.position = pn.dn.note.offset as f64;
             ph.note_id = Some(id);
             ph.last_audio_pos = pos;
         } else {
             let raw_delta = pos - ph.last_audio_pos;
-            let max_delta = sr as i64;
-            let audio_delta_samples = raw_delta.clamp(-max_delta, max_delta);
-            let audio_delta_secs = audio_delta_samples as f64 / sr;
+            let max_delta = sr_comp as i64;
+            let audio_delta_secs = raw_delta.clamp(-max_delta, max_delta) as f64 / sr_comp;
+            let pitch = value_at(&pn.dn.note.pitch_points, pn.lookup_row).unwrap_or(C5_HZ);
+            let ratio = (pitch / C5_HZ).max(1e-6);
             ph.position += audio_delta_secs * sample_rate_f * ratio;
             ph.last_audio_pos = pos;
         }
 
-        if loop_pts.is_some() {
-            ph.position = wrapped_pos(ph.position, loop_pts);
+        ph.position = if loop_pts.is_some() {
+            wrapped_pos(ph.position, loop_pts)
         } else {
-            ph.position = ph.position.clamp(0.0, nf);
-        }
+            ph.position.clamp(0.0, nf)
+        };
 
         let t = (ph.position / nf).clamp(0.0, 1.0);
-        let row = ((t * pixel_rows as f64).floor() as usize)
-        .min(pixel_rows.saturating_sub(1));
+        let row = ((t * pixel_rows as f64).floor() as usize).min(pixel_rows.saturating_sub(1));
         playhead_pys.push(Some(row));
     }
 
@@ -467,29 +227,23 @@ pub fn draw(
     let muted_bg = theme.color(Token::MutedBg);
     let playhead_fg = theme.color(Token::Playhead);
 
+    // Header.
     let mut header: Vec<Span> = Vec::new();
     let mut hit_columns: Vec<TrackerColumnHit> = Vec::with_capacity(visible_cols);
     let mut x_cursor: u16 = 0;
-    for col in 0..visible_cols {
-        let path = &path_order[col];
-        let label_text = by_path[path]
-        .first()
-        .map(|(name, _, _, _)| {
-            p.line_block_title(li, name).unwrap_or(name).to_string()
-        })
-        .unwrap_or_else(|| "(?)".to_string());
 
-        let has_chain = !chain_names_per_col[col].is_empty();
-        let expanded = state.expanded_chains.contains(path.as_str());
+    for col in 0..visible_cols {
+        let part = &prep.parts[col];
+        let label_text = p.line_block_title(li, &part.first_name)
+        .unwrap_or(&part.first_name).to_string();
+
+        let has_chain = !part.shim_names.is_empty();
+        let expanded = state.expanded_chains.contains(part.path.as_str());
         let marker_chars = if has_chain { 1 } else { 0 };
 
-        let vol = part_volume::get(path);
-        let show_vol = p.part_supports_volume(path);
-        let vol_tag = if show_vol && (vol - 1.0).abs() > 0.01 {
-            format!(" {}%", (vol * 100.0).round() as i64)
-        } else {
-            String::new()
-        };
+        let vol_tag = if part.show_vol && (part.vol - 1.0).abs() > 0.01 {
+            format!(" {}%", (part.vol * 100.0).round() as i64)
+        } else { String::new() };
         let tag_chars = vol_tag.chars().count();
         let avail = col_w.saturating_sub(tag_chars + marker_chars);
 
@@ -499,28 +253,15 @@ pub fn draw(
                 let mut s: String = label_text.chars().take(avail - 1).collect();
                 s.push('…');
                 s
-            } else {
-                label_text.chars().take(avail).collect()
-            }
-        } else {
-            label_text
-        };
+            } else { label_text.chars().take(avail).collect() }
+        } else { label_text };
 
-        let style = label::header_style(path, muted_parts, soloed_part, &theme);
-
-        // A part with a chain keeps its marker right after the name; the
-        // column is padded out to col_w after the marker instead.
-        let fill = if has_chain {
-            trimmed.chars().count().min(avail)
-        } else {
-            avail
-        };
+        let style = label::header_style(&part.path, &HashSet::new(), None, &theme);
+        let fill = if has_chain { trimmed.chars().count().min(avail) } else { avail };
         let padded = format!("{:<width$}", trimmed, width = fill);
-        // Measure label::split output and force exactly `avail` cells.
-        // If it returns more (unexpected prefix, encoding quirks), truncate;
-        // if fewer, pad.  Guarantees vol_tag + marker land at intended cells.
+
         let mut label_len = 0usize;
-        for span in label::split(&padded, style, &theme, &labels_cfg, col_playing[col]) {
+        for span in label::split(&padded, style, &theme, &labels_cfg, part.is_playing_now) {
             let sw = span.content.chars().count();
             if label_len + sw <= fill {
                 label_len += sw;
@@ -535,30 +276,17 @@ pub fn draw(
                 break;
             }
         }
-        while label_len < fill {
-            header.push(Span::raw(" "));
-            label_len += 1;
-        }
+        while label_len < fill { header.push(Span::raw(" ")); label_len += 1; }
 
         if !vol_tag.is_empty() {
             header.push(Span::styled(vol_tag, style.add_modifier(Modifier::DIM)));
         }
         if has_chain {
             let marker = if expanded { "↴" } else { "@" };
-            // Distinct style so it's obvious whether it renders at all.
             header.push(Span::styled(
                 marker,
-                Style::default()
-                .fg(ratatui::style::Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+                Style::default().fg(ratatui::style::Color::Yellow).add_modifier(Modifier::BOLD),
             ));
-            if std::env::var_os("SHIMS_DEBUG").is_some() {
-                let total: usize = header.iter().map(|s| s.content.chars().count()).sum();
-                eprintln!(
-                    "header col={} has_chain marker={:?} header_chars={} col_w={} avail={}",
-                    col, marker, total, col_w, avail
-                );
-            }
         }
         for _ in (fill + tag_chars + marker_chars)..col_w {
             header.push(Span::raw(" "));
@@ -568,12 +296,10 @@ pub fn draw(
         let marker_x = if has_chain {
             let mx = x_cursor + (fill + tag_chars) as u16;
             Some((mx, mx + 1))
-        } else {
-            None
-        };
+        } else { None };
 
         hit_columns.push(TrackerColumnHit {
-            path: path.clone(),
+            path: part.path.clone(),
                          x_start: x_cursor,
                          width: col_w as u16,
                          header_y: 0,
@@ -583,20 +309,20 @@ pub fn draw(
         x_cursor += col_w as u16 + 1;
     }
 
+    // Rows.
     let mut lines: Vec<Line> = Vec::with_capacity(char_rows + 1);
     lines.push(Line::from(header));
 
     for r in 0..char_rows {
         let mut spans: Vec<Span> = Vec::new();
         for col in 0..visible_cols {
-            let path = &path_order[col];
-            let chain_rows = chain_rows_per_col[col];
+            let part = &prep.parts[col];
+            let chain_rows = if state.expanded_chains.contains(part.path.as_str()) {
+                part.shim_names.len()
+            } else { 0 };
 
-            let solo_hides_col = soloed_part.map_or(false, |s| s != path.as_str());
-            let is_muted_col = muted_parts.contains(path);
-
-            let playhead_char: Option<usize> =
-            playhead_pys[col].map(|py| py / 4 + chain_rows);
+            let solo_hides_col = part.is_soloed_out;
+            let playhead_char = playhead_pys[col].map(|py| py / 4 + chain_rows);
 
             for cx in 0..col_w {
                 let mut bits: u8 = 0;
@@ -607,81 +333,53 @@ pub fn draw(
                     if py >= pixel_rows { continue; }
                     let px0 = cx * 2;
                     let px1 = cx * 2 + 1;
-                    if px0 < col_w * 2 && dot_matrices[col][py][px0] {
-                        bits |= dot_bit(0, ly);
-                    }
-                    if px1 < col_w * 2 && dot_matrices[col][py][px1] {
-                        bits |= dot_bit(1, ly);
-                    }
+                    if px0 < col_w * 2 && dot_matrices[col][py][px0] { bits |= dot_bit(0, ly); }
+                    if px1 < col_w * 2 && dot_matrices[col][py][px1] { bits |= dot_bit(1, ly); }
                 }
 
                 let row_entry = columns[col].get(r);
-                let (cell_text, is_note_muted): (Option<(String, Style)>, bool) =
-                match row_entry {
+                let (cell_text, is_note_muted): (Option<(String, Style)>, bool) = match row_entry {
                     Some(ColumnLine::Note(dn)) => {
-                        let lines_back = (dn.value_offset / rpmeasure).round() as usize;
-                        let block_line = li.saturating_sub(lines_back);
-                        let start_row = dn.note.start_row as i64;
-                        let note_muted = muted_notes.contains(&(
-                            dn.source_name.clone(),
-                                                                block_line,
-                                                                start_row,
-                        ));
-
-                        let note_local_row = dn.value_offset + current_row;
-                        let lookup_row = note_local_row.max(dn.note.start_row);
-
-                        let playing = dn.display_end > 0.0
-                        && dn.display_start <= current_row
-                        && current_row < dn.display_end;
-                        let played = !playing
-                        && (dn.display_end == 0.0
-                        || current_row >= dn.display_end);
-
-                        let state_note = if playing {
-                            NoteState::Playing
-                        } else if played {
-                            NoteState::Played
-                        } else if dn.note.start_row >= rpmeasure {
-                            NoteState::Future
+                        // Find the matching PreparedNote for style lookup.
+                        // FIX: We must match the exact pitch as well, otherwise
+                        // all notes in a chord will inherit the style of the first one.
+                        let pnote = part.notes.iter().find(|pn| {
+                            pn.dn.source_name == dn.source_name
+                            && pn.dn.note.start_row == dn.note.start_row
+                            && pn.dn.value_offset == dn.value_offset
+                            && pn.dn.note.pitch_points.first().map(|p| p.value as i64)
+                            == dn.note.pitch_points.first().map(|p| p.value as i64)
+                        });
+                        if let Some(pn) = pnote {
+                            let text = fmt_note(&pn.dn.note, pn.lookup_row, pn.dn.subs, pn.note_state);
+                            (Some((text, pn.style)), pn.is_muted)
                         } else {
-                            NoteState::Waiting
-                        };
-
-                        let text = fmt_note(&dn.note, lookup_row, dn.subs, state_note);
-                        let pitch = value_at(&dn.note.pitch_points, lookup_row)
-                        .unwrap_or(440.0);
-                        let vol = value_at(&dn.note.vol_points, lookup_row)
-                        .unwrap_or(100.0);
-                        let sty = note_style(pitch, vol, state_note, &theme, &synth);
-                        (Some((text, sty)), note_muted)
+                            // Fallback: shouldn't happen since we built from part.notes.
+                            let text = fmt_note(&dn.note, 0.0, dn.subs, NoteState::Played);
+                            (Some((text, Style::default())), false)
+                        }
                     }
                     Some(ColumnLine::Divider { label }) => (
-                        Some((
-                            label.clone(),
-                              Style::default()
-                              .fg(ratatui::style::Color::DarkGray)
-                              .add_modifier(Modifier::ITALIC),
-                        )),
-                        false,
+                        Some((label.clone(), Style::default().fg(ratatui::style::Color::DarkGray).add_modifier(Modifier::ITALIC))),
+                                                            false,
                     ),
                     None => (None, false),
                 };
 
-                let text_char: Option<char> = cell_text
-                .as_ref()
+                let text_char: Option<char> = cell_text.as_ref()
                 .and_then(|(t, _)| t.chars().nth(cx));
 
                 let under_playhead = playhead_char == Some(r);
-                let off = is_muted_col || solo_hides_col || is_note_muted;
+                let off = part.is_muted || solo_hides_col || is_note_muted;
 
                 if let Some(ch) = text_char {
+                    let base_style = cell_text.as_ref().unwrap().1;
                     let style = if off {
                         Style::default().fg(muted_fg).bg(muted_bg)
                     } else if under_playhead {
-                        cell_text.as_ref().unwrap().1.fg(playhead_fg)
+                        base_style.fg(playhead_fg)
                     } else {
-                        cell_text.as_ref().unwrap().1
+                        base_style
                     };
                     spans.push(Span::styled(ch.to_string(), style));
                 } else if bits != 0 {
@@ -697,10 +395,7 @@ pub fn draw(
                 } else if off {
                     spans.push(Span::styled(" ", Style::default().bg(muted_bg)));
                 } else if under_playhead {
-                    spans.push(Span::styled(
-                        playhead_marker.clone(),
-                                            Style::default().fg(playhead_fg),
-                    ));
+                    spans.push(Span::styled(playhead_marker.clone(), Style::default().fg(playhead_fg)));
                 } else {
                     spans.push(Span::raw(" "));
                 }
@@ -712,8 +407,5 @@ pub fn draw(
 
     f.render_widget(Paragraph::new(lines).block(outer), area);
 
-    state.tracker_hit = Some(TrackerHit {
-        inner,
-        columns: hit_columns,
-    });
+    state.tracker_hit = Some(TrackerHit { inner, columns: hit_columns });
 }

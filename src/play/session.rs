@@ -351,35 +351,46 @@ pub fn play_one(
             }
         });
 
+        // FIX: supply all 7 arguments. `transport` is still needed after the
+        // call, so clone the Arc; `term` is still needed for `tui::restore`,
+        // so reborrow it explicitly. `project`, `queue`, `settings`, and
+        // `media_rx` are not used again, so they can move.
         let (outcome, _queue) = tui::run_against(
-            term,
+            &mut *term,
             Arc::clone(&transport),
-                                                 Arc::clone(&project),
+                                                 project,
                                                  sample_rate,
                                                  queue,
                                                  settings,
                                                  media_rx,
         )?;
 
-        // Restore the terminal IMMEDIATELY so the user sees the menu even if
-        // VST cleanup later hangs.
+        // Restore the terminal immediately
         let _ = tui::restore(term);
-
-        // Signal the audio callback to stop. It checks `tp.stop` at the top of
-        // every block and returns silence — so from this point on the audio
-        // thread does almost nothing.
         transport.stop.store(true, Ordering::Relaxed);
 
-        // cpal::Stream is !Send (it holds PhantomData<*mut ()>). It cannot be
-        // moved to a background thread, and dropping it inline blocks the main
-        // thread until the audio callback returns — which can be forever if a
-        // plugin hangs inside a DSP call.
+        // Drop the stream on a background thread so a hanging VST doesn't freeze the TUI.
+        // We DO join it (with a generous timeout) so the ALSA device is properly closed
+        // before the next song starts.
         //
-        // So we leak it. The stream stays alive until process exit, the callback
-        // does nothing but zero its output buffer, and the menu returns instantly.
-        // Only cost: the audio device handle stays open. When the user quits,
-        // process exit reclaims it.
-        std::mem::forget(stream);
+        // cpal's `Stream` is `!Send` (it wraps `PhantomData<*mut ()>`). We're only
+        // moving it across threads so it can be *dropped* there, after `transport.stop`
+        // has parked the audio callback — so the wrapper below is safe.
+        struct SendStream(cpal::Stream);
+        unsafe impl Send for SendStream {}
 
+        let (tx, rx) = std::sync::mpsc::channel();
+        let send_stream = SendStream(stream);
+        std::thread::spawn(move || {
+            // NB: `drop(send_stream)` (whole wrapper), not `drop(send_stream.0)`.
+            // Rust 2021 precise capture would otherwise capture just `.0`,
+            // which is `!Send`, defeating the `unsafe impl Send`.
+            drop(send_stream);
+            let _ = tx.send(());
+        });
+
+        // Wait up to 2 seconds for the audio thread to cleanly drop the stream.
+        // If it takes longer, we proceed anyway to avoid freezing the menu forever.
+        let _ = rx.recv_timeout(std::time::Duration::from_secs(2));
         Ok(outcome)
 }
