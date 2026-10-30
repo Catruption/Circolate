@@ -13,17 +13,14 @@ const EXPLANATION_SLOTS: usize = 4;
 
 pub fn draw(f: &mut Frame<'_>, area: Rect, theme: &Theme, line_idx: usize, report: &AnalysisReport) {
     let w = (area.width * 85 / 100).min(100).min(area.width.saturating_sub(4));
-    let h = (area.height * 80 / 100).min(35).min(area.height.saturating_sub(4));
+    let h = (area.height * 80 / 100).min(40).min(area.height.saturating_sub(4));
 
     let x = area.x + (area.width.saturating_sub(w)) / 2;
-
-    // FIXED: Biased vertical centering.
-    // Instead of 50/50, we put 60% of the empty space above the popup, and 40% below.
+    
+    // Push the modal down slightly so it doesn't obscure the top of the tracker
     let y = area.y + (area.height.saturating_sub(h) * 6) / 10;
-
-    // Safety clamp just in case the terminal is very small
     let y = y.min(area.y + area.height.saturating_sub(h));
-
+    
     let rect = Rect::new(x, y, w, h);
 
     f.render_widget(Clear, rect);
@@ -40,16 +37,16 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, theme: &Theme, line_idx: usize, repor
     lines.push(Line::from(Span::styled(" CONTEXT", header_style)));
     lines.push(Line::from(vec![
         Span::styled("   Scale      ", key_style),
-                          Span::styled(&report.scale, desc_style),
+        Span::styled(&report.scale, desc_style),
     ]));
     lines.push(Line::from(vec![
         Span::styled("   Contour    ", key_style),
-                          Span::styled(&report.contour, desc_style),
+        Span::styled(&report.contour, desc_style),
     ]));
     let motif_text = report.motif.as_deref().unwrap_or("—");
     lines.push(Line::from(vec![
         Span::styled("   Motif      ", key_style),
-                          Span::styled(motif_text, desc_style),
+        Span::styled(motif_text, desc_style),
     ]));
     lines.push(Line::from(""));
 
@@ -57,13 +54,13 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, theme: &Theme, line_idx: usize, repor
     lines.push(Line::from(Span::styled(" HARMONY", header_style)));
     lines.push(Line::from(vec![
         Span::styled("   Root       ", key_style),
-                          Span::styled(&report.root, desc_style),
+        Span::styled(&report.root, desc_style),
     ]));
     lines.push(Line::from(vec![
         Span::styled("   Chord      ", key_style),
-                          Span::styled(&report.chord, Style::default().fg(Color::Green).bg(help_bg).add_modifier(Modifier::BOLD)),
+        Span::styled(&report.chord, Style::default().fg(Color::Green).bg(help_bg).add_modifier(Modifier::BOLD)),
     ]));
-
+    
     let intervals_str = if report.intervals.is_empty() {
         "—".to_string()
     } else if report.intervals.len() > 5 {
@@ -73,7 +70,31 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, theme: &Theme, line_idx: usize, repor
     };
     lines.push(Line::from(vec![
         Span::styled("   Intervals  ", key_style),
-                          Span::styled(intervals_str, desc_style),
+        Span::styled(intervals_str, desc_style),
+    ]));
+    lines.push(Line::from(""));
+
+    // ── Motion ──
+    lines.push(Line::from(Span::styled(" MOTION", header_style)));
+    lines.push(Line::from(vec![
+        Span::styled("   Anchor     ", key_style),
+        Span::styled(if report.motion_anchor { "Yes (static pedal)" } else { "—" }, if report.motion_anchor { Style::default().fg(Color::Yellow).bg(help_bg) } else { desc_style }),
+    ]));
+    
+    let leap_str = if report.motion_leap == 0 {
+        "—".to_string()
+    } else if report.motion_leap > 0 {
+        format!("+{} semitones", report.motion_leap)
+    } else {
+        format!("{} semitones", report.motion_leap)
+    };
+    lines.push(Line::from(vec![
+        Span::styled("   Leap       ", key_style),
+        Span::styled(leap_str, desc_style),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("   Register   ", key_style),
+        Span::styled(&report.motion_register, desc_style),
     ]));
     lines.push(Line::from(""));
 
@@ -81,7 +102,7 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, theme: &Theme, line_idx: usize, repor
     lines.push(Line::from(Span::styled(" CHROMATIC GRID", header_style)));
     lines.push(Line::from(vec![
         Span::raw("   "),
-                          Span::styled(&report.chromatic_grid, Style::default().fg(Color::Cyan).bg(help_bg)),
+        Span::styled(&report.chromatic_grid, Style::default().fg(Color::Cyan).bg(help_bg)),
     ]));
     lines.push(Line::from(Span::styled("   C  C# D  D# E  F  F# G  G# A  A# B", dim_style)));
     lines.push(Line::from(""));
@@ -93,7 +114,7 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, theme: &Theme, line_idx: usize, repor
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
             Span::styled("   • ", Style::default().fg(Color::Yellow).bg(help_bg)),
-                              Span::styled(&report.explanations[i], Style::default().fg(Color::Yellow).bg(help_bg).add_modifier(Modifier::ITALIC)),
+            Span::styled(&report.explanations[i], Style::default().fg(Color::Yellow).bg(help_bg).add_modifier(Modifier::ITALIC)),
         ]));
     }
     for _ in expl_count..EXPLANATION_SLOTS {
@@ -102,26 +123,26 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, theme: &Theme, line_idx: usize, repor
     }
 
     let block = Block::default()
-    .borders(Borders::ALL)
-    .border_set(theme.border_set())
-    .border_style(Style::default().fg(Color::Magenta))
-    .title(format!(" Analysis: Line {} ", line_idx + 1))
-    .style(Style::default().bg(help_bg));
+        .borders(Borders::ALL)
+        .border_set(theme.border_set())
+        .border_style(Style::default().fg(Color::Magenta))
+        .title(format!(" Analysis: Line {} ", line_idx + 1))
+        .style(Style::default().bg(help_bg));
 
     let chunks = Layout::default()
-    .direction(Direction::Vertical)
-    .constraints([
-        Constraint::Min(0),
-                 Constraint::Length(2),
-    ])
-    .split(block.inner(rect));
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(2),
+        ])
+        .split(block.inner(rect));
 
     f.render_widget(block, rect);
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: true });
     f.render_widget(paragraph, chunks[0]);
 
     let footer = Paragraph::new(" Press [Esc] or [A] to close")
-    .style(dim_style)
-    .alignment(ratatui::layout::Alignment::Center);
+        .style(dim_style)
+        .alignment(ratatui::layout::Alignment::Center);
     f.render_widget(footer, chunks[1]);
 }

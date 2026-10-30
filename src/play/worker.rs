@@ -1,60 +1,107 @@
 //! Loader worker thread and live-reload watcher.
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
+use crate::deps::requires;
+use crate::fidelity::FIDELITY_FILENAME;
 use crate::player::{self, Cache, Loader, Msg, Project, Transport};
-
-use super::audio::Silence;
 
 pub struct ReloadSlot {
     pub pending: Mutex<Option<(Arc<Project>, Arc<Mutex<Cache>>)>>,
 }
 
+/// (path, length, mtime) of every file whose change should trigger a
+/// reload: the trackscript, samples.json, the fidelity and requires
+/// sidecars, and everything in `instruments/`.
+type Signature = Vec<(PathBuf, u64, Option<SystemTime>)>;
+
+fn signature(main: &Path) -> Signature {
+    let base = main.parent().unwrap_or_else(|| Path::new("."));
+    let mut files: Vec<PathBuf> = vec![
+        main.to_path_buf(),
+        base.join("samples.json"),
+        base.join(FIDELITY_FILENAME),
+        base.join(requires::FILENAME),
+    ];
+    if let Ok(rd) = std::fs::read_dir(base.join("instruments")) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_file() {
+                files.push(p);
+            }
+        }
+    }
+    files.sort();
+    files
+        .into_iter()
+        .map(|p| {
+            let m = std::fs::metadata(&p).ok();
+            let len = m.as_ref().map_or(0, |m| m.len());
+            let mtime = m.and_then(|m| m.modified().ok());
+            (p, len, mtime)
+        })
+        .collect()
+}
+
+/// Poll the project's files and publish a freshly loaded project into
+/// `slot` whenever any of them changes.
+///
+/// `_initial_hashes` is kept so the caller doesn't change; it is unused
+/// because comparing part hashes made edits to anything but notes
+/// (instruments, arrangement, tempo, volume) invisible.
 pub fn watch_for_changes(
-    path: std::path::PathBuf,
+    path: PathBuf,
     rate: u32,
     use_cache: bool,
     slot: Arc<ReloadSlot>,
     tp: Arc<Transport>,
-    mut last_hashes: std::collections::HashMap<String, u64>,
+    _initial_hashes: HashMap<String, u64>,
 ) {
-    let mut last_mtime = std::fs::metadata(&path)
-    .and_then(|m| m.modified())
-    .ok();
+    const POLL: Duration = Duration::from_millis(100);
+    const SETTLE: Duration = Duration::from_millis(120);
+    const MAX_SETTLE_ROUNDS: u32 = 20;
+
+    let mut last_sig = signature(&path);
 
     while !tp.stop.load(Ordering::Relaxed) {
-        std::thread::sleep(Duration::from_millis(400));
-        let mtime = std::fs::metadata(&path)
-        .and_then(|m| m.modified())
-        .ok();
-        if mtime == last_mtime {
+        std::thread::sleep(POLL);
+        let sig = signature(&path);
+        if sig == last_sig {
             continue;
         }
-        std::thread::sleep(Duration::from_millis(300));
-        let settled = std::fs::metadata(&path)
-        .and_then(|m| m.modified())
-        .ok();
-        if settled != mtime {
-            continue;
-        }
-        let _s = Silence::new();
-        match player::load_project(&path, rate, use_cache, true) {
-            Ok((project, cache)) => {
-                let new_hashes = project.part_hash_map().clone();
-                if new_hashes == last_hashes {
-                    last_mtime = mtime;
-                    continue;
-                }
-                last_hashes = new_hashes;
-                if let Ok(mut g) = slot.pending.lock() {
-                    *g = Some((project, Arc::new(Mutex::new(cache))));
-                }
-                last_mtime = mtime;
+
+        // Debounce: wait until the files stop changing (editors often
+        // write a temp file, then rename, then touch sidecars).
+        let mut cur = sig;
+        for _ in 0..MAX_SETTLE_ROUNDS {
+            std::thread::sleep(SETTLE);
+            if tp.stop.load(Ordering::Relaxed) {
+                return;
             }
-            Err(_) => {}
+            let next = signature(&path);
+            let stable = next == cur;
+            cur = next;
+            if stable {
+                break;
+            }
+        }
+        // Recorded *before* loading: a save that lands during the load
+        // differs from this and triggers another reload.  It is also
+        // recorded when the load fails, so a half-typed file isn't
+        // re-parsed every poll.
+        last_sig = cur;
+
+        // No `Silence` here: it dup2()s the process-wide stdout/stderr,
+        // which the TUI is drawing to while this thread runs.
+        if let Ok((project, cache)) = player::load_project(&path, rate, use_cache, true) {
+            if let Ok(mut g) = slot.pending.lock() {
+                *g = Some((project, Arc::new(Mutex::new(cache))));
+            }
         }
     }
 }

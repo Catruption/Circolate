@@ -2,6 +2,7 @@
 //! Central log bus.
 
 pub mod spec;
+pub mod pipe;
 
 pub use spec::{Category, Level, LogEvent, CATEGORIES, CATEGORY_COUNT};
 

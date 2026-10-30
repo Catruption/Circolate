@@ -88,6 +88,7 @@ pub(crate) struct Sf2VoiceSpec {
     pub pan: f64,
 }
 
+#[derive(Clone)]
 struct Sf2ZoneEntry {
     key_lo: u8,
     key_hi: u8,
@@ -103,11 +104,22 @@ struct Sf2ZoneEntry {
     env: Sf2VoiceEnvelope,
 }
 
+#[derive(Clone)]
 pub(crate) struct Sf2Instrument {
     zones: Vec<Sf2ZoneEntry>,
 }
 
 impl Sf2Instrument {
+    /// Copy of this instrument with every sample id shifted by `delta`,
+    /// so one cached build can be placed at any id range.
+    pub(crate) fn rebased(&self, delta: u32) -> Sf2Instrument {
+        let mut zones = self.zones.clone();
+        for z in &mut zones {
+            z.sample_id += delta;
+        }
+        Sf2Instrument { zones }
+    }
+
     pub(crate) fn zone_count_hint(&self) -> u32 {
         self.zones.len() as u32
     }

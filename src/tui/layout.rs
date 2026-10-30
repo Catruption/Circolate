@@ -19,6 +19,7 @@ pub const QUEUE_MIN_CONTENT_H: u16 = 1 + VISIBLE_LINES as u16;
 /// One row of the queue box's border, described as coordinates so the
 /// renderer knows where to place corners and how far the frame's left
 /// wall runs before the tape row takes over.
+#[derive(Clone)]
 pub struct BorderRows {
     pub top_y: u16,
     pub left_x: u16,
@@ -28,6 +29,7 @@ pub struct BorderRows {
 
 /// Where the queue box goes and how its interior is divided.  All rects
 /// are absolute (terminal coordinates).
+#[derive(Clone)]
 pub struct QueueLayout {
     /// The whole box, including borders.  Used for click exclusion and
     /// for the notch strip's `max_x` bound.

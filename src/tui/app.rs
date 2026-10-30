@@ -1,6 +1,5 @@
 //! Terminal lifecycle, event loop, key and mouse handling.
 
-use std::io::{self, Stdout};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,6 +33,7 @@ const REWIND_COOLDOWN_MS: u64 = 1000;
 const SPEED_STEPS: &[i64] = &[1, 4, 16];
 const HOLD_WINDOW_MS: u128 = 250;
 const DOUBLE_CLICK_MS: u128 = 350;
+const PERF_POLL_MS: u128 = 1000;
 
 #[derive(Debug, Clone)]
 pub enum LoopOutcome {
@@ -50,10 +50,19 @@ macro_rules! tui_dbg {
 
 // ── terminal lifecycle ─────────────────────────────────────────────────
 
-pub fn setup() -> Result<Terminal<CrosstermBackend<Stdout>>> {
+// FIXED: Use /dev/tty directly so we can silence fd 1 (stdout) without breaking the TUI.
+pub type TuiBackend = CrosstermBackend<std::fs::File>;
+
+pub fn setup() -> Result<Terminal<TuiBackend>> {
     enable_raw_mode()?;
-    let mut out = io::stdout();
-    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
+
+    // Open the terminal directly, bypassing fd 1
+    let out = std::fs::OpenOptions::new()
+    .read(true)
+    .write(true)
+    .open("/dev/tty")?;
+
+    execute!(out.try_clone()?, EnterAlternateScreen, EnableMouseCapture)?;
 
     #[cfg(unix)]
     unsafe {
@@ -66,7 +75,9 @@ pub fn setup() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     std::panic::set_hook(Box::new(move |info| {
         crate::tui::logs::uninstall();
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture, Show);
+        if let Ok(mut out) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+            let _ = execute!(out, LeaveAlternateScreen, DisableMouseCapture, Show);
+        }
         prev_hook(info);
     }));
     crate::tui::logs::install();
@@ -94,13 +105,15 @@ extern "C" fn handle_signal(sig: libc::c_int) {
         crate::tui::logs::uninstall();
         libc::signal(sig, libc::SIG_IGN);
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture, Show);
+        if let Ok(mut out) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+            let _ = execute!(out, LeaveAlternateScreen, DisableMouseCapture, Show);
+        }
         libc::signal(sig, libc::SIG_DFL);
         libc::raise(sig);
     }
 }
 
-pub fn restore(t: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+pub fn restore(t: &mut Terminal<TuiBackend>) -> Result<()> {
     crate::tui::logs::uninstall();
     disable_raw_mode()?;
     execute!(t.backend_mut(), LeaveAlternateScreen, DisableMouseCapture, Show)?;
@@ -111,7 +124,7 @@ pub fn restore(t: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
 // ── session entry points ───────────────────────────────────────────────
 
 pub fn show_loading(
-    term: &mut Terminal<CrosstermBackend<Stdout>>,
+    term: &mut Terminal<TuiBackend>,
     queue: &QueueState,
     settings: &Settings,
     msg: &str,
@@ -138,7 +151,7 @@ pub fn show_loading(
 }
 
 pub fn run_against(
-    term: &mut Terminal<CrosstermBackend<Stdout>>,
+    term: &mut Terminal<TuiBackend>,
     transport: Arc<Transport>,
     project: Arc<Project>,
     sample_rate: u32,
@@ -155,7 +168,7 @@ pub fn run_against(
 // ── event loop ─────────────────────────────────────────────────────────
 
 fn event_loop(
-    term: &mut Terminal<CrosstermBackend<Stdout>>,
+    term: &mut Terminal<TuiBackend>,
     tp: &Arc<Transport>,
     project: &Arc<Project>,
     sample_rate: u32,
@@ -208,6 +221,25 @@ fn event_loop(
         }
         // ──────────────────────────────────
 
+        // ── PERF POLL (once per second) ──
+        let perf_now = std::time::Instant::now();
+        if perf_now.duration_since(state.perf_last_poll).as_millis() >= PERF_POLL_MS {
+            let snap = crate::player::perf::perf_snapshot();
+            crate::log_event!(
+                "player.perf",
+                load: format!("{:.3}", snap.load),
+                              worst: format!("{:.3}", snap.worst),
+                              overruns: snap.overruns,
+                              voices: format!("{:.3}", snap.voices),
+                              vst: format!("{:.3}", snap.vst),
+                              shim: format!("{:.3}", snap.shim),
+                              fx: format!("{:.3}", snap.fx),
+            );
+            state.perf_snapshot = Some(snap);
+            state.perf_last_poll = perf_now;
+        }
+        // ────────────────────────────────
+
         let wraps = tp.loop_wraps.load(Ordering::Acquire);
         while seen_wraps < wraps {
             seen_wraps += 1;
@@ -257,7 +289,6 @@ fn event_loop(
                     // ── ANALYSIS MODAL ──
                     if k.kind != KeyEventKind::Release {
                         if state.player.show_analysis {
-                            // If the modal is open, intercept Esc, A, a, or q to close it
                             if k.code == KeyCode::Esc
                                 || k.code == KeyCode::Char('A')
                                 || k.code == KeyCode::Char('a')
@@ -266,11 +297,9 @@ fn event_loop(
                                     state.player.show_analysis = false;
                                     continue;
                                 }
-                                // Otherwise, fall through to let keys (play/pause/seek) work!
                         } else if (k.code == KeyCode::Char('A') || k.code == KeyCode::Char('a'))
                             && !state.queue.focused
                             {
-                                // If modal is closed AND we are not typing in the queue, 'A' opens it
                                 state.player.show_analysis = true;
                                 state.player.show_help = false;
                                 state.player.show_config = false;

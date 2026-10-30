@@ -9,11 +9,29 @@ use crate::tui::config::Settings;
 use crate::tui::widgets::config::ConfigUi;
 use crate::tui::widgets::cover::Cover;
 use crate::tui::spiral::SpiralLayout;
+use crate::tui::layout::QueueLayout;
 
 pub const VISIBLE_LINES: usize = 5;
 pub const GUTTER_W: u16 = 3;
 pub const TEXT_W: u16 = 50;
 pub const BUF_W: u16 = 20;
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SpiralCacheKey {
+    pub total_measures: usize,
+    pub aspect: usize,
+    pub budget_w: usize,
+    pub budget_h: usize,
+    pub tape_left: u16,
+    pub area: Rect,
+    pub tape_rows: u16,
+    pub speed_label_w: u16,
+}
+
+pub struct SpiralCache {
+    pub key: SpiralCacheKey,
+    pub result: Option<(SpiralLayout, QueueLayout)>,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct MenuState {
@@ -39,7 +57,7 @@ impl MenuState {
 pub struct PlayerState {
     pub show_help: bool,
     pub show_config: bool,
-    pub show_analysis: bool, // Added
+    pub show_analysis: bool,
     pub loop_enabled: bool,
     pub loop_measures: HashSet<usize>,
     pub last_loop_check_measure: Option<usize>,
@@ -72,8 +90,6 @@ pub struct QueueState {
     pub speed_label: String,
 }
 
-/// Byte index of the `char_idx`-th character in `s`.  Returns `s.len()`
-/// when `char_idx` is at or past the end.
 fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
     s.char_indices()
     .nth(char_idx)
@@ -176,8 +192,6 @@ impl QueueState {
 
         let line = &mut self.lines[row];
 
-        // If we are currently playing this line, we can go down to 0 (which means skip).
-        // Otherwise, the minimum is 1.
         let lo: i32 = if self.playing == Some(row) { 0 } else { 1 };
         let span = MAX_LOOP - lo + 1;
 
@@ -344,6 +358,10 @@ pub struct RenderState {
     pub last_dir_press: Option<(KeyCode, Instant)>,
     pub rewind_cooldown_until: Option<Instant>,
 
+    pub perf_last_poll: Instant,
+    pub(crate) perf_snapshot: Option<crate::player::perf::PerfSnapshot>,
+    pub spiral_cache: Option<SpiralCache>,
+
     pub menu: MenuState,
 }
 
@@ -380,6 +398,10 @@ impl RenderState {
             volume_last_poll: Instant::now(),
             last_dir_press: None,
             rewind_cooldown_until: None,
+
+            perf_last_poll: Instant::now(),
+            perf_snapshot: None,
+            spiral_cache: None,
 
             menu: MenuState::new(),
         }

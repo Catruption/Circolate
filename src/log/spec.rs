@@ -186,6 +186,10 @@ ev("play.session.init_done", Level::Info, Category::Player,
    "All VST hosts finished installing.", "0.1.0"),
 
 // ── Player: project load ───────────────────────────────────────────
+ev("player.perf", Level::Info, Category::Player,
+   "load={load} worst={worst} overruns={overruns} voices={voices} vst={vst} shim={shim} fx={fx}",
+   &["load", "worst", "overruns", "voices", "vst", "shim", "fx"],
+   "Per-second render load as a fraction of the audio budget.", "0.1.0"),
 ev("player.load.fidelity_summary", Level::Info, Category::Player,
    "  fidelity: {channels} channels, {automation} automation lanes, {playlist} playlist items, {inserts} insert buses, {multisample} multi-sample groups",
    &["channels", "automation", "playlist", "inserts", "multisample"],

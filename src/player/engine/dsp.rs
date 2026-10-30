@@ -45,6 +45,9 @@ const SINC_TAPS: usize = 8;
 const SINC_TAPS_BEFORE: i64 = 3;
 
 static SINC_UP: OnceLock<[[f64; SINC_TAPS]; SINC_PHASES]> = OnceLock::new();
+static SINC_UP32: OnceLock<[[f32; SINC_TAPS]; SINC_PHASES]> = OnceLock::new();
+
+const _: () = assert!(SINC_TAPS == 8, "dot8 below is unrolled for 8 taps");
 
 #[inline]
 fn sinc(x: f64) -> f64 {
@@ -82,7 +85,66 @@ pub(super) fn up_table() -> &'static [[f64; SINC_TAPS]; SINC_PHASES] {
     })
 }
 
+/// f32 copy of the sinc table, for the fast path.
+pub(super) fn up_table_f32() -> &'static [[f32; SINC_TAPS]; SINC_PHASES] {
+    SINC_UP32.get_or_init(|| {
+        let src = up_table();
+        let mut t = [[0.0f32; SINC_TAPS]; SINC_PHASES];
+        for p in 0..SINC_PHASES {
+            for k in 0..SINC_TAPS {
+                t[p][k] = src[p][k] as f32;
+            }
+        }
+        t
+    })
+}
+
+/// Build every lookup table now, not mid-callback.
+pub(super) fn init_tables() {
+    up_table();
+    up_table_f32();
+}
+
+/// 8-tap dot product as a balanced tree so the compiler can vectorize it.
+#[inline(always)]
+fn dot8(s: &[f32], w: &[f32; SINC_TAPS]) -> f32 {
+    let s: &[f32; SINC_TAPS] = s.try_into().unwrap();
+    ((s[0] * w[0] + s[4] * w[4]) + (s[1] * w[1] + s[5] * w[5]))
+        + ((s[2] * w[2] + s[6] * w[6]) + (s[3] * w[3] + s[7] * w[7]))
+}
+
+/// Sinc interpolation.  Fast path when the whole 8-sample window lies
+/// inside the sample and needs no loop wrapping (almost always);
+/// otherwise falls back to the original per-tap wrap/clamp code.
 pub(super) fn interpolate(smp: &Sample, pos: f64, _step: f64, raw_pos: f64) -> (f32, f32) {
+    let n = smp.len() as i64;
+    let center = pos.floor() as i64;
+    let lo = center - SINC_TAPS_BEFORE;
+    let hi = lo + SINC_TAPS as i64 - 1;
+
+    let clean = lo >= 0
+        && hi < n
+        && match smp.loop_pts {
+            Some((ls, le)) if le > ls => hi < le && !(raw_pos >= le as f64 && lo < ls),
+            _ => true,
+        };
+    if clean {
+        let frac = pos - center as f64;
+        let phase = ((frac * SINC_PHASES as f64) as usize) & (SINC_PHASES - 1);
+        let w = &up_table_f32()[phase];
+        let lo = lo as usize;
+        let l = dot8(&smp.left[lo..lo + SINC_TAPS], w);
+        let r = if smp.stereo {
+            dot8(&smp.right[lo..lo + SINC_TAPS], w)
+        } else {
+            l
+        };
+        return (l, r);
+    }
+    interpolate_slow(smp, pos, raw_pos)
+}
+
+fn interpolate_slow(smp: &Sample, pos: f64, raw_pos: f64) -> (f32, f32) {
     let n = smp.len() as i64;
     let center = pos.floor() as i64;
 
@@ -117,7 +179,7 @@ pub(super) fn interpolate(smp: &Sample, pos: f64, _step: f64, raw_pos: f64) -> (
 
 // ── envelope phase boundaries ──────────────────────────────────────────
 
-pub(super) struct EnvState {
+pub(crate) struct EnvState {
     pub(super) delay_sec: f64,
     pub(super) attack_end: f64,
     pub(super) hold_end: f64,
@@ -130,6 +192,17 @@ pub(super) struct EnvState {
     pub(super) decay_inv: f32,
     pub(super) release_inv: f32,
     pub(super) start_sample: i64,
+    /// Envelope level at `release_start`; filled by `with_release_level`.
+    pub(super) release_level: f32,
+}
+
+impl EnvState {
+    /// Precompute the level the release ramp starts from, so
+    /// `env_level_at` doesn't recompute it for every release sample.
+    pub(super) fn with_release_level(mut self) -> Self {
+        self.release_level = env_sustain_level(&self, self.release_start);
+        self
+    }
 }
 
 #[inline]
@@ -141,7 +214,7 @@ pub(super) fn env_level_at(state: &EnvState, t_sec: f64) -> f32 {
         return 0.0;
     }
     if t_sec >= state.release_start {
-        let at_release = env_sustain_level(state, state.release_start);
+        let at_release = state.release_level;
         let ft = ((t_sec - state.release_start) * state.release_inv as f64)
         .clamp(0.0, 1.0) as f32;
         return at_release * (1.0 - ft);

@@ -13,6 +13,8 @@ categories = ["multimedia::audio"]
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+clap-sys = "0.3"
+libloading = "0.8"
 cpal = "0.15"
 crossterm = "0.28"
 hound = "3.5"
@@ -29,6 +31,7 @@ midly = "0.5"
 lewton = "0.10"
 souvlaki = "0.7"
 arc-swap = "1"
+rayon = "1.10"
 
 [build-dependencies]
 cc = "1"

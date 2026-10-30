@@ -9,6 +9,7 @@ pub mod notes;
 pub mod project;
 pub mod render;
 pub mod scope;
+pub mod store;
 pub mod stretch;
 pub mod template;
 pub mod transport;
@@ -17,11 +18,10 @@ pub mod inserts;
 pub mod analysis;
 pub mod analysis_mir;
 pub mod theory;
+pub mod motion;      // <-- THIS LINE. If it's missing, everything breaks.
 
-// Re-exports for call sites that say `player::X` instead of the full
-// submodule path.  `pub(crate) use` rather than `pub use` because the
-// underlying items are `pub(crate)` — re-exporting them at `pub` was
-// the E0365 cluster.
+pub(crate) use engine::perf;
+
 pub(crate) use cache::Cache;
 pub(crate) use engine::{Engine, Msg};
 pub(crate) use loader::Loader;

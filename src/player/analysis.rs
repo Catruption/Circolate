@@ -5,6 +5,7 @@ use crate::player::{Project, Transport};
 use crate::player::notes::{split_notes, value_at};
 use crate::formats::trackscript::hz_to_note;
 use super::analysis_mir::{self, N, Features};
+use super::motion; // <--- Import motion
 use super::theory;
 
 pub struct AnalysisReport {
@@ -17,6 +18,10 @@ pub struct AnalysisReport {
     pub contour: String,
     pub motif: Option<String>,
     pub explanations: Vec<String>,
+    // New motion fields for the UI
+    pub motion_anchor: bool,
+    pub motion_leap: i32,
+    pub motion_register: String,
 }
 
 fn midi_to_name(midi: i32) -> String {
@@ -34,8 +39,8 @@ pub fn analyze(project: &Project, tp: &Transport, line_idx: usize) -> AnalysisRe
 
     let mut project_notes = Vec::new();
 
-    let mut measure_notes_by_part: std::collections::HashMap<String, Vec<N>> = std::collections::HashMap::new();
-    let mut prev_measure_notes_by_part: std::collections::HashMap<String, Vec<N>> = std::collections::HashMap::new();
+    let mut measure_notes_by_part: std::collections::BTreeMap<String, Vec<N>> = std::collections::BTreeMap::new();
+    let mut prev_measure_notes_by_part: std::collections::BTreeMap<String, Vec<N>> = std::collections::BTreeMap::new();
     let mut total_measure_notes = 0;
 
     let pos = tp.position.load(Ordering::Relaxed).max(0);
@@ -126,7 +131,6 @@ pub fn analyze(project: &Project, tp: &Transport, line_idx: usize) -> AnalysisRe
     active_parts.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut split = analysis_mir::Split { melody: vec![], harmony: vec![] };
-    // FIXED: added `&` to borrow instead of move
     for (name, notes) in &measure_notes_by_part {
         let part_split = analysis_mir::split_roles(notes, name);
         split.melody.extend(part_split.melody);
@@ -134,7 +138,6 @@ pub fn analyze(project: &Project, tp: &Transport, line_idx: usize) -> AnalysisRe
     }
 
     let mut prev_split = analysis_mir::Split { melody: vec![], harmony: vec![] };
-    // FIXED: added `&` to borrow instead of move
     for (name, notes) in &prev_measure_notes_by_part {
         let part_split = analysis_mir::split_roles(notes, name);
         prev_split.melody.extend(part_split.melody);
@@ -150,7 +153,6 @@ pub fn analyze(project: &Project, tp: &Transport, line_idx: usize) -> AnalysisRe
         all_pitches.dedup();
     }
 
-    // FIXED: Moved this down so unique_pcs matches the grid perfectly
     let unique_pcs: BTreeSet<i32> = all_pitches.iter().map(|p| p.rem_euclid(12)).collect();
 
     let chord_obj = analysis_mir::identify(&all_pitches);
@@ -161,7 +163,6 @@ pub fn analyze(project: &Project, tp: &Transport, line_idx: usize) -> AnalysisRe
     let roman = chord_obj.as_ref().map(|c| analysis_mir::roman(c, tonic));
     let motif = analysis_mir::find_motif(&split.melody);
 
-    // FIXED: Store the Vec in a variable so we don't return a dangling reference
     let contour_source: Vec<N> = if split.melody.is_empty() {
         measure_notes_by_part.values().flatten().cloned().collect()
     } else {
@@ -211,10 +212,15 @@ pub fn analyze(project: &Project, tp: &Transport, line_idx: usize) -> AnalysisRe
         }
     }
 
+    // --- CALCULATE MOTION ---
+    let motion_feats = motion::calculate_motion(&measure_notes_by_part.values().flatten().cloned().collect::<Vec<_>>());
+
+    let prev_motion_feats = motion::calculate_motion(&prev_measure_notes_by_part.values().flatten().cloned().collect::<Vec<_>>());
+
     let features = Features {
         chord: chord_obj.clone(),
         roman,
-        contour: contour.clone(), // <--- ADDED THIS
+        contour: contour.clone(),
         melody_mean,
         prev_melody_mean,
         onsets_per_beat,
@@ -224,6 +230,8 @@ pub fn analyze(project: &Project, tp: &Transport, line_idx: usize) -> AnalysisRe
         unique_pc_count: unique_pcs.len(),
         active_pitches: all_pitches.len(),
         average_pitch,
+        motion: motion_feats.clone(),
+        prev_motion: prev_motion_feats,
     };
 
     let explanations = theory::explain_emotional(&features);
@@ -252,6 +260,15 @@ pub fn analyze(project: &Project, tp: &Transport, line_idx: usize) -> AnalysisRe
     }
     intervals.dedup();
 
+    // Format the register for the UI
+    let motion_register = if motion_feats.highest_pitch > 72 {
+        "High".to_string()
+    } else if motion_feats.lowest_pitch < 48 {
+        "Low".to_string()
+    } else {
+        "Mid".to_string()
+    };
+
     AnalysisReport {
         active_parts,
         chord: chord_obj.map_or("None".into(), |c| c.name),
@@ -262,5 +279,8 @@ pub fn analyze(project: &Project, tp: &Transport, line_idx: usize) -> AnalysisRe
         contour,
         motif,
         explanations,
+        motion_anchor: motion_feats.is_pedal,
+        motion_leap: motion_feats.biggest_leap,
+        motion_register,
     }
 }

@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use crate::player::{Project, Transport};
 use crate::tui::layout::{self, QueueLayout};
 use crate::tui::spiral::{build_coil, coil_sizes, SpiralLayout};
-use crate::tui::state::{RenderState, BUF_W};
+use crate::tui::state::{RenderState, SpiralCacheKey, SpiralCache, BUF_W};
 use crate::tui::theme::Theme;
 use crate::tui::widgets;
 use crate::tui::widgets::cover::Cover;
@@ -55,13 +55,12 @@ pub fn draw(
     sample_rate: u32,
     state: &mut RenderState,
 ) {
-    // If we are loading, just draw the logs so we can see what's hanging!
     if let Some(msg) = &state.loading {
         let chunks = ratatui::layout::Layout::default()
         .direction(ratatui::layout::Direction::Vertical)
         .constraints([
-            ratatui::layout::Constraint::Length(3), // Top message
-                     ratatui::layout::Constraint::Min(0),    // Logs
+            ratatui::layout::Constraint::Length(3),
+                     ratatui::layout::Constraint::Min(0),
         ])
         .split(f.area());
 
@@ -70,7 +69,7 @@ pub fn draw(
         f.render_widget(header, chunks[0]);
 
         crate::tui::widgets::logs::draw(f, chunks[1], state);
-        return; // Don't draw the tracker!
+        return;
     }
     let area = f.area();
 
@@ -93,7 +92,6 @@ pub fn draw(
 
     draw_header(f, chunks[0], project, tp, sample_rate, state.loading.as_deref(), &theme);
 
-    // The bottom row belongs to the spiral's tape.
     let tape_rows: u16 = if chunks[1].height > 6 { 1 } else { 0 };
     let tracker_area = Rect { height: chunks[1].height - tape_rows, ..chunks[1] };
 
@@ -110,7 +108,6 @@ pub fn draw(
 
     widgets::cover::paint_background(f.buffer_mut(), state.cover.as_ref());
 
-    // Draw lyrics overlay
     widgets::lyrics::draw(f, chunks[1], tp, project);
 
     let spd = tp.speed.load(Ordering::Relaxed);
@@ -130,29 +127,46 @@ pub fn draw(
 
     let speed_label_w = state.queue.speed_label.chars().count() as u16;
 
-    // Try coil sizes from smallest upward; take the first whose tape fits
-    // in the room the queue box leaves.  No rendering needed during the
-    // search — `compute_queue` is pure geometry, so the loop is cheap.
-    let mut best: Option<(SpiralLayout, QueueLayout)> = None;
-    for n in coil_sizes(total_measures, aspect) {
-        let mut layout = build_coil(total_measures, n, aspect);
-        layout.tape_left = tape_left;
-        if layout.grid_w as usize > budget_w || layout.grid_h as usize > budget_h {
-            break;
-        }
-        let size = (layout.grid_w.max(1), layout.grid_h);
-        let Some(queue_layout) = layout::compute_queue(
-            chunks[1], tape_rows, size, BUF_W, speed_label_w,
-        ) else {
-            if best.is_some() { break; }
-            continue;
-        };
-        let fits = layout.tape_fits(queue_layout.spiral.x);
-        best = Some((layout, queue_layout));
-        if fits { break; }
-    }
+    let cache_key = SpiralCacheKey {
+        total_measures,
+        aspect,
+        budget_w,
+        budget_h,
+        tape_left,
+        area: chunks[1],
+        tape_rows,
+        speed_label_w,
+    };
 
-    // Draw the queue box.
+    let best = match &state.spiral_cache {
+        Some(c) if c.key == cache_key => c.result.clone(),
+        _ => {
+            let mut best: Option<(SpiralLayout, QueueLayout)> = None;
+            for n in coil_sizes(total_measures, aspect) {
+                let mut layout = build_coil(total_measures, n, aspect);
+                layout.tape_left = tape_left;
+                if layout.grid_w as usize > budget_w || layout.grid_h as usize > budget_h {
+                    break;
+                }
+                let size = (layout.grid_w.max(1), layout.grid_h);
+                let Some(queue_layout) = layout::compute_queue(
+                    chunks[1], tape_rows, size, BUF_W, speed_label_w,
+                ) else {
+                    if best.is_some() { break; }
+                    continue;
+                };
+                let fits = layout.tape_fits(queue_layout.spiral.x);
+                best = Some((layout, queue_layout));
+                if fits { break; }
+            }
+            state.spiral_cache = Some(SpiralCache {
+                key: cache_key,
+                result: best.clone(),
+            });
+            best
+        }
+    };
+
     let (spiral_layout, queue_placed) = match best {
         Some((spiral_layout, queue_layout)) => {
             let placed = widgets::queue::render(
@@ -164,7 +178,6 @@ pub fn draw(
     };
     state.queue_placed = queue_placed;
 
-    // Notch: bottom-left strip.  Bounded by the queue box on the right.
     let notch_max_x = queue_placed
     .map_or(chunks[1].right().saturating_sub(1), |q| q.box_rect.x);
     let segments = build_notch_segments(state);

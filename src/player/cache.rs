@@ -1,7 +1,7 @@
 //! Per-part template cache and fingerprinting.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -15,8 +15,16 @@ use super::types::{
 
 pub(crate) struct Cache {
     enabled: bool,
+    /// Hash of everything a template depends on besides the part itself
+    /// (sample set, instrument ids, multi-sample config).  Templates are
+    /// only inherited across a reload when this matches.
+    env: u64,
     map: HashMap<u64, Arc<PartTemplate>>,
-    stretched: HashMap<(u32, u64), Arc<Sample>>,
+    /// Keyed by the *source sample's identity* (its `Arc` pointer) and the
+    /// stretch factor, so entries stay valid across reloads that reuse the
+    /// same decoded sample.  The source `Arc` is stored in the value to
+    /// keep the pointer from being reused for a different sample.
+    stretched: HashMap<(usize, u64), (Arc<Sample>, Arc<Sample>)>,
     hits: u64,
     misses: u64,
 }
@@ -25,10 +33,53 @@ impl Cache {
     pub(crate) fn new(enabled: bool) -> Self {
         Cache {
             enabled,
+            env: 0,
             map: HashMap::new(),
             stretched: HashMap::new(),
             hits: 0,
             misses: 0,
+        }
+    }
+
+    pub(crate) fn set_env(&mut self, env: u64) {
+        self.env = env;
+    }
+
+    /// Cheap copy (the values are `Arc`s) for the reload watcher to load
+    /// against without holding the live cache's lock.
+    pub(crate) fn snapshot(&self) -> Cache {
+        Cache {
+            enabled: self.enabled,
+            env: self.env,
+            map: self.map.clone(),
+            stretched: self.stretched.clone(),
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    /// Carry reusable entries over from the previous load's cache.
+    /// `live_hashes` / `live_ptrs` are the part hashes and sample
+    /// pointers of the new project, so stale entries aren't kept.
+    pub(crate) fn inherit_from(
+        &mut self,
+        prev: &Cache,
+        live_hashes: &HashSet<u64>,
+        live_ptrs: &HashSet<usize>,
+    ) {
+        if self.enabled && prev.enabled && prev.env == self.env {
+            for (k, v) in &prev.map {
+                if live_hashes.contains(k) {
+                    self.map.entry(*k).or_insert_with(|| Arc::clone(v));
+                }
+            }
+        }
+        for (k, (src, out)) in &prev.stretched {
+            if live_ptrs.contains(&k.0) {
+                self.stretched
+                    .entry(*k)
+                    .or_insert_with(|| (Arc::clone(src), Arc::clone(out)));
+            }
         }
     }
 
@@ -66,15 +117,17 @@ impl Cache {
         t
     }
 
+    /// `_sid` is unused now (entries are keyed by sample identity); the
+    /// parameter is kept so callers don't change.
     pub(crate) fn stretched(
         &mut self,
-        sid: u32,
+        _sid: u32,
         sample: &Arc<Sample>,
         factor: f64,
     ) -> Arc<Sample> {
-        let key = (sid, factor.to_bits());
-        if let Some(s) = self.stretched.get(&key) {
-            return Arc::clone(s);
+        let key = (Arc::as_ptr(sample) as usize, factor.to_bits());
+        if let Some((_, out)) = self.stretched.get(&key) {
+            return Arc::clone(out);
         }
         let mut chans: Vec<&[f32]> = vec![&sample.left];
         if sample.stereo {
@@ -91,7 +144,7 @@ impl Cache {
             rate: sample.rate,
             loop_pts: sample.loop_pts.map(|(a, b)| (scale(a), scale(b))),
         });
-        self.stretched.insert(key, Arc::clone(&s));
+        self.stretched.insert(key, (Arc::clone(sample), Arc::clone(&s)));
         s
     }
 
@@ -110,6 +163,7 @@ fn fnv(h: &mut u64, v: u64) {
     *h = h.wrapping_mul(0x100000001b3);
 }
 
+#[allow(dead_code)]
 pub(crate) fn fingerprint(s: &Sample) -> u64 {
     let mut h = 0xcbf29ce484222325u64;
     fnv(&mut h, s.rate.to_bits());

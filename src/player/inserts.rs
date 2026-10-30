@@ -31,7 +31,7 @@ use crate::asset::AssetSource;
 use crate::deps::index::PluginIndex;
 use crate::hosting::vst::ffi::VstHost;
 
-use super::engine::Engine;
+use super::engine::{Engine, VST_BLOCK};
 use super::Project;
 
 // ── metadata (portable, no plugin loading) ────────────────────────────
@@ -185,6 +185,15 @@ pub fn load_chain_metadata(
 
 // ── audio installation (opens VST hosts) ─────────────────────────────
 
+/// Peak level (≈ -90 dBFS) below which a chain's input and output count
+/// as silent for idle-gating purposes.
+const IDLE_THRESHOLD: f32 = 3.0e-5;
+
+/// How long a chain must stay silent (input AND output) before its plugins
+/// stop being run.  Long enough to outlast reverb tails and tempo-synced
+/// delay echoes; raise it if you use delays with more than 8 s of gap.
+const IDLE_HOLD_SECS: f64 = 8.0;
+
 pub struct InsertSlot {
     pub name: String,
     pub gain: f32,
@@ -195,13 +204,46 @@ pub struct InsertChain {
     pub insert: u8,
     pub slots: Vec<InsertSlot>,
     pub volume: f32,
+    /// The chain's own in/out buffer.  Instruments mix into it, then
+    /// `process_scratch` runs the plugins over it in place.  Owning it here
+    /// lets chains be processed in parallel without aliasing.
+    pub buf_l: Vec<f32>,
+    pub buf_r: Vec<f32>,
+    idle_blocks: u32,
+    idle_hold_blocks: u32,
+}
+
+#[inline]
+fn peak(l: &[f32], r: &[f32]) -> f32 {
+    let mut m = 0.0f32;
+    for &s in l {
+        m = m.max(s.abs());
+    }
+    for &s in r {
+        m = m.max(s.abs());
+    }
+    m
 }
 
 impl InsertChain {
+    pub fn new(insert: u8, slots: Vec<InsertSlot>, volume: f32, sample_rate: u32) -> Self {
+        let hold = (IDLE_HOLD_SECS * sample_rate.max(1) as f64 / VST_BLOCK as f64) as u32;
+        InsertChain {
+            insert,
+            slots,
+            volume,
+            buf_l: vec![0.0; VST_BLOCK as usize],
+            buf_r: vec![0.0; VST_BLOCK as usize],
+            idle_blocks: 0,
+            idle_hold_blocks: hold.max(1),
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty()
     }
 
+    /// Process caller-supplied buffers in place (offline / legacy path).
     pub fn process(&mut self, l: &mut [f32], r: &mut [f32]) {
         let n = l.len().min(r.len());
         for slot in &mut self.slots {
@@ -221,6 +263,47 @@ impl InsertChain {
         }
     }
 
+    /// Process the chain's own buffers in place for the first `n` frames.
+    /// Skips the plugins entirely once input and output have been silent
+    /// for `IDLE_HOLD_SECS`; any input wakes the chain immediately.
+    pub fn process_scratch(&mut self, n: usize) {
+        let n = n.min(self.buf_l.len()).min(self.buf_r.len());
+        let in_peak = peak(&self.buf_l[..n], &self.buf_r[..n]);
+
+        if in_peak > IDLE_THRESHOLD {
+            self.idle_blocks = 0;
+        } else if self.idle_blocks >= self.idle_hold_blocks {
+            self.buf_l[..n].fill(0.0);
+            self.buf_r[..n].fill(0.0);
+            return;
+        }
+
+        let l = &mut self.buf_l[..n];
+        let r = &mut self.buf_r[..n];
+        for slot in &mut self.slots {
+            slot.host.process_inplace(&mut *l, &mut *r);
+            if (slot.gain - 1.0).abs() > 1e-4 {
+                for i in 0..n {
+                    l[i] *= slot.gain;
+                    r[i] *= slot.gain;
+                }
+            }
+        }
+        if (self.volume - 1.0).abs() > 1e-4 {
+            for i in 0..n {
+                l[i] *= self.volume;
+                r[i] *= self.volume;
+            }
+        }
+
+        let out_peak = peak(l, r);
+        if in_peak <= IDLE_THRESHOLD && out_peak <= IDLE_THRESHOLD {
+            self.idle_blocks = self.idle_blocks.saturating_add(1);
+        } else {
+            self.idle_blocks = 0;
+        }
+    }
+
     pub fn slot_count(&self) -> usize {
         self.slots.len()
     }
@@ -236,11 +319,7 @@ pub fn install_chains(engine: &mut Engine, project: &Project, sample_rate: u32) 
     let index = PluginIndex::scan();
 
     for (&insert_idx, chain) in &project.chains {
-        let mut installed = InsertChain {
-            insert: insert_idx,
-            slots: Vec::new(),
-            volume: chain.volume,
-        };
+        let mut slots: Vec<InsertSlot> = Vec::new();
 
         for slot in &chain.slots {
             let Some(plugin_path) = index.find_vst3(&slot.name).cloned() else {
@@ -256,10 +335,10 @@ pub fn install_chains(engine: &mut Engine, project: &Project, sample_rate: u32) 
                 &slot.state_bytes[..]
             };
             match VstHost::load(plugin_path.to_str().unwrap_or(""), state, sample_rate) {
-                Ok(host) => installed.slots.push(InsertSlot {
+                Ok(host) => slots.push(InsertSlot {
                     name: slot.name.clone(),
-                                                 gain: slot.gain,
-                                                 host,
+                                       gain: slot.gain,
+                                       host,
                 }),
                 Err(e) => eprintln!(
                     "  insert {:02}: failed to load '{}': {:#}",
@@ -268,8 +347,11 @@ pub fn install_chains(engine: &mut Engine, project: &Project, sample_rate: u32) 
             }
         }
 
-        if !installed.slots.is_empty() {
-            engine.install_insert_chain(insert_idx, installed);
+        if !slots.is_empty() {
+            engine.install_insert_chain(
+                insert_idx,
+                InsertChain::new(insert_idx, slots, chain.volume, sample_rate),
+            );
         }
     }
 

@@ -1,6 +1,7 @@
 //! Music Information Retrieval (MIR) helpers for player/analysis.rs.
 
 use std::collections::BTreeSet;
+use super::motion::MotionFeatures;
 
 pub const NAMES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 
@@ -121,7 +122,6 @@ pub fn identify(pitches: &[i32]) -> Option<Chord> {
                 score += 5;
             }
 
-            // FIXED: use .as_ref() to prevent moving `best`
             if best.as_ref().map_or(true, |&(b, _, _, _)| score > b) {
                 best = Some((score, root, suffix, extra_notes));
             }
@@ -161,7 +161,6 @@ const MIN: [f64; 12] = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.
 fn pearson(a: &[f64], b: &[f64]) -> f64 {
     let n = a.len() as f64;
     let (ma, mb) = (a.iter().sum::<f64>() / n, b.iter().sum::<f64>() / n);
-    // FIXED: `da` and `db` need to be mutable
     let (mut num, mut da, mut db) = (0.0, 0.0, 0.0);
     for i in 0..a.len() {
         num += (a[i] - ma) * (b[i] - mb);
@@ -263,7 +262,7 @@ pub fn find_motif(melody: &[N]) -> Option<String> {
 pub struct Features {
     pub chord: Option<Chord>,
     pub roman: Option<String>,
-    pub contour: String, // <--- ADDED THIS
+    pub contour: String,
     pub melody_mean: Option<f64>,
     pub prev_melody_mean: Option<f64>,
     pub onsets_per_beat: f64,
@@ -273,4 +272,6 @@ pub struct Features {
     pub unique_pc_count: usize,
     pub active_pitches: usize,
     pub average_pitch: Option<f64>,
+    pub motion: MotionFeatures,
+    pub prev_motion: MotionFeatures, // <--- ADD THIS
 }

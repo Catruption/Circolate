@@ -1,23 +1,11 @@
 // vst_shim.cpp — flat C ABI over the Steinberg VST3 SDK.
-//
 // [unchanged doc header]
-//
-// Controller discovery.  VST3 has three architectures in the wild:
-//   * Multi-component (most commercial plugins): IComponent and
-//     IEditController share the same class ID; createInstance with
-//     each interface from that ID works.
-//   * Single-component (JUCE, some open-source): only IComponent is
-//     registered; the same object also implements IEditController,
-//     reachable via queryInterface.
-//   * Split-registration (DPF — Dragonfly, x42, LSP, ProM): the
-//     factory advertises *two* separate kVstAudioEffectClass entries,
-//     one for the processor and one for the controller, under
-//     different class IDs.
-// The discovery path tries each in order: direct createInstance →
-// component queryInterface → factory scan over every class ID.  Only
-// the first successful path is used; if it was queryInterface the
-// `singleComponent` flag is set so terminate() isn't called twice on
-// a shared object.
+
+#if defined(__x86_64__) || defined(__i386__)
+#include <xmmintrin.h>
+#endif
+
+#define _GNU_SOURCE
 
 #include <algorithm>
 #include <cctype>
@@ -32,6 +20,11 @@
 #include <sys/stat.h>
 #include <vector>
 #include <cstdlib>
+#include <iostream>
+#include <sstream>
+#include <unistd.h>
+#include <atomic>
+#include <thread>
 
 #include "public.sdk/source/vst/hosting/module.h"
 #include "public.sdk/source/vst/hosting/hostclasses.h"
@@ -45,6 +38,14 @@
 #include "pluginterfaces/vst/ivstevents.h"
 #include "pluginterfaces/vst/ivstprocesscontext.h"
 #include "pluginterfaces/vst/vstspeaker.h"
+
+extern "C" void rust_log_callback(const char* msg);
+
+static void hook_cpp_stderr_once() {
+    // Intentionally disabled. Redirecting fd 1/2 into a pipe causes deadlocks
+    // when the pipe fills and blocks the audio thread, preventing clean exit.
+    // Plugins that spam stderr will just print to the terminal, which we accept.
+}
 
 using namespace Steinberg;
 using namespace Steinberg::Vst;
@@ -273,9 +274,6 @@ do { if (shim_debug_enabled()) std::fprintf(stderr, __VA_ARGS__); } while (0)
         return false;
     }
 
-    /// Try every plausible way of getting an IEditController for a
-    /// component that lives at `ci`.  Returns the controller (or null) and
-    /// sets `single_component` if the object is shared with the component.
     static IPtr<IEditController> discover_controller(
         const VST3::Hosting::PluginFactory& factory,
         const VST3::Hosting::ClassInfo& ci,
@@ -284,14 +282,12 @@ do { if (shim_debug_enabled()) std::fprintf(stderr, __VA_ARGS__); } while (0)
     {
         single_component = false;
 
-        // 1. Same class ID as the component (multi-component normal case).
         IPtr<IEditController> ctrl = factory.createInstance<IEditController>(ci.ID());
         if (ctrl.get()) {
             SHIM_LOG("vst_shim: controller via factory (multi-component)\n");
             return ctrl;
         }
 
-        // 2. queryInterface on the component (single-component JUCE-style).
         {
             IEditController* raw = nullptr;
             if (component->queryInterface(
@@ -305,9 +301,6 @@ do { if (shim_debug_enabled()) std::fprintf(stderr, __VA_ARGS__); } while (0)
                 }
         }
 
-        // 3. Factory scan — DPF registers a *separate* class ID for the
-        //    controller.  Try every class the factory advertises, skipping
-        //    the one we used for the component (memcmp on TUIDs).
         for (const auto& other : factory.classInfos()) {
             if (other.ID() == ci.ID()) continue;
 
@@ -330,10 +323,6 @@ do { if (shim_debug_enabled()) std::fprintf(stderr, __VA_ARGS__); } while (0)
             return false;
         }
         if (s->controller.get() && !s->singleComponent) {
-            // Multi-component plugin: separate controller instance needs
-            // its own initialize.  Single-component plugins alias component
-            // and controller — the component->initialize above already
-            // covered it.
             r = s->controller->initialize(s->host_app);
             if (r != kResultOk) {
                 SHIM_LOG("vst_shim: controller->initialize returned %d (ignoring)\n",
@@ -487,9 +476,11 @@ do { if (shim_debug_enabled()) std::fprintf(stderr, __VA_ARGS__); } while (0)
     extern "C" {
 
         void* vst_shim_create(const char* path, int sr, int block) {
+            hook_cpp_stderr_once();
+            #if defined(__x86_64__) || defined(__i386__)
+            _mm_setcsr(_mm_getcsr() | 0x8040);
+            #endif
             try {
-                // 1. Strip the display variables so JUCE plugins (Surge, Vital)
-                //    skip X11 initialization entirely.
                 unsetenv("DISPLAY");
                 unsetenv("WAYLAND_DISPLAY");
 
@@ -590,9 +581,6 @@ do { if (shim_debug_enabled()) std::fprintf(stderr, __VA_ARGS__); } while (0)
                 s->component->setActive(false);
                 s->active = false;
             }
-            // Single-component plugins alias controller and component —
-            // terminate once, on the component, so the shared object isn't
-            // torn down twice.
             if (s->controller.get() && !s->singleComponent) s->controller->terminate();
             if (s->component.get()) s->component->terminate();
 

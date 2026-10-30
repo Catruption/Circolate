@@ -217,19 +217,30 @@ pub fn hit_from_queue(state: &RenderState, m: MouseEvent) -> Option<HitAction> {
             return None;
         }
 
-        let in_rect = |rr: ratatui::layout::Rect| {
-            m.column >= rr.x
-            && m.column < rr.x + rr.width
-            && m.row >= rr.y
-            && m.row < rr.y + rr.height
-        };
+        // The spiral is drawn inside box_rect, but the spiral widget owns
+        // its own hit-testing. If the click landed on the spiral's rect,
+        // don't consume it — let the caller fall through to hit_from_spiral.
+        if m.column >= q.spiral.x
+            && m.column < q.spiral.x + q.spiral.width
+            && m.row >= q.spiral.y
+            && m.row < q.spiral.y + q.spiral.height
+            {
+                return None;
+            }
 
-        if in_rect(q.rewind) {
-            return Some(HitAction::QueueRewind);
-        }
-        if in_rect(q.play) {
-            return Some(HitAction::QueuePlay);
-        }
+            let in_rect = |rr: ratatui::layout::Rect| {
+                m.column >= rr.x
+                && m.column < rr.x + rr.width
+                && m.row >= rr.y
+                && m.row < rr.y + rr.height
+            };
+
+            if in_rect(q.rewind) {
+                return Some(HitAction::QueueRewind);
+            }
+            if in_rect(q.play) {
+                return Some(HitAction::QueuePlay);
+            }
         if in_rect(q.lines) {
             let rel_y = (m.row - q.lines.y) as usize;
             if rel_y < VISIBLE_LINES {

@@ -2,7 +2,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::timing::AutomationLane;
+use std::sync::OnceLock;
+
+use crate::timing::{AutomationLane, TempoMap};
 
 use super::cache::Cache;
 use super::engine::{gains, Scheduled, VstNote};
@@ -60,6 +62,50 @@ impl Loader {
         Loaded { samples, vsts }
     }
 
+    /// Build every template and time-stretch the song will need, without
+    /// materializing any voices.  Replaces `load_due(i64::MAX)` as the
+    /// startup pre-warm.
+    pub(crate) fn warm(&mut self) {
+        let project = Arc::clone(&self.project);
+        let mut cache = self.cache.lock().unwrap();
+        for li in 0..project.lines.len() {
+            let line_base_row = project.line_start_row(li);
+            for call in project.line_calls(li) {
+                let Some(part) = project.parts.get(&call.name) else { continue };
+                let tpl = cache.template(
+                    project.part_hash_map()[&call.name],
+                                         part,
+                                         &project.path_to_id,
+                                         &project.samples,
+                                         &project.sf2_instruments,
+                                         &project.sf2_engine_specs,
+                                         &project.vst_instruments,
+                                         &project.multi_sample_instruments,
+                );
+                let ms = call.pattern_measure_start;
+                let me = ms + call.pattern_measure_len;
+                let call_base_row = line_base_row + call.line_offset;
+                for tv in &tpl.voices {
+                    let Some(src_bpm) = tv.src_bpm else { continue };
+                    if tv.rel_row < ms || tv.rel_row >= me {
+                        continue;
+                    }
+                    let start_row = call_base_row + (tv.rel_row - ms);
+                    let Some(f) =
+                    stretch_factor(&project.tempo, part.subs_per_beat, start_row, src_bpm)
+                    else {
+                        continue;
+                    };
+                    if let Some(s) = project.samples.get(&tv.sample_id) {
+                        if s.len() > 0 {
+                            cache.stretched(tv.sample_id, s, f);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub(crate) fn seek(&mut self, to: i64, horizon: i64) -> Loaded {
         let project = Arc::clone(&self.project);
         self.cursor = 0;
@@ -86,6 +132,34 @@ impl Loader {
     }
 }
 
+fn trace_sample() -> Option<u32> {
+    static T: OnceLock<Option<u32>> = OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("VOICE_TRACE_SAMPLE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    })
+}
+
+fn flp_debug() -> bool {
+    static D: OnceLock<bool> = OnceLock::new();
+    *D.get_or_init(|| std::env::var_os("FLP_DEBUG").is_some())
+}
+
+/// Time-stretch factor for a voice whose source tempo differs from the
+/// song's at `start_row`, or `None` if it plays as-is.  Quantized to
+/// 0.001 so a tempo ramp doesn't mint a fresh stretch for every voice.
+fn stretch_factor(tempo: &TempoMap, subs_per_beat: u32, start_row: f64, src_bpm: f64) -> Option<f64> {
+    let beat_secs =
+    tempo.time_at_row(start_row + subs_per_beat as f64) - tempo.time_at_row(start_row);
+    if beat_secs <= 0.0 {
+        return None;
+    }
+    let song_bpm = 60.0 / beat_secs;
+    let factor = ((src_bpm / song_bpm) * 1000.0).round() / 1000.0;
+    ((factor - 1.0).abs() > 0.001 && factor > 0.01 && factor < 100.0).then_some(factor)
+}
+
 pub(crate) fn prepare_line(
     project: &Project,
     cache: &mut Cache,
@@ -95,7 +169,7 @@ pub(crate) fn prepare_line(
     let sr = project.sample_rate as f64;
     let line_base_row = project.line_start_row(li);
     let tempo = &project.tempo;
-    let debug = std::env::var_os("FLP_DEBUG").is_some();
+    let debug = flp_debug();
     let mut samples = Vec::new();
     let mut vsts = Vec::new();
     let mut seq = 0u32;
@@ -158,16 +232,12 @@ pub(crate) fn prepare_line(
 
             let mut offset = tv.offset as f64;
             if let Some(src_bpm) = tv.src_bpm {
-                let beat_secs = tempo.time_at_row(start_row + part.subs_per_beat as f64)
-                - tempo.time_at_row(start_row);
-                if beat_secs > 0.0 {
-                    let song_bpm = 60.0 / beat_secs;
-                    let factor = src_bpm / song_bpm;
-                    if (factor - 1.0).abs() > 0.001 && factor > 0.01 && factor < 100.0 {
+                if let Some(factor) =
+                    stretch_factor(tempo, part.subs_per_beat, start_row, src_bpm)
+                    {
                         sample = cache.stretched(tv.sample_id, &sample, factor);
                         offset *= factor;
                     }
-                }
             }
 
             let mk = |wp: &Vec<_>, initial: f64| -> Option<AutomationLane> {
@@ -198,43 +268,45 @@ pub(crate) fn prepare_line(
                          env: tv.env,
             });
 
-            if let Ok(target) = std::env::var("VOICE_TRACE_SAMPLE") {
-                if let Ok(tid) = target.parse::<u32>() {
-                    if tv.sample_id == tid {
-                        eprintln!(
-                            "vtrace: scheduled sample {} start={} end={} ({} samples, {:.3}s) offset={} pitch_hz={:.2} vol={}",
-                                  tv.sample_id, start, end, end - start,
-                                  (end - start) as f64 / sr, offset, tv.pitch_hz, vol
-                        );
-                    }
+            if let Some(target) = trace_sample() {
+                if tv.sample_id == target {
+                    eprintln!(
+                        "vtrace: scheduled sample {} start={} end={} ({} samples, {:.3}s) offset={} pitch_hz={:.2} vol={}",
+                              tv.sample_id, start, end, end - start,
+                              (end - start) as f64 / sr, offset, tv.pitch_hz, vol
+                    );
                 }
             }
         }
 
-        for vn in &tpl.vst_notes {
-            if vn.rel_row < measure_start || vn.rel_row >= measure_end {
-                continue;
+        if !tpl.vst_notes.is_empty() {
+            // One shared path per part call; every note clones the Arc.
+            let vst_path: Arc<str> = Arc::from(part.sample_path.as_str());
+            for vn in &tpl.vst_notes {
+                if vn.rel_row < measure_start || vn.rel_row >= measure_end {
+                    continue;
+                }
+                let local = vn.rel_row - measure_start;
+                seq += 1;
+                let start_row = call_base_row + local;
+                let end_row = start_row + vn.dur_rows;
+                let start = (tempo.time_at_row(start_row) * sr) as i64;
+                let end = (tempo.time_at_row(end_row).min(project.render_end_sec) * sr) as i64;
+                if end <= start || end <= min_end {
+                    continue;
+                }
+                vsts.push(VstNote {
+                    start,
+                    end,
+                    iid: vn.iid,
+                    note: vn.pitch_midi,
+                    velocity: vn.velocity,
+                    line: li as u32,
+                    seq,
+                    part_path: Arc::clone(&vst_path),
+                          source_row: vn.rel_row,
+                });
             }
-            let local = vn.rel_row - measure_start;
-            seq += 1;
-            let start_row = call_base_row + local;
-            let end_row = start_row + vn.dur_rows;
-            let start = (tempo.time_at_row(start_row) * sr) as i64;
-            let end = (tempo.time_at_row(end_row).min(project.render_end_sec) * sr) as i64;
-            if end <= start || end <= min_end {
-                continue;
-            }
-            vsts.push(VstNote {
-                start,
-                end,
-                iid: vn.iid,
-                note: vn.pitch_midi,
-                velocity: vn.velocity,
-                line: li as u32,
-                seq,
-                part_path: part.sample_path.clone(),
-                      source_row: vn.rel_row,
-            });
         }
     }
     Loaded { samples, vsts }

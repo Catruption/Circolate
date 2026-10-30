@@ -79,17 +79,6 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Install the log bus before any subcommand runs.  Filter is seeded
-    // from CIRCOLATE_LOG / CIRCOLATE_DEBUG / CIRCOLATE_QUIET; the TUI can
-    // swap it later via `log::set_filter`.
-    //
-    // The ring sink is only needed by the player/menu (in-memory scrollback
-    // for the log widget).  Line-oriented subcommands get stderr + file only.
-    //
-    // `StderrSink` is installed only when the ring is absent.  With the
-    // ring present, TUI mode captures fd 2 into the ring as `ffi.stderr`;
-    // installing `StderrSink` there would make every log line feed back
-    // into the ring through the capture thread (infinite loop).
     let wants_ring = match &cli.command {
         Some(Command::Play { .. }) | None => true,
         Some(_) => false,
@@ -121,7 +110,6 @@ fn main() -> Result<()> {
         };
 
         if cli.pause {
-            // Interactive UI prompt, not a log — stays on eprintln.
             eprintln!("\npress enter to close...");
             let mut s = String::new();
             let _ = std::io::stdin().read_line(&mut s);
@@ -135,52 +123,47 @@ fn main() -> Result<()> {
 
 fn run_app(args: &[String], _no_pick: bool) -> Result<()> {
     let play_args = play::cli::parse_args(args)?;
-    let mut term = tui::setup()?;
-
     let mut current_song = play_args.song.clone();
     let queue = tui::state::QueueState::new();
 
-    let result = (|| -> Result<()> {
-        loop {
-            let dir = current_song.as_deref().and_then(|p| p.parent());
-            let settings = tui::config::Config::load_layered(dir).resolve();
+    loop {
+        // Setup TUI for this iteration
+        let mut term = tui::setup()?;
 
-            let msg = match &current_song {
-                Some(p) => format!("loading {}...", p.display()),
-                  None => "".into(), // Menu renders instead
-            };
-            tui::show_loading(&mut term, &queue, &settings, &msg, &[])?;
+        let dir = current_song.as_deref().and_then(|p| p.parent());
+        let settings = tui::config::Config::load_layered(dir).resolve();
 
-            match play::session::play_one(
-                &mut term,
-                &play_args,
-                current_song.as_deref(),
-                                          queue.clone(),
-                                          settings.clone(),
-            ) {
-                Ok(tui::app::LoopOutcome::Quit) => return Ok(()),
-                  Ok(tui::app::LoopOutcome::Home) => {
-                      // Hit 'q' -> go back to the menu
-                      current_song = None;
-                  }
-                  Ok(tui::app::LoopOutcome::Next(name)) => {
-                      match paths::resolve_track(&name) {
-                          Ok(p) => current_song = Some(p),
-                  Err(_) => current_song = None,
-                      }
-                  }
-                  Err(e) => {
-                      let msg = format!("load failed: {e:#}");
-                      tui::show_loading(&mut term, &queue, &settings, &msg, &[])?;
-                      std::thread::sleep(Duration::from_secs(3));
-                      current_song = None;
-                  }
+        let msg = match &current_song {
+            Some(p) => format!("loading {}...", p.display()),
+            None => "".into(),
+        };
+        tui::show_loading(&mut term, &queue, &settings, &msg, &[])?;
+
+        match play::session::play_one(
+            &mut term,
+            &play_args,
+            current_song.as_deref(),
+                                      queue.clone(),
+                                      settings.clone(),
+        ) {
+            Ok(tui::app::LoopOutcome::Quit) => return Ok(()),
+            Ok(tui::app::LoopOutcome::Home) => {
+                current_song = None;
+            }
+            Ok(tui::app::LoopOutcome::Next(name)) => {
+                match paths::resolve_track(&name) {
+                    Ok(p) => current_song = Some(p),
+                    Err(_) => current_song = None,
+                }
+            }
+            Err(e) => {
+                let msg = format!("load failed: {e:#}");
+                tui::show_loading(&mut term, &queue, &settings, &msg, &[])?;
+                std::thread::sleep(Duration::from_secs(3));
+                current_song = None;
             }
         }
-    })();
-
-    let _ = tui::restore(&mut term);
-    result
+    }
 }
 
 fn pick_if_empty(mut args: Vec<String>, no_pick: bool, filter: &str, title: &str) -> Vec<String> {
