@@ -10,6 +10,9 @@ keywords = ["audio", "music", "tracker", "fl-studio"]
 categories = ["multimedia::audio"]
 
 [dependencies]
+soundlog = "0.10"  # VGM parsing and callback stream
+ymfm-sys = { path = "vendor/ymfm-sys" } # local wrapper exposes isolated YM2612 channel taps
+flate2 = "1.0"     # For decompressing .vgz files
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

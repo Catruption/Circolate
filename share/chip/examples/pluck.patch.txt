@@ -1,0 +1,26 @@
+patch 1
+name    "pluck"
+author  "circolate"
+license CC0
+origin  handwritten
+
+requires tone.square
+requires pitch.divider
+  range 1..1023
+requires amp.attenuation
+  steps 16
+  step_db 2.0
+
+source tone.square
+
+pitch
+  transpose 0
+  detune    0
+  glide     0
+
+amp adsr
+  a 0.005
+  d 0.120
+  s 0.0
+  r 0.040
+  curve lin

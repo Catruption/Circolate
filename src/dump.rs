@@ -98,6 +98,9 @@ pub fn run(argv: &[String]) -> Result<()> {
             });
             println!("{}", serde_json::to_string_pretty(&out)?);
         }
+        SourceKind::Vgm => {
+            bail!("cannot dump VGM files (use `play` instead)");
+        }
     }
     Ok(())
 }

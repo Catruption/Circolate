@@ -20,8 +20,8 @@ use crate::tui::state as queue;
 use super::audio::{soft_clip, Silence};
 use super::cli::Args;
 use super::install::{
-    find_share_dir, install_master_fx, install_sf2_engines, install_shims,
-    install_vst_hosts,
+    find_share_dir, install_chip_players, install_master_fx, install_sf2_engines,
+    install_shims, install_vst_hosts,
 };
 use super::resolve::{is_archive, resolve_source};
 use super::worker::{watch_for_changes, worker, ReloadSlot};
@@ -176,6 +176,7 @@ pub fn play_one(
         install_master_fx(&mut engine, &project, args.no_master_fx);
         install_shims(&mut engine, &project, find_share_dir().as_deref());
         crate::player::inserts::install_chains(&mut engine, &project, sample_rate);
+        install_chip_players(&mut engine, &project, find_share_dir().as_deref());
 
         let tp = Arc::clone(&transport);
         let mut left = vec![0f32; 8192];
@@ -351,10 +352,6 @@ pub fn play_one(
             }
         });
 
-        // FIX: supply all 7 arguments. `transport` is still needed after the
-        // call, so clone the Arc; `term` is still needed for `tui::restore`,
-        // so reborrow it explicitly. `project`, `queue`, `settings`, and
-        // `media_rx` are not used again, so they can move.
         let (outcome, _queue) = tui::run_against(
             &mut *term,
             Arc::clone(&transport),
@@ -365,32 +362,20 @@ pub fn play_one(
                                                  media_rx,
         )?;
 
-        // Restore the terminal immediately
         let _ = tui::restore(term);
         transport.stop.store(true, Ordering::Relaxed);
 
-        // Drop the stream on a background thread so a hanging VST doesn't freeze the TUI.
-        // We DO join it (with a generous timeout) so the ALSA device is properly closed
-        // before the next song starts.
-        //
-        // cpal's `Stream` is `!Send` (it wraps `PhantomData<*mut ()>`). We're only
-        // moving it across threads so it can be *dropped* there, after `transport.stop`
-        // has parked the audio callback — so the wrapper below is safe.
         struct SendStream(cpal::Stream);
         unsafe impl Send for SendStream {}
 
         let (tx, rx) = std::sync::mpsc::channel();
         let send_stream = SendStream(stream);
         std::thread::spawn(move || {
-            // NB: `drop(send_stream)` (whole wrapper), not `drop(send_stream.0)`.
-            // Rust 2021 precise capture would otherwise capture just `.0`,
-            // which is `!Send`, defeating the `unsafe impl Send`.
             drop(send_stream);
             let _ = tx.send(());
         });
 
-        // Wait up to 2 seconds for the audio thread to cleanly drop the stream.
-        // If it takes longer, we proceed anyway to avoid freezing the menu forever.
         let _ = rx.recv_timeout(std::time::Duration::from_secs(2));
+
         Ok(outcome)
 }

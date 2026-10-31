@@ -66,6 +66,7 @@ pub fn draw(
     if rc > state.player.last_reload_count {
         state.player.last_reload_count = rc;
         state.player.reload_flash_until = Some(Instant::now() + Duration::from_millis(RELOAD_FLASH_MS));
+        state.motion_highlight_line = None;
     }
 
     refresh_cover(state, project, area);
@@ -80,17 +81,17 @@ pub fn draw(
 
     draw_header(f, chunks[0], project, tp, sample_rate, state.loading.as_deref(), &theme);
 
-    // Refresh motion highlights so both views can render red-text notes.
+    // Motion markers are static for a line; compute them once when entering it.
     let pos_now = tp.position.load(Ordering::Relaxed).max(0);
     if let Some(li_now) = project.current_line(pos_now) {
-        let report = crate::player::analysis::analyze(project, tp, li_now);
-        state.motion_highlights = report.motion_highlight.clone();
-        if state.player.show_analysis {
-            // We already have the report — draw it last, on top of everything.
-            // (handled below after the views render)
+        let marker_key = (li_now, crate::mixer::mute::generation());
+        if state.motion_highlight_line != Some(marker_key) {
+            state.motion_highlights = crate::player::analysis::motion_highlights(project, li_now);
+            state.motion_highlight_line = Some(marker_key);
         }
     } else {
         state.motion_highlights.clear();
+        state.motion_highlight_line = None;
     }
 
     let tape_rows: u16 = if chunks[1].height > 6 { 1 } else { 0 };

@@ -23,9 +23,8 @@ use ratatui::text::Span;
 use crate::player::envelope::{synth_envelope_live, whole_sample_envelope};
 use crate::player::Sample;
 
-use super::braille::{braille_char, dot_bit};
+use super::braille::{braille_str, dot_bit};
 
-const PLAYHEAD_GLYPH: char = '┃';
 const AUTO_SCALE_MAX: f32 = 1000.0;
 const AUTO_SCALE_FLOOR: f32 = 1e-5;
 
@@ -36,24 +35,24 @@ const AUTO_SCALE_FLOOR: f32 = 1e-5;
 /// sub-pixel strip. Skipped below `AUTO_SCALE_FLOOR` so a genuinely
 /// silent channel stays flat instead of amplifying noise.
 pub fn auto_scale(env: &mut [(f32, f32)]) {
-    let mut peak = 0.0f32;
-    for &(lo, hi) in env.iter() {
-        let m = lo.abs().max(hi.abs());
-        if m > peak {
-            peak = m;
-        }
-    }
-    if !peak.is_finite() || peak < AUTO_SCALE_FLOOR {
-        return;
-    }
-    let scale = (1.0 / peak).min(AUTO_SCALE_MAX);
-    if scale <= 1.05 {
-        return;
-    }
+    let scale = auto_scale_factor(env);
+    if scale == 1.0 { return; }
     for (lo, hi) in env.iter_mut() {
         *lo = (*lo * scale).clamp(-1.0, 1.0);
         *hi = (*hi * scale).clamp(-1.0, 1.0);
     }
+}
+
+#[inline]
+fn auto_scale_factor(env: &[(f32, f32)]) -> f32 {
+    let mut peak = 0.0f32;
+    for &(lo, hi) in env {
+        let m = lo.abs().max(hi.abs());
+        if m > peak { peak = m; }
+    }
+    if !peak.is_finite() || peak < AUTO_SCALE_FLOOR { return 1.0; }
+    let scale = (1.0 / peak).min(AUTO_SCALE_MAX);
+    if scale <= 1.05 { 1.0 } else { scale }
 }
 
 /// Map a value interval `[lo, hi]` in `[-1, 1]` to a contiguous range
@@ -88,24 +87,25 @@ pub fn rasterize_time_x(
     env: &[(f32, f32)],
                         w_dots: usize,
                         h_dots: usize,
-) -> Vec<Vec<bool>> {
-    let mut dots = vec![vec![false; w_dots.max(1)]; h_dots.max(1)];
+) -> Vec<bool> {
+    let width = w_dots.max(1);
+    let height = h_dots.max(1);
+    let mut dots = vec![false; width.saturating_mul(height)];
     if w_dots == 0 || h_dots == 0 {
         return dots;
     }
-    let mut scaled = env.to_vec();
-    auto_scale(&mut scaled);
+    let scale = auto_scale_factor(env);
 
     for x in 0..w_dots {
-        let (lo, hi) = scaled.get(x).copied().unwrap_or((0.0, 0.0));
-        let (d0, d1) = dot_range(lo, hi, h_dots);
+        let (lo, hi) = env.get(x).copied().unwrap_or((0.0, 0.0));
+        let (d0, d1) = dot_range(lo * scale, hi * scale, h_dots);
         if d0 > d1 {
             continue;
         }
         let d0 = d0.max(0) as usize;
         let d1 = (d1 as usize).min(h_dots - 1);
         for d in d0..=d1 {
-            dots[d][x] = true;
+            dots[d * width + x] = true;
         }
     }
     dots
@@ -122,24 +122,38 @@ pub fn rasterize_time_y(
     env: &[(f32, f32)],
                         w_dots: usize,
                         h_dots: usize,
-) -> Vec<Vec<bool>> {
-    let mut dots = vec![vec![false; w_dots.max(1)]; h_dots.max(1)];
+) -> Vec<bool> {
+    let mut dots = Vec::new();
+    rasterize_time_y_into(env, w_dots, h_dots, &mut dots);
+    dots
+}
+
+/// Rasterize into a reusable buffer to keep tracker redraws allocation-free.
+pub fn rasterize_time_y_into(
+    env: &[(f32, f32)],
+    w_dots: usize,
+    h_dots: usize,
+    dots: &mut Vec<bool>,
+) {
+    let width = w_dots.max(1);
+    let height = h_dots.max(1);
+    dots.resize(width.saturating_mul(height), false);
+    dots.fill(false);
     if w_dots == 0 || h_dots == 0 {
-        return dots;
+        return;
     }
-    let mut scaled = env.to_vec();
-    auto_scale(&mut scaled);
+    let scale = auto_scale_factor(env);
 
     let half = w_dots as f32 / 2.0;
     let last = (w_dots as isize) - 1;
 
-    for y in 0..h_dots.min(scaled.len()) {
-        let (lo, hi) = scaled[y];
+    for y in 0..h_dots.min(env.len()) {
+        let (lo, hi) = env[y];
         if !lo.is_finite() || !hi.is_finite() || lo > hi {
             continue;
         }
-        let lo = lo.clamp(-1.0, 1.0);
-        let hi = hi.clamp(-1.0, 1.0);
+        let lo = (lo * scale).clamp(-1.0, 1.0);
+        let hi = (hi * scale).clamp(-1.0, 1.0);
         // Clamp both ends to the valid pixel range. `lo = hi = +1.0`
         // used to produce `px_lo = px_hi = w_dots`, one past the last
         // valid column, so positive peaks at exactly full scale fell
@@ -150,10 +164,9 @@ pub fn rasterize_time_y(
         let px_hi = ((half + hi * half).round() as isize).clamp(0, last) as usize;
         let (px_lo, px_hi) = if px_lo <= px_hi { (px_lo, px_hi) } else { (px_hi, px_lo) };
         for px in px_lo..=px_hi {
-            dots[y][px] = true;
+            dots[y * width + px] = true;
         }
     }
-    dots
 }
 
 /// Pack a dot matrix into a `Vec<Vec<Span>>` of braille characters.
@@ -173,7 +186,7 @@ pub fn render_envelope(
         let mut row: Vec<Span<'static>> = Vec::with_capacity(w);
         for x in 0..w {
             if Some(x) == playhead_col {
-                row.push(Span::styled(PLAYHEAD_GLYPH.to_string(), playhead_style));
+                row.push(Span::styled("┃", playhead_style));
                 continue;
             }
             let mut bits = 0u8;
@@ -187,13 +200,12 @@ pub fn render_envelope(
                     if dx >= w * 2 {
                         continue;
                     }
-                    if dots[dy][dx] {
+                    if dots[dy * (w * 2).max(1) + dx] {
                         bits |= dot_bit(lx, ly);
                     }
                 }
             }
-            let ch = if bits == 0 { ' ' } else { braille_char(bits) };
-            row.push(Span::styled(ch.to_string(), base_style));
+            row.push(Span::styled(braille_str(bits), base_style));
         }
         out.push(row);
     }

@@ -16,6 +16,7 @@ pub enum SourceKind {
     Flp,
     It,
     Midi,
+    Vgm,
     Trackscript,
 }
 
@@ -41,6 +42,7 @@ impl SourceKind {
             "flp" => SourceKind::Flp,
             "it"  => SourceKind::It,
             "mid" | "midi" => SourceKind::Midi,
+            "vgm" | "vgz" => SourceKind::Vgm,
             "trackscript" => SourceKind::Trackscript,
             other => bail!("unknown source type .{other}"),
         })

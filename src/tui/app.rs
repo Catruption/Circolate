@@ -179,7 +179,13 @@ fn event_loop(
     let mut seen_wraps = tp.loop_wraps.load(Ordering::Acquire);
 
     loop {
+        let frame_started = std::time::Instant::now();
+        let draw_started = std::time::Instant::now();
         term.draw(|f| views::draw(f, tp, project, sample_rate, state))?;
+        let draw_ns = draw_started.elapsed().as_nanos() as u64;
+        state.ui_draw_ns = state.ui_draw_ns.saturating_add(draw_ns);
+        state.ui_draw_frames = state.ui_draw_frames.saturating_add(1);
+        state.ui_draw_worst_ns = state.ui_draw_worst_ns.max(draw_ns);
         loop_tick(tp, project, state);
 
         // ── HANDLE SYSTEM MEDIA CONTROLS ──
@@ -234,7 +240,12 @@ fn event_loop(
                               vst: format!("{:.3}", snap.vst),
                               shim: format!("{:.3}", snap.shim),
                               fx: format!("{:.3}", snap.fx),
+                              ui_draw_ms: format!("{:.3}", state.ui_draw_ns as f64 / state.ui_draw_frames.max(1) as f64 / 1e6),
+                              ui_draw_worst_ms: format!("{:.3}", state.ui_draw_worst_ns as f64 / 1e6),
             );
+            state.ui_draw_ns = 0;
+            state.ui_draw_frames = 0;
+            state.ui_draw_worst_ns = 0;
             state.perf_snapshot = Some(snap);
             state.perf_last_poll = perf_now;
         }
@@ -280,8 +291,17 @@ fn event_loop(
             }
         }
 
-        if event::poll(tick)? {
-            match event::read()? {
+        // TICK_MS is a frame period, not an extra delay after rendering.
+        // Poll only for the remaining frame budget; otherwise a 50 ms draw
+        // accidentally turns the nominal 20 FPS loop into 10 FPS.
+        if event::poll(tick.saturating_sub(frame_started.elapsed()))? {
+            // Drain already-queued input before the next render. One event per
+            // frame lets key-repeat/mouse bursts build an unbounded UI backlog.
+            for event_idx in 0..64 {
+                if event_idx > 0 && !event::poll(Duration::ZERO)? {
+                    break;
+                }
+                match event::read()? {
                 Event::Key(k) => {
                     let is_ctrl_c = k.code == KeyCode::Char('c')
                     && k.modifiers.contains(KeyModifiers::CONTROL);
@@ -440,6 +460,7 @@ fn event_loop(
                 Event::Mouse(m) => handle_mouse(m, tp, project, state),
                 other => {
                     tui_dbg!("[event] {:?}", other);
+                }
                 }
             }
         }

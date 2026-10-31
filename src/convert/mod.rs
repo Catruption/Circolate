@@ -6,6 +6,7 @@
 //! the source.  Callers (`export`, `play`, `test`) write the bundle
 //! themselves.
 
+pub mod vgm;
 mod flp;
 mod it;
 mod midi;
@@ -83,18 +84,19 @@ pub fn convert_file(src: &Path, opts: &ConvertOptions) -> Result<Converted> {
             let module = formats::it::parse_file(src)?;
             it::convert(&module, src, opts)
         }
-        SourceKind::Midi => {                         // ← new
+        SourceKind::Midi => {
             let mf = formats::midi::parse_file(src)?;
             midi::convert(&mf, src, opts)
         }
+        SourceKind::Vgm => vgm::convert_vgm(src, opts), // <--- ADD THIS ARM
         SourceKind::Trackscript => {
             let text = std::fs::read_to_string(src)?;
             trackscript::parse_str(&text)?;
             Ok(Converted {
                 trackscript: text,
                 samples: Vec::new(),
-                samples_json: String::new(),
-                aux: Vec::new(),
+               samples_json: String::new(),
+               aux: Vec::new(),
             })
         }
     }

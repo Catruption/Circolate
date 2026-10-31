@@ -1,0 +1,20 @@
+patch 1
+name    "hat_sms_01"
+author  "lifted"
+license "VGM abc123 — see source ROM"
+origin  vgm:abc123 track:5 voice:noise
+
+requires noise.lfsr
+  width 16
+  fb    white
+requires amp.attenuation
+  steps 16
+  step_db 2.0
+
+source noise.lfsr
+  rate 0
+  fb   white
+
+amp steps
+  values 0 6 15
+  rate   60

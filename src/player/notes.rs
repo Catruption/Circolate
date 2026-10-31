@@ -41,7 +41,9 @@ pub struct DisplayNote {
 }
 
 pub enum ColumnLine {
-    Note(DisplayNote),
+    /// Index into the owning prepared part's note list. Keeping this as an
+    /// index avoids cloning waypoint vectors into the horizontal view.
+    Note(usize),
     Divider { label: String },
 }
 

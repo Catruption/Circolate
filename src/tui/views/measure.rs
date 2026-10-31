@@ -12,7 +12,7 @@ use ratatui::style::Style;
 
 use crate::formats::trackscript::C5_HZ;
 use crate::mixer::mute;
-use crate::player::notes::{split_notes, value_at, DisplayNote};
+use crate::player::notes::{value_at, DisplayNote};
 use crate::player::{Project, Transport};
 use crate::tui::shared::note_style::{note_style, NoteState};
 use crate::tui::state::RenderState;
@@ -90,12 +90,9 @@ pub fn prepare_measure(
         let offset_rows = k as f64 * rpmeasure;
         for call in p.line_calls(prev_li) {
             let Some(path) = p.part_path(&call.name) else { continue };
-            let subs = p.part_subs_per_beat(&call.name);
             let measure_end = call.pattern_measure_start + call.pattern_measure_len;
-            let still_on = split_notes(
-                p.part_events(&call.name), subs,
-                                       p.part_sample_offset_u32(&call.name),
-            ).iter().any(|n| {
+            let Some(note_rows) = p.note_rows(&call.name) else { continue };
+            let still_on = note_rows.iter().any(|n| {
                 n.start_row >= call.pattern_measure_start
                 && n.start_row < measure_end
                 && (n.end_row - call.pattern_measure_start) > offset_rows
@@ -162,11 +159,11 @@ pub fn prepare_measure(
             let note_block_line = li.saturating_sub(offset_lines);
             let measure_end = measure_start + measure_len;
 
-            for mut note in split_notes(
-                p.part_events(name), subs,
-                                        p.part_sample_offset_u32(name),
-            ) {
-                if note.start_row < *measure_start || note.start_row >= measure_end { continue; }
+            let Some(note_rows) = p.note_rows(name) else { continue };
+            for source_note in note_rows.iter().filter(|n| {
+                n.start_row >= *measure_start && n.start_row < measure_end
+            }) {
+                let mut note = source_note.clone();
 
                 let ms = *measure_start;
                 note.start_row -= ms;

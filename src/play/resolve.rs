@@ -1,10 +1,4 @@
 //! Turning a source path into a playable trackscript.
-//!
-//! - trackscripts and archives pass through untouched
-//! - FLP / IT / MIDI are converted on the fly into a temp bundle
-//!
-//! Name → path resolution lives in `crate::paths::resolve_track` so
-//! `cmd_list` and the queue-triggered play path can share it.
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
@@ -24,8 +18,6 @@ pub fn is_archive(path: &Path) -> bool {
 
 // ── temporary bundle ───────────────────────────────────────────────────
 
-/// A throwaway directory containing a converted trackscript plus its
-/// samples.  Dropped when the play session ends.
 pub struct TempBundle {
     dir: PathBuf,
 }
@@ -97,7 +89,11 @@ pub fn resolve_source(src: &Path, args: &Args) -> Result<(PathBuf, Option<TempBu
 
             let conv = {
                 let _s = Silence::new();
-                convert::convert_file(src, &opts)?
+                if let SourceKind::Vgm = SourceKind::from_path(src)? {
+                    crate::convert::vgm::convert_vgm(src, &opts)?
+                } else {
+                    convert::convert_file(src, &opts)?
+                }
             };
 
             let tb = TempBundle::new("play")?;

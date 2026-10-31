@@ -1,0 +1,181 @@
+# ym2612.chip : backend model of the Yamaha YM2612 / YM3438 (OPN2)
+#
+# v2.1, functional model. FM synthesis, 6 channels x 4 operators,
+# optional 8-bit streaming DAC on ch6. Bit-exactness (DAC ladder,
+# exact tables, envelope quirks, SSG-EG, CH3 special mode) is deferred.
+#
+# Format reference: CHIP.md v2.1 §2.
+# Items marked "verify" need checking against ymfm or hardware captures.
+
+chip 2
+name    ym2612
+title   "Yamaha YM2612 / YM3438 (OPN2)"
+family  fm
+
+clock   7670453                # NTSC Genesis / Mega Drive
+step    clock / 144            # FM sample rate (~53267 Hz at NTSC)
+out     bipolar                # core output -1..1; host DC-blocks & resamples
+
+variant ym2612  quirk dac_ladder on    # NMOS; 9-bit ladder DAC
+variant ym3438  quirk dac_ladder off   # CMOS; linear DAC
+default_variant ym2612
+
+# PAL clock is 7987200. Select with `clock 7987200` in the bank.
+
+# ---------------------------------------------------------------- behavior
+behavior
+  key     reg key_on         # 0x28: op_mask << 4 | channel_selector
+  noteon  patch pitch vol pan keyon
+  noteoff keyoff
+
+# ---------------------------------------------------------------- voices
+voices
+  ch1  fm
+  ch2  fm
+  ch3  fm
+  ch4  fm
+  ch5  fm
+  ch6  fm                    # also DAC when sample.pcm is active
+
+# ---------------------------------------------------------------- provides
+provides
+  fm.operator
+    sources     ch1 ch2 ch3 ch4 ch5 ch6
+    operators   4
+    algorithms  8
+    feedback    yes
+
+  pitch.fnum_block
+    voices  ch1 ch2 ch3 ch4 ch5 ch6
+    field   fnum
+    law     fnum * (clock/144) / 2^(21 - block)
+    block   0..7
+    fnum    0..2047
+
+  amp.envelope
+    voices       ch1 ch2 ch3 ch4 ch5 ch6
+    field        eg
+    resolution   10-bit attenuation internal (0..1023); 7-bit TL visible
+    stages       attack decay sustain release
+    key_scaling  yes
+    rate_table   eg_rate
+
+  pan.lr
+    voices  ch1 ch2 ch3 ch4 ch5 ch6
+    field   lr
+    values  off l r lr
+
+  sample.pcm
+    voices  ch6
+    mode    streaming        # write-driven; not a fixed-rate PCM channel
+    depth   8
+    dependency ch6 unavailable for FM while dac_enable
+
+# ---------------------------------------------------------------- registers
+# EXT-4: addr is the base address (operator 1 / channel 1 / global).
+# Channel and operator offsets are applied by the bus block.
+
+# Global registers
+reg lfo_ctrl    global  addr 0x22  width 8  reset 0
+reg timer_a1    global  addr 0x24  width 8  reset 0
+reg timer_a2    global  addr 0x25  width 8  reset 0
+reg timer_b     global  addr 0x26  width 8  reset 0
+reg ch3_mode    global  addr 0x27  width 8  reset 0
+reg key_on      global  addr 0x28  width 8  reset 0
+reg dac_data    global  addr 0x2A  width 8  reset 0
+reg dac_enable  global  addr 0x2B  width 8  reset 0
+
+# Per-operator registers (base = operator 1)
+reg mul         voices ch1 ch2 ch3 ch4 ch5 ch6  addr 0x30  width 4  reset 0
+reg dt          voices ch1 ch2 ch3 ch4 ch5 ch6  addr 0x30  width 3  reset 0
+reg tl          voices ch1 ch2 ch3 ch4 ch5 ch6  addr 0x40  width 7  reset 0
+reg ar          voices ch1 ch2 ch3 ch4 ch5 ch6  addr 0x50  width 8  reset 0
+reg dr          voices ch1 ch2 ch3 ch4 ch5 ch6  addr 0x60  width 8  reset 0
+reg sr          voices ch1 ch2 ch3 ch4 ch5 ch6  addr 0x70  width 5  reset 0
+reg rr          voices ch1 ch2 ch3 ch4 ch5 ch6  addr 0x80  width 4  reset 0
+reg sl          voices ch1 ch2 ch3 ch4 ch5 ch6  addr 0x80  width 4  reset 0
+reg ssg_eg      voices ch1 ch2 ch3 ch4 ch5 ch6  addr 0x90  width 4  reset 0
+
+# Per-channel registers
+reg fnum_lo           voices ch1 ch2 ch3 ch4 ch5 ch6  addr 0xA0  width 8  reset 0
+reg fnum_hi_block_ks  voices ch1 ch2 ch3 ch4 ch5 ch6  addr 0xA4  width 8  reset 0
+reg alg_fb            voices ch1 ch2 ch3 ch4 ch5 ch6  addr 0xB0  width 6  reset 0
+reg lr_ams_pms        voices ch1 ch2 ch3 ch4 ch5 ch6  addr 0xB4  width 8  reset 0xC0
+
+# ---------------------------------------------------------------- fields
+# Per-operator fields (EXT-1: scope op)
+field mul      reg mul      bits 0..3   role param   scope op
+field dt       reg dt       bits 4..6   role param   scope op
+field tl       reg tl       bits 0..6   role volume  scope op
+field ar       reg ar       bits 0..4   role param   scope op
+field rs       reg ar       bits 6..7   role param   scope op
+field dr       reg dr       bits 0..4   role param   scope op
+field am       reg dr       bit  7      role param   scope op
+field sr       reg sr       bits 0..4   role param   scope op
+field rr       reg rr       bits 0..3   role param   scope op
+field sl       reg sl       bits 4..7   role param   scope op
+field ssg_eg   reg ssg_eg   bits 0..3   role param   scope op  # not modeled
+
+# Per-channel fields. EXT-2: fnum spans two registers.
+field fnum      reg fnum_lo bits 0..7 reg fnum_hi_block_ks bits 0..2  role pitch
+field block     reg fnum_hi_block_ks bits 3..5  role pitch
+field key_scale reg fnum_hi_block_ks bits 6..7  role param
+field alg       reg alg_fb     bits 0..2  role param
+field fb        reg alg_fb     bits 3..5  role param
+field lr        reg lr_ams_pms bits 6..7  role param
+field pms       reg lr_ams_pms bits 0..2  role param
+field ams       reg lr_ams_pms bits 4..5  role param
+
+# Global fields
+field lfo_enable reg lfo_ctrl   bit  3     role param  scope global
+field lfo_freq   reg lfo_ctrl   bits 0..2  role param  scope global
+field dac_enable reg dac_enable bit  7      role param  scope global
+
+enum lr off=0 l=1 r=2 lr=3
+
+# ---------------------------------------------------------------- carriers
+# EXT-3: 1-based algorithms and operators. Corrected against the
+# official YM2612 algorithm diagrams (see also Genesis.py reference).
+carriers
+  alg 1: op4
+  alg 2: op4
+  alg 3: op4
+  alg 4: op4
+  alg 5: op2 op4
+  alg 6: op2 op3 op4
+  alg 7: op2 op3 op4
+  alg 8: op1 op2 op3 op4
+
+# ---------------------------------------------------------------- bus
+bus addr_data
+  ports          2
+  chan_per_port  3
+  chan_stride    1
+  op_offset      1:0x00  2:0x04  3:0x08  4:0x0C
+
+# ---------------------------------------------------------------- core
+# Functional model. Placeholder tables, marked verify. Full bit-exact
+# model deferred; see notes at end.
+core
+  table sine[1024]  = <log-sin, 14-bit signed>       # verify
+  table exp[256]    = <exp, 14-bit unsigned>         # verify
+  table detune[32]  = <detune, 5-bit signed>         # verify
+  table eg_rate[64] = <envelope step per rate>       # verify
+
+  mix sum( ch1..ch6 outputs, panned by lr )
+      * (1 / (6 * 256))
+
+# ---------------------------------------------------------------- vgm
+vgm
+  header clock 0x0C  dual_bit 30  ym2612_clock 0x2C
+  op   0x52 port 0     # YM2612 port 0 register write
+  op2  0x53 port 1     # YM2612 port 1 register write
+
+# ---------------------------------------------------------------- deferred
+# Not modeled (patches requiring these fail `requires` and fall back to Raw):
+#   - SSG-EG (register 0x90)
+#   - CH3 special mode (0xA8-0xAF, 0x27 bit 6)
+#   - Full LFO (0x22); simplified only
+#   - Timers (0x24-0x27); VGM carries its own timing
+#   - DAC ladder effect; selected by variant quirk but math is placeholder
+#   - Exact tables; formulas + sizes are marked verify

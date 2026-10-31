@@ -1,18 +1,15 @@
-//! Streaming loader: emits voices for a horizon of upcoming blocks.
-
-use std::sync::{Arc, Mutex};
-
-use std::sync::OnceLock;
-
-use crate::timing::{AutomationLane, TempoMap};
-
-use super::cache::Cache;
-use super::engine::{gains, Scheduled, VstNote};
-use super::project::Project;
+// src/player/loader.rs
+use std::sync::{Arc, Mutex, OnceLock};
+use crate::player::Cache;
+use crate::player::project::Project;
+use crate::timing::{TempoMap, AutomationLane};
+use crate::player::engine::{Scheduled, VstNote, gains};
+use crate::hosting::chip::{ChipNote, ChipAutomation};
 
 pub(crate) struct Loaded {
     pub(crate) samples: Vec<Scheduled>,
     pub(crate) vsts: Vec<VstNote>,
+    pub(crate) chips: Vec<ChipNote>,
 }
 
 pub(crate) struct Loader {
@@ -22,8 +19,6 @@ pub(crate) struct Loader {
 }
 
 impl Loader {
-    /// Construct from an owned cache, wrapping it in `Arc<Mutex<_>>`.
-    /// Used by the worker thread when no pre-warm has been done.
     #[allow(dead_code)]
     pub(crate) fn new(project: Arc<Project>, cache: Cache) -> Self {
         Loader {
@@ -33,7 +28,6 @@ impl Loader {
         }
     }
 
-    /// Construct from a shared cache, so pre-warm results persist.
     pub(crate) fn with_shared_cache(project: Arc<Project>, cache: Arc<Mutex<Cache>>) -> Self {
         Loader {
             project,
@@ -46,6 +40,7 @@ impl Loader {
         let project = Arc::clone(&self.project);
         let mut samples = Vec::new();
         let mut vsts = Vec::new();
+        let mut chips = Vec::new();
         let mut cache = self.cache.lock().unwrap();
         while self.cursor < project.order.len() {
             let li = project.order[self.cursor];
@@ -56,15 +51,14 @@ impl Loader {
             let batch = prepare_line(&project, &mut cache, li, i64::MIN);
             samples.extend(batch.samples);
             vsts.extend(batch.vsts);
+            chips.extend(batch.chips);
         }
         samples.sort_unstable_by_key(Scheduled::key);
         vsts.sort_unstable_by_key(VstNote::key);
-        Loaded { samples, vsts }
+        chips.sort_unstable_by_key(|c| (c.start, c.line, c.seq));
+        Loaded { samples, vsts, chips }
     }
 
-    /// Build every template and time-stretch the song will need, without
-    /// materializing any voices.  Replaces `load_due(i64::MAX)` as the
-    /// startup pre-warm.
     pub(crate) fn warm(&mut self) {
         let project = Arc::clone(&self.project);
         let mut cache = self.cache.lock().unwrap();
@@ -87,15 +81,11 @@ impl Loader {
                 let call_base_row = line_base_row + call.line_offset;
                 for tv in &tpl.voices {
                     let Some(src_bpm) = tv.src_bpm else { continue };
-                    if tv.rel_row < ms || tv.rel_row >= me {
-                        continue;
-                    }
+                    if tv.rel_row < ms || tv.rel_row >= me { continue; }
                     let start_row = call_base_row + (tv.rel_row - ms);
                     let Some(f) =
                     stretch_factor(&project.tempo, part.subs_per_beat, start_row, src_bpm)
-                    else {
-                        continue;
-                    };
+                    else { continue; };
                     if let Some(s) = project.samples.get(&tv.sample_id) {
                         if s.len() > 0 {
                             cache.stretched(tv.sample_id, s, f);
@@ -111,6 +101,7 @@ impl Loader {
         self.cursor = 0;
         let mut samples = Vec::new();
         let mut vsts = Vec::new();
+        let mut chips = Vec::new();
         let mut cache = self.cache.lock().unwrap();
         while self.cursor < project.order.len() {
             let li = project.order[self.cursor];
@@ -125,10 +116,12 @@ impl Loader {
             let batch = prepare_line(&project, &mut cache, li, to);
             samples.extend(batch.samples);
             vsts.extend(batch.vsts);
+            chips.extend(batch.chips);
         }
         samples.sort_unstable_by_key(Scheduled::key);
         vsts.sort_unstable_by_key(VstNote::key);
-        Loaded { samples, vsts }
+        chips.sort_unstable_by_key(|c| (c.start, c.line, c.seq));
+        Loaded { samples, vsts, chips }
     }
 }
 
@@ -146,9 +139,6 @@ fn flp_debug() -> bool {
     *D.get_or_init(|| std::env::var_os("FLP_DEBUG").is_some())
 }
 
-/// Time-stretch factor for a voice whose source tempo differs from the
-/// song's at `start_row`, or `None` if it plays as-is.  Quantized to
-/// 0.001 so a tempo ramp doesn't mint a fresh stretch for every voice.
 fn stretch_factor(tempo: &TempoMap, subs_per_beat: u32, start_row: f64, src_bpm: f64) -> Option<f64> {
     let beat_secs =
     tempo.time_at_row(start_row + subs_per_beat as f64) - tempo.time_at_row(start_row);
@@ -172,10 +162,81 @@ pub(crate) fn prepare_line(
     let debug = flp_debug();
     let mut samples = Vec::new();
     let mut vsts = Vec::new();
+    let mut chips = Vec::new();
     let mut seq = 0u32;
 
     for call in project.line_calls(li) {
         let Some(part) = project.parts.get(&call.name) else { continue };
+
+        // ── chip patch branch ─────────────────────────────────────────
+        // Parts sourced from `.patch` files (lifted VGM channels) produce
+        // ChipNote instead of Scheduled / VstNote. Same timing math as
+        // the sample branch, but the pitch is looked up by the chip
+        // player from the patch, not stored here.
+        if let Some(patch_iid) = project.patch_iids.get(&part.sample_path).copied() {
+            let chip_path: Arc<str> = Arc::from(part.sample_path.as_str());
+            let measure_start = call.pattern_measure_start;
+            let measure_end = call.pattern_measure_start + call.pattern_measure_len;
+            let call_base_row = line_base_row + call.line_offset;
+
+            let events: Vec<_> = project.part_events(&call.name).iter()
+                .filter(|ev| ev.row >= measure_start && ev.row < measure_end)
+                .cloned().collect();
+            let note_rows = crate::player::notes::split_notes(&events, part.subs_per_beat, part.sample_offset);
+            for nr in note_rows {
+                let rel_row = nr.start_row;
+                let local = rel_row - measure_start;
+                seq += 1;
+                let start_row = call_base_row + local;
+                let end_row = call_base_row + (nr.end_row - measure_start);
+                let start = (tempo.time_at_row(start_row) * sr) as i64;
+                let end = (tempo.time_at_row(end_row).min(project.render_end_sec) * sr) as i64;
+                if end <= start || end <= min_end { continue; }
+
+                let initial_hz = nr.pitch_points.first().map(|p| p.value);
+                let midi = initial_hz.map(|hz| 69.0 + 12.0 * (hz / 440.0).log2())
+                    .unwrap_or(60.0).round().clamp(0.0, 127.0) as u8;
+                let vel = nr.vol_points.first().map(|p| p.value).unwrap_or(100.0).clamp(0.0, 127.0) as u8;
+                let mut automation: Vec<ChipAutomation> = Vec::new();
+                for p in nr.pitch_points.iter().skip(1) {
+                    let at_row = call_base_row + (p.row - measure_start);
+                    let at = (tempo.time_at_row(at_row) * sr) as i64;
+                    let ramp_end_row = p.row + p.ramp_rows;
+                    let ramp_end = (tempo.time_at_row(call_base_row + (ramp_end_row - measure_start)) * sr) as i64;
+                    automation.push(ChipAutomation { at, ramp_samples: (ramp_end - at).max(0), pitch_hz: Some(p.value), volume: None });
+                }
+                for p in nr.vol_points.iter().skip(1) {
+                    let at_row = call_base_row + (p.row - measure_start);
+                    let at = (tempo.time_at_row(at_row) * sr) as i64;
+                    let ramp_end_row = p.row + p.ramp_rows;
+                    let ramp_end = (tempo.time_at_row(call_base_row + (ramp_end_row - measure_start)) * sr) as i64;
+                    if let Some(existing) = automation.iter_mut().find(|x| x.at == at) {
+                        existing.volume = Some(p.value);
+                        existing.ramp_samples = existing.ramp_samples.max((ramp_end - at).max(0));
+                    } else {
+                        automation.push(ChipAutomation { at, ramp_samples: (ramp_end - at).max(0), pitch_hz: None, volume: Some(p.value) });
+                    }
+                }
+                automation.sort_by_key(|p| p.at);
+
+                chips.push(ChipNote {
+                    start,
+                    end,
+                    iid: patch_iid,
+                    note: midi,
+                    velocity: vel,
+                    pitch_hz: initial_hz,
+                    automation,
+                    line: li as u32,
+                    seq,
+                    part_path: Arc::clone(&chip_path),
+                    source_row: rel_row,
+                });
+            }
+            continue;
+        }
+        // ──────────────────────────────────────────────────────────────
+
         let tpl = cache.template(
             project.part_hash_map()[&call.name],
                                  part,
@@ -280,7 +341,6 @@ pub(crate) fn prepare_line(
         }
 
         if !tpl.vst_notes.is_empty() {
-            // One shared path per part call; every note clones the Arc.
             let vst_path: Arc<str> = Arc::from(part.sample_path.as_str());
             for vn in &tpl.vst_notes {
                 if vn.rel_row < measure_start || vn.rel_row >= measure_end {
@@ -309,5 +369,5 @@ pub(crate) fn prepare_line(
             }
         }
     }
-    Loaded { samples, vsts }
+    Loaded { samples, vsts, chips }
 }

@@ -1,4 +1,15 @@
 //! Voice scheduling, mixer, and DSP primitives.
+//!
+//! # Chip players
+//!
+//! This engine has four voice sources: samples, SF2, VST, and chips.
+//! Chip players (`crate::hosting::chip::ChipPlayer`) render a *patch*
+//! through a data-driven backend (`.chip` file). They replace the old
+//! VGM player, which replayed register writes through ymfm-sys.
+//!
+//! Each chip instance is its own mixer channel (`iid` -> `part_path`).
+//! Notes are dispatched at block boundaries (~10 ms at 48 kHz); sample-
+//! accurate dispatch is a future upgrade.
 
 mod dsp;
 pub(crate) mod perf;
@@ -15,15 +26,16 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::effects::EffectChain;
+use crate::hosting::chip::{ChipNote, ChipPlayer};
 use crate::hosting::sf2::engine::Sf2Engine;
 use crate::hosting::vst::ffi::VstHost;
-use crate::player::project::{Project, Sample};
+use crate::player::project::Project;
 use crate::player::inserts;
 
-// Re-exports so the rest of the app doesn't break
 pub(crate) use voices::{Scheduled, Active};
 pub(crate) use vst::HostSlot;
 pub(crate) use shims::ShimHost;
+pub(crate) use crate::player::types::Sample;
 
 #[derive(Clone, Debug)]
 pub(crate) struct VstNote {
@@ -45,19 +57,25 @@ impl VstNote {
 }
 
 pub(crate) enum Msg {
-    Batch { epoch: u64, samples: Vec<Scheduled>, vsts: Vec<VstNote> },
-    Seek  { epoch: u64, pos: i64, samples: Vec<Scheduled>, vsts: Vec<VstNote> },
+    Batch {
+        epoch: u64,
+        samples: Vec<Scheduled>,
+        vsts: Vec<VstNote>,
+        chips: Vec<ChipNote>,
+    },
+    Seek {
+        epoch: u64,
+        pos: i64,
+        samples: Vec<Scheduled>,
+        vsts: Vec<VstNote>,
+        chips: Vec<ChipNote>,
+    },
 }
 
 pub(crate) const VST_BLOCK: i64 = 512;
 pub(crate) const VST_HISTORY_SECS: f64 = 10.0;
 pub(crate) const HOLD_TAIL_SECS: f64 = 0.020;
 
-/// How many blocks to keep processing a VST after its last note event.
-/// 20 blocks × 512 samples @ 48kHz ≈ 213ms — covers most release
-/// envelopes and short reverb tails, but skips hosts that have been
-/// silent for a quarter second.  Larger values waste CPU on silent
-/// plugins in dense projects; smaller values clip audible tails.
 pub(crate) const VST_TAIL_BLOCKS: u32 = 20;
 
 pub(crate) struct Engine {
@@ -107,6 +125,18 @@ pub(crate) struct Engine {
     pub(crate) master_fx: Option<EffectChain>,
     pub(crate) pause_fade: f32,
     pub(crate) tail_frames: i64,
+
+    /// One chip player per chip instance. Keyed by `iid`; the mapping
+    /// `iid -> part_path` lives in `iid_to_part_path` (shared with VSTs
+    /// and SF2s).
+    pub(crate) chip_players: BTreeMap<u16, ChipPlayer>,
+    pub(crate) chip_pending: VecDeque<ChipNote>,
+    pub(crate) chip_active: Vec<ChipNote>,
+    chip_ended: Vec<ChipNote>,
+    chip_gain_scratch: Vec<(u16, f32)>,
+    /// All chip notes ever ingested, for the tracker's history view.
+    /// Mirrors `vst_log`.
+    pub(crate) chip_log: Vec<ChipNote>,
 }
 
 impl Engine {
@@ -157,6 +187,12 @@ impl Engine {
             shim_link_r: vec![0.0; VST_BLOCK as usize],
             vst_events_buf: Vec::with_capacity(128),
             render_flags: Vec::new(),
+            chip_players: BTreeMap::new(),
+            chip_pending: VecDeque::new(),
+            chip_active: Vec::new(),
+            chip_ended: Vec::with_capacity(256),
+            chip_gain_scratch: Vec::with_capacity(8),
+            chip_log: Vec::new(),
         }
     }
 
@@ -196,13 +232,17 @@ impl Engine {
         self.vst_held.entry(iid).or_insert(0);
     }
 
-    pub(crate) fn host_count(&self) -> usize {
-        self.hosts.len()
+    /// Register a fully-constructed chip player under `iid`. The player
+    /// owns its backend, patch table, and internal voice allocation. The
+    /// engine will dispatch notes to it and call `render` each block.
+    pub(crate) fn install_chip(&mut self, iid: u16, part_path: String, player: ChipPlayer) {
+        self.register_part_path(iid, part_path);
+        self.chip_players.insert(iid, player);
     }
 
-    pub(crate) fn sf2_engine_count(&self) -> usize {
-        self.sf2_engines.len()
-    }
+    pub(crate) fn host_count(&self) -> usize { self.hosts.len() }
+    pub(crate) fn sf2_engine_count(&self) -> usize { self.sf2_engines.len() }
+    pub(crate) fn chip_count(&self) -> usize { self.chip_players.len() }
 
     pub(crate) fn install_master_fx(&mut self, chain: EffectChain) {
         self.master_fx = Some(chain);
@@ -213,6 +253,134 @@ impl Engine {
     }
 
     pub(crate) fn sample_rate(&self) -> f64 { self.sr }
+
+    // ─────────────── chip gain ───────────────
+
+    fn chip_gain(&self, iid: u16) -> f32 {
+        // Two chip players: 100 = sn76489, 101 = ym2612. The mixer's
+        // mute/volume registry doesn't track these paths, so use
+        // song_volume directly instead of zeroing out.
+        if iid == 100 || iid == 101 {
+            return self.song_volume as f32;
+        }
+        let path = match self.iid_to_part_path.get(&iid) {
+            Some(p) => p.as_str(),
+            None => return 0.0,
+        };
+        if !crate::mixer::mute::is_note_active(path, 0, 0) {
+            return 0.0;
+        }
+        let v = crate::mixer::part_volume::get(path);
+        (self.song_volume * v) as f32
+    }
+
+    // ─────────────── chip ingest ───────────────
+
+    pub(crate) fn ingest_chip(&mut self, mut notes: Vec<ChipNote>) {
+        notes.sort_unstable_by_key(|n| (n.start, n.line, n.seq));
+
+        if self.chip_pending.capacity() < self.chip_pending.len() + notes.len() + 64 {
+            self.chip_pending.reserve(notes.len() + 64);
+        }
+        if self.chip_log.capacity() < self.chip_log.len() + notes.len() + 64 {
+            self.chip_log.reserve(notes.len() + 64);
+        }
+        self.chip_active.reserve(notes.len());
+        self.chip_ended.reserve(notes.len());
+
+        const CHIP_LOG_MAX: usize = 10_000;
+        if self.chip_log.len() + notes.len() > CHIP_LOG_MAX {
+            let drop = ((self.chip_log.len() + notes.len()) - CHIP_LOG_MAX)
+            .min(self.chip_log.len());
+            self.chip_log.drain(..drop);
+        }
+
+        for mut n in notes {
+            self.chip_log.push(n.clone());
+            if n.end <= self.pos {
+                continue;
+            }
+            // Chip parts (iids 100/101) don't participate in the mixer's mute
+            // registry — those paths are chip patch files, not sample/VST paths.
+            // Skip the check for them so notes actually reach `render_chips`.
+            if n.iid != 100 && n.iid != 101 {
+                if !crate::mixer::mute::is_note_active(&n.part_path, n.line as usize, n.source_row as i64) {
+                    continue;
+                }
+            }
+            if n.start < self.pos {
+                // Note was already sounding when we entered this block:
+                // begin it now so the tail is audible.
+                n.start = self.pos;
+            }
+            let key = (n.start, n.line, n.seq);
+            if self.chip_pending.back().map_or(true, |b| (b.start, b.line, b.seq) <= key) {
+                self.chip_pending.push_back(n);
+            } else {
+                let idx = self
+                .chip_pending
+                .binary_search_by_key(&key, |p| (p.start, p.line, p.seq))
+                .unwrap_or_else(|i| i);
+                self.chip_pending.insert(idx, n);
+            }
+        }
+
+    }
+
+    // ─────────────── chip render ───────────────
+
+    /// Dispatch due note-ons and note-offs into chip players, then render
+    /// each player's block. Block-boundary dispatch (not sample-accurate);
+    /// upgrade path is to pass absolute sample time into the player.
+    fn render_chips(&mut self, out_l: &mut [f32], out_r: &mut [f32], block_start: i64) {
+        if self.chip_players.is_empty() {
+            return;
+        }
+        let block_end = block_start + out_l.len() as i64;
+
+        self.chip_ended.clear();
+        {
+            let (active, ended) = (&mut self.chip_active, &mut self.chip_ended);
+            active.retain(|n| {
+                if n.end <= block_start {
+                    ended.push(n.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        for n in &self.chip_ended {
+            if let Some(p) = self.chip_players.get_mut(&n.iid) {
+                p.note_off(n);
+            }
+        }
+
+        while let Some(n) = self.chip_pending.front() {
+            if n.start >= block_end { break; }
+            let note = self.chip_pending.pop_front().unwrap();
+            if let Some(p) = self.chip_players.get_mut(&note.iid) {
+                p.note_on(&note);
+            }
+            self.chip_active.push(note);
+        }
+
+        self.chip_gain_scratch.clear();
+        for iid in self.chip_players.keys().copied() {
+            let gain = self.chip_gain(iid);
+            self.chip_gain_scratch.push((iid, gain));
+        }
+        for idx in 0..self.chip_gain_scratch.len() {
+            let (iid, gain) = self.chip_gain_scratch[idx];
+            if gain <= 0.0 { continue; }
+            if let Some(player) = self.chip_players.get_mut(&iid) {
+                player.render(out_l, out_r, block_start, gain);
+            }
+        }
+
+    }
+
+    // ─────────────── sample voices ───────────────
 
     pub(crate) fn ingest(&mut self, mut voices: Vec<Scheduled>) {
         voices.sort_unstable_by_key(Scheduled::key);
@@ -288,6 +456,8 @@ impl Engine {
         }
     }
 
+    // ─────────────── seek ───────────────
+
     pub(crate) fn apply_seek(&mut self, to: i64, voices: Vec<Scheduled>) {
         self.pos = to.clamp(0, self.total);
         self.active.clear();
@@ -298,22 +468,34 @@ impl Engine {
         self.vst_log.clear();
         self.vst_synced = true;
         self.vst_hist_head = i64::MIN;
+        // Chip state: reset voices, drop pending/active notes, and reset
+        // the chip players to a silent state. Seeking is a full re-entry;
+        // any note that would have been mid-flight is restarted by the
+        // loader's seek batch.
+        self.chip_pending.clear();
+        self.chip_active.clear();
+        self.chip_log.clear();
+        for p in self.chip_players.values_mut() {
+            p.seek(to);
+        }
         self.ready = true;
         self.ingest(voices);
     }
 
     pub(crate) fn handle(&mut self, m: Msg) {
         match m {
-            Msg::Batch { epoch, samples, vsts } => {
+            Msg::Batch { epoch, samples, vsts, chips } => {
                 if epoch == self.epoch {
                     self.ingest(samples);
                     self.ingest_vst(vsts);
+                    self.ingest_chip(chips);
                 }
             }
-            Msg::Seek { epoch, pos, samples, vsts } => {
+            Msg::Seek { epoch, pos, samples, vsts, chips } => {
                 self.epoch = epoch;
                 self.apply_seek(pos, samples);
                 self.ingest_vst(vsts);
+                self.ingest_chip(chips);
             }
         }
     }
@@ -323,16 +505,11 @@ impl Engine {
     }
 
     pub(crate) fn active_count(&self) -> usize {
-        self.active.len()
+        self.active.len() + self.chip_active.len()
     }
 
     pub(crate) fn render(&mut self, out_l: &mut [f32], out_r: &mut [f32], speed: i64) {
-        // Denormals make reverb/filter tails many times slower; this flag
-        // is per-thread, so set it on whichever thread runs the callback.
         vst::enable_ftz_daz();
-        // Also try to escalate this thread to real-time priority.  The
-        // function is idempotent (only tries once per thread) so it's
-        // safe to call on every render block.
         vst::set_realtime_priority();
 
         out_l.fill(0.0);
@@ -389,13 +566,19 @@ impl Engine {
         }
         perf::lap(&mut lap_t, &PERF.vst_ns);
 
-        // 3. Shims
+        // 3. Chip players (replaces the old VGM path).
+        //    Same speed==1 constraint: chip players don't time-stretch.
+        if !self.chip_players.is_empty() && speed == 1 {
+            self.render_chips(out_l, out_r, block_start);
+        }
+
+        // 4. Shims
         if !self.shims.is_empty() {
             self.process_shims(out_l, out_r);
         }
         perf::lap(&mut lap_t, &PERF.shim_ns);
 
-        // 4. Master FX
+        // 5. Master FX
         sanitize(out_l);
         sanitize(out_r);
 
@@ -422,7 +605,6 @@ impl Engine {
 
         PERF.record_block(t_start.elapsed(), (block_len as f64 / self.sr * 1e9) as u64);
 
-        // Tail logic
         if speed == 0 {
             self.tail_frames -= block_len;
             self.pause_fade = (self.pause_fade - (block_len as f32 / (0.1 * self.sr) as f32)).max(0.0);

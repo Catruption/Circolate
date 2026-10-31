@@ -310,3 +310,79 @@ pub fn install_shims(
         total: total_shims,
     );
 }
+
+pub(crate) fn install_chip_players(
+    engine: &mut crate::player::engine::Engine,
+    project: &crate::player::project::Project,
+    share_dir: Option<&std::path::Path>,
+) {
+    use crate::hosting::chip::{ChipPlayer, chip::parse as parse_chip};
+
+    let Some(share) = share_dir else { return };
+
+    let locate = |name: &str| -> Option<std::path::PathBuf> {
+        let candidates = [
+            share.join("chip").join(name),
+            share.join("chip").join(format!("{}.txt", name)),
+            share.parent().map(|p| p.join("chip").join(name)).unwrap_or_default(),
+            share.parent().map(|p| p.join("chip").join(format!("{}.txt", name))).unwrap_or_default(),
+            std::path::PathBuf::from("share/chip").join(name),
+        ];
+        candidates.into_iter().find(|c| !c.as_os_str().is_empty() && c.is_file())
+    };
+
+    let sn_chip = locate("sn76489.chip")
+    .and_then(|p| std::fs::read_to_string(p).ok())
+    .and_then(|t| parse_chip(&t).ok());
+
+    // Group patches by chip.
+    let mut psg_patches: Vec<(String, crate::hosting::chip::patch::Patch)> = Vec::new();
+    let mut fm_patches:  Vec<(String, crate::hosting::chip::patch::Patch)> = Vec::new();
+    for (path, patch) in &project.patch_instruments {
+        if patch.requires.iter().any(|r| r.capability == "sample.pcm") {
+            continue;
+        }
+        if patch.requires.iter().any(|r| r.capability == "fm.operator") {
+            fm_patches.push((path.clone(), patch.clone()));
+        } else if patch.requires.iter().any(|r| {
+            r.capability == "tone.square" || r.capability == "noise.lfsr"
+        }) {
+            psg_patches.push((path.clone(), patch.clone()));
+        }
+    }
+
+    // PSG player (SN76489 via CoreState)
+    if !psg_patches.is_empty() {
+        match sn_chip {
+            Some(chip) => match ChipPlayer::new(chip, project.sample_rate) {
+                Ok(mut player) => {
+                    let n = psg_patches.len();
+                    if let Some(track) = project.vgm_dac.clone() { player.set_dac(track); }
+                    for (path, patch) in psg_patches {
+                        player.add_patch(path, patch);
+                    }
+                    engine.install_chip(100, "sn76489".into(), player);
+                    eprintln!("chip install: PSG player with {} patches", n);
+                }
+                Err(e) => eprintln!("PSG player init failed: {}", e),
+            },
+            None => eprintln!("sn76489.chip not found; PSG silent"),
+        }
+    }
+
+    // FM player (YM2612 via YmfmBackend)
+    if !fm_patches.is_empty() || project.vgm_dac.is_some() {
+        match ChipPlayer::new_ymfm(7_670_453, project.sample_rate) {
+            Ok(mut player) => {
+                let n = fm_patches.len();
+                if let Some(track) = project.vgm_dac.clone() { player.set_dac(track); }
+                for (path, patch) in fm_patches {
+                    player.add_patch(path, patch);
+                }
+                engine.install_chip(101, "ym2612".into(), player);
+                eprintln!("chip install: FM player with {} patches", n);
+            }
+            Err(e) => eprintln!("FM player init failed: {}", e),
+        }
+    }
+}

@@ -35,14 +35,15 @@ pub(crate) fn enable_ftz_daz() {
     }
 }
 
-/// Try to put the calling thread into SCHED_FIFO (real-time priority).
-/// Falls back to SCHED_RR, then nice -20, then nothing.
-///
-/// Requires CAP_SYS_NICE (or membership in the `audio` group with
-/// `@audio - rtprio 95` in /etc/security/limits.conf) for SCHED_FIFO
-/// to succeed.  Without it, nice -20 is still better than SCHED_OTHER.
+/// Optionally put the audio callback into SCHED_FIFO. This is disabled by
+/// default because an unbounded realtime callback can starve the TUI. Set
+/// CIRCOLATE_AUDIO_RT=1 to opt in when the audio workload is well behaved.
 #[inline]
 pub(crate) fn set_realtime_priority() {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("CIRCOLATE_AUDIO_RT").is_some()) {
+        return;
+    }
     #[cfg(target_os = "linux")]
     unsafe {
         // Only try once per thread — pthread_setschedparam is cheap but
@@ -64,16 +65,6 @@ pub(crate) fn set_realtime_priority() {
             );
             if rc == 0 { return; }
 
-            // Fallback 1: SCHED_RR (round-robin real-time)
-            let rc2 = libc::pthread_setschedparam(
-                libc::pthread_self(),
-                                                  libc::SCHED_RR,
-                                                  &param,
-            );
-            if rc2 == 0 { return; }
-
-            // Fallback 2: nice -20 (highest normal priority)
-            libc::setpriority(libc::PRIO_PROCESS, 0, -20);
         });
     }
 
@@ -97,7 +88,6 @@ fn audio_pool() -> &'static rayon::ThreadPool {
         .thread_name(|i| format!("circolate-vst-{i}"))
         .start_handler(|_| {
             enable_ftz_daz();
-            set_realtime_priority();
         })
         .build()
         .expect("failed to build VST thread pool")

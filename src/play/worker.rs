@@ -15,9 +15,6 @@ pub struct ReloadSlot {
     pub pending: Mutex<Option<(Arc<Project>, Arc<Mutex<Cache>>)>>,
 }
 
-/// (path, length, mtime) of every file whose change should trigger a
-/// reload: the trackscript, samples.json, the fidelity and requires
-/// sidecars, and everything in `instruments/`.
 type Signature = Vec<(PathBuf, u64, Option<SystemTime>)>;
 
 fn signature(main: &Path) -> Signature {
@@ -38,22 +35,16 @@ fn signature(main: &Path) -> Signature {
     }
     files.sort();
     files
-        .into_iter()
-        .map(|p| {
-            let m = std::fs::metadata(&p).ok();
-            let len = m.as_ref().map_or(0, |m| m.len());
-            let mtime = m.and_then(|m| m.modified().ok());
-            (p, len, mtime)
-        })
-        .collect()
+    .into_iter()
+    .map(|p| {
+        let m = std::fs::metadata(&p).ok();
+        let len = m.as_ref().map_or(0, |m| m.len());
+        let mtime = m.and_then(|m| m.modified().ok());
+        (p, len, mtime)
+    })
+    .collect()
 }
 
-/// Poll the project's files and publish a freshly loaded project into
-/// `slot` whenever any of them changes.
-///
-/// `_initial_hashes` is kept so the caller doesn't change; it is unused
-/// because comparing part hashes made edits to anything but notes
-/// (instruments, arrangement, tempo, volume) invisible.
 pub fn watch_for_changes(
     path: PathBuf,
     rate: u32,
@@ -75,8 +66,6 @@ pub fn watch_for_changes(
             continue;
         }
 
-        // Debounce: wait until the files stop changing (editors often
-        // write a temp file, then rename, then touch sidecars).
         let mut cur = sig;
         for _ in 0..MAX_SETTLE_ROUNDS {
             std::thread::sleep(SETTLE);
@@ -90,14 +79,8 @@ pub fn watch_for_changes(
                 break;
             }
         }
-        // Recorded *before* loading: a save that lands during the load
-        // differs from this and triggers another reload.  It is also
-        // recorded when the load fails, so a half-typed file isn't
-        // re-parsed every poll.
         last_sig = cur;
 
-        // No `Silence` here: it dup2()s the process-wide stdout/stderr,
-        // which the TUI is drawing to while this thread runs.
         if let Ok((project, cache)) = player::load_project(&path, rate, use_cache, true) {
             if let Ok(mut g) = slot.pending.lock() {
                 *g = Some((project, Arc::new(Mutex::new(cache))));
@@ -145,6 +128,7 @@ pub fn worker(
                 pos: req,
                 samples: batch.samples,
                 vsts: batch.vsts,
+                chips: batch.chips,
             };
             if tx.send(msg).is_err() {
                 break;
@@ -153,12 +137,15 @@ pub fn worker(
             let pos = tp.position.load(Ordering::Relaxed);
             let horizon = pos + lookahead;
             let batch = loader.load_due(horizon);
-            let empty = batch.samples.is_empty() && batch.vsts.is_empty();
+            let empty = batch.samples.is_empty()
+            && batch.vsts.is_empty()
+            && batch.chips.is_empty();
             if !empty {
                 let msg = Msg::Batch {
                     epoch,
                     samples: batch.samples,
                     vsts: batch.vsts,
+                    chips: batch.chips,
                 };
                 if tx.send(msg).is_err() {
                     break;
@@ -173,11 +160,15 @@ pub fn worker(
                 && pos + tail_margin >= total
                 {
                     let tail = loader.load_due(i64::MAX);
-                    if !(tail.samples.is_empty() && tail.vsts.is_empty()) {
+                    if !(tail.samples.is_empty()
+                        && tail.vsts.is_empty()
+                        && tail.chips.is_empty())
+                    {
                         let msg = Msg::Batch {
                             epoch,
                             samples: tail.samples,
                             vsts: tail.vsts,
+                            chips: tail.chips,
                         };
                         if tx.send(msg).is_err() {
                             break;
@@ -190,6 +181,7 @@ pub fn worker(
                         pos: 0,
                         samples: first.samples,
                         vsts: first.vsts,
+                        chips: first.chips,
                     };
                     if wrap_tx.send(wrap).is_err() {
                         break;

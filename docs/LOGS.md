@@ -454,6 +454,18 @@ VSTs initialized.
 
 - All VST hosts finished installing.
 
+### `player.perf` — INFO
+
+```
+load={load} worst={worst} overruns={overruns} voices={voices} vst={vst} shim={shim} fx={fx} ui_draw_ms={ui_draw_ms} ui_draw_worst_ms={ui_draw_worst_ms}
+```
+
+- fields: `load`, `worst`, `overruns`, `voices`, `vst`, `shim`, `fx`, `ui_draw_ms`, `ui_draw_worst_ms`
+
+- since 0.1.0
+
+- Per-second render load and average/worst terminal draw times.
+
 ### `player.load.fidelity_summary` — INFO
 
 ```
@@ -861,6 +873,64 @@ vtrace: scheduled sample {sample_id} start={start} end={end} ({len} samples, {se
 - since 0.1.0
 
 - Offline render wrote samples outside [-1, 1].
+
+### `player.load.vgm_found` — INFO
+
+```
+  VGM: found audio.vgm ({size} bytes)
+```
+
+- fields: `size`
+
+- since 0.1.0
+
+- Found the embedded VGM audio file.
+
+### `player.load.vgm_part` — INFO
+
+```
+  VGM: part='{name}' sample_path='{sample_path}'
+```
+
+- fields: `name`, `sample_path`
+
+- since 0.1.0
+
+- Details of a parsed part to debug VGM matching.
+
+### `player.load.vgm_registered` — INFO
+
+```
+  VGM: registered part '{name}'
+```
+
+- fields: `name`
+
+- since 0.1.0
+
+- A VGM instrument was successfully registered.
+
+### `player.load.vgm_no_audio` — WARN
+
+```
+  VGM: no audio.vgm found in bundle
+```
+
+- since 0.1.0
+
+- Failed to find audio.vgm in the extracted bundle.
+
+### `player.load.vgm_no_voices` — ERROR
+
+```
+  VGM diagnostics: parts={parts} vgms={vgms} has_audio={has_audio} lines={lines}
+```
+
+- fields: `parts`, `vgms`, `has_audio`, `lines`
+
+- since 0.1.0
+
+- No playable voices. Dumping diagnostics.
 
 ## `deps`
 

@@ -1,0 +1,18 @@
+bank 1
+name     "sonic_sms"
+author   "..."
+license  "VGM abc123 — see source ROM"
+chip     sn76489  variant sega
+
+patch    pluck_sms_01.patch
+patch    hat_sms_01.patch
+patch    bass_sms_01.patch
+
+map      program 0 -> pluck_sms_01
+map      program 1 -> bass_sms_01
+map      program 2 -> hat_sms_01
+
+zone     36..47  hat_sms_01
+
+# Samples are only valid for chips advertising sample.pcm.
+# sample   kick_dac  samples/kick.flac  rate 11025  depth 8  root 60

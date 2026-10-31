@@ -201,7 +201,7 @@ pub fn resolve_track(name: &str) -> Result<PathBuf> {
 
     let mut searched: Vec<PathBuf> = Vec::new();
     for dir in roots {
-        for ext in ["", ".tsz", ".trackscript", ".flp", ".it"] {
+        for ext in ["", ".tsz", ".trackscript", ".flp", ".it", ".mid", ".midi", ".vgm", ".vgz"] {
             let candidate = dir.join(format!("{}{}", name, ext));
             searched.push(candidate.clone());
             if candidate.is_file() {

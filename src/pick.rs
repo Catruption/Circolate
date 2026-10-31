@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub const FILTER_TRACKSCRIPT: &str =
-"*.trackscript *.tsz *.flp *.it *.mid *.midi|Trackscript sources";
+"*.trackscript *.tsz *.flp *.it *.mid *.midi *.vgm *.vgz|Trackscript sources";
 pub const FILTER_SOURCE: &str =
-"*.flp *.it *.mid *.midi|FLP / IT / MIDI sources";
+"*.flp *.it *.mid *.midi *.vgm *.vgz|FLP / IT / MIDI / VGM sources";
 pub const FILTER_SF2: &str =
 "*.sf2 *.sf3 *.SF2 *.SF3|SoundFont files";
 

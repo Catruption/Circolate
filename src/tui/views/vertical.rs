@@ -1,16 +1,4 @@
 //! Vertical tracker layout for tall/narrow terminals.
-//!
-//! Reads like the trackscript source rather than a tracker grid.  Each
-//! part is a paragraph: a name line with accented block number and `ƒ`
-//! glyph, one or more event lines in source syntax, a multi-row braille
-//! waveform of the part's sample at full width, then a blank gap.
-//!
-//! When the part has inline shims (`ƒpianoer(2)@<ƒFruity_Limiter()>@…`)
-//! the label line ends in `@`.  When `state.expanded_chains` contains its
-//! path the marker becomes `↦` directly after the name and the effects
-//! follow inline as `<ƒTarget()>` cells (`;` after the last), wrapping onto
-//! extra rows when they don't fit.  Shims are looked up on the BlockList
-//! line each source call came from, so carried-over notes keep their chain.
 
 use ratatui::{
     layout::Rect,
@@ -24,15 +12,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 
 use crate::mixer::{mute, part_volume};
-use crate::player::envelope::wrapped_pos;
-use crate::player::notes::{split_notes, value_at, DisplayNote};
-use crate::player::scope::scope_snapshot;
+use crate::player::envelope::{synth_envelope_static, whole_sample_envelope, wrapped_pos, SCOPE_SAMPLES_PER_BIN};
+use crate::player::notes::{value_at, DisplayNote};
+use crate::player::scope::{scope_snapshot_recent, vgm_scope_slot};
 use crate::player::{Project, Transport};
 use crate::formats::trackscript::C5_HZ;
 use crate::tui::shared::label;
 use crate::tui::shared::note_fmt::{fmt_num, fmt_pitch};
 use crate::tui::shared::note_style::{note_style, NoteState};
-use crate::tui::shared::waveform::{render_waveform, synth_waveform};
+use crate::tui::shared::waveform::{render_envelope, synth_waveform};
 use crate::tui::state::{RenderState, VerticalHit, VerticalRow};
 use crate::tui::theme::{Theme, Token};
 
@@ -139,15 +127,9 @@ pub fn draw(
         let offset_rows = k as f64 * rpmeasure;
         for call in p.line_calls(prev_li) {
             let Some(path) = p.part_path(&call.name) else { continue };
-            let subs = p.part_subs_per_beat(&call.name);
             let measure_end = call.pattern_measure_start + call.pattern_measure_len;
-            let still_on = split_notes(
-                p.part_events(&call.name),
-                                       subs,
-                                       p.part_sample_offset_u32(&call.name),
-            )
-            .iter()
-            .any(|n| {
+            let Some(note_rows) = p.note_rows(&call.name) else { continue };
+            let still_on = note_rows.iter().any(|n| {
                 n.start_row >= call.pattern_measure_start
                 && n.start_row < measure_end
                 && (n.end_row - call.pattern_measure_start) > offset_rows
@@ -227,14 +209,11 @@ pub fn draw(
             let is_current = *offset_rows == 0.0;
             let measure_end = measure_start + measure_len;
 
-            for mut note in split_notes(
-                p.part_events(name),
-                                        subs,
-                                        p.part_sample_offset_u32(name),
-            ) {
-                if note.start_row < *measure_start || note.start_row >= measure_end {
-                    continue;
-                }
+            let Some(note_rows) = p.note_rows(name) else { continue };
+            for source_note in note_rows.iter().filter(|n| {
+                n.start_row >= *measure_start && n.start_row < measure_end
+            }) {
+                let mut note = source_note.clone();
 
                 let ms = *measure_start;
                 note.start_row -= ms;
@@ -262,8 +241,6 @@ pub fn draw(
                     (0.0, 0.0)
                 };
 
-                // Save the true start row (relative to the measure) before we
-                // zero it out for lookback notes.
                 let original_start = note.start_row as i64;
 
                 if !is_current {
@@ -294,16 +271,13 @@ pub fn draw(
                 } else {
                     NoteState::Waiting
                 };
+
                 let note_local_row = dn.value_offset + current_row;
                 let lookup_row = note_local_row.max(original_start as f64);
 
                 let pitch = value_at(&dn.note.pitch_points, lookup_row).unwrap_or(440.0);
                 let vol = value_at(&dn.note.vol_points, lookup_row).unwrap_or(100.0);
 
-                // FIX: X-Ray highlight. `is_current` == `*offset_rows == 0.0`;
-                // for those notes `dn.note.start_row` is measure-local and
-                // matches the (block_line, measure-local start) key that
-                // analysis.rs emits via state.motion_highlights.
                 let is_motion_highlight = *offset_rows == 0.0
                 && state
                 .motion_highlights
@@ -397,9 +371,6 @@ pub fn draw(
         .unwrap_or(&first_name)
         .to_string();
 
-        // Inline shim chain.  Look on the BlockList line each source call
-        // came from (current line first, then lookback lines), so a part
-        // carried over from an earlier line still shows its chain.
         let shim_names: Vec<String> = sources
         .iter()
         .map(|(_, off, _, _)| li.saturating_sub((off / rpmeasure).round() as usize))
@@ -411,7 +382,21 @@ pub fn draw(
         let expanded = state.expanded_chains.contains(path.as_str());
         let marker_chars = if has_chain { 1 } else { 0 };
 
-        let vol = part_volume::get(path);
+        // VGM parts all share one physical chip; their per-part volume is
+        // reported through the canonical "vgm" mixer key that the engine
+        // reads. Fall back to the part's own path if "vgm" hasn't been
+        // touched (which is what happens when the user adjusts the one
+        // VGM channel the engine registered).
+        let vol = if path.to_lowercase().contains("vgm") {
+            let canonical = part_volume::get("vgm");
+            if (canonical - 1.0).abs() > 1e-6 {
+                canonical
+            } else {
+                part_volume::get(path)
+            }
+        } else {
+            part_volume::get(path)
+        };
         let show_vol = p.part_supports_volume(path);
         let vol_tag = if show_vol && (vol - 1.0).abs() > 0.01 {
             format!(" {}%", (vol * 100.0).round() as i64)
@@ -430,8 +415,6 @@ pub fn draw(
             }
         }
 
-        // Parts with a chain keep the marker right after the name, so the
-        // label isn't padded out to the right edge in that case.
         let fill = if has_chain {
             label.chars().count().min(avail)
         } else {
@@ -583,7 +566,6 @@ pub fn draw(
         });
     }
 
-    // ── pass 2: fit blocks, allocate wave rows ────────────────────
     let mut total_fixed = 0usize;
     let mut included = 0usize;
     for (i, b) in blocks.iter().enumerate() {
@@ -606,7 +588,6 @@ pub fn draw(
     let per_wave = if included == 0 { 0 } else { available / included };
     let wave_rows = per_wave.max(min_wave_rows);
 
-    // ── pass 3: emit lines and hit-test rows ──────────────────────
     let mut lines: Vec<Line> = Vec::with_capacity(inner_h);
     let mut hit_rows: Vec<(u16, VerticalRow)> = Vec::new();
     let mut y: u16 = 0;
@@ -666,55 +647,62 @@ pub fn draw(
 
         let wave: Vec<Vec<Span<'static>>> =
         if let Some(sample) = p.preview_sample_for_part(&block.first_name) {
-            render_waveform(
-                &sample,
-                inner_w,
-                wave_rows,
-                base_style,
-                ph_col,
-                ph_style,
-            )
-        } else if let Some(iid) = p.iid_for_part(&block.first_name) {
-            scope_snapshot(iid as usize, &mut state.snapshot);
-            if state.snapshot.is_empty() {
-                vec![
-                    vec![Span::styled(" ".to_string(), base_style); inner_w];
-                    wave_rows
-                ]
+            let bins = inner_w.saturating_mul(2);
+            let key = (block.path.clone(), bins);
+            let env = state.sample_env_cache.entry(key)
+                .or_insert_with(|| whole_sample_envelope(&sample, bins));
+            render_envelope(env, inner_w, wave_rows, base_style, ph_col, ph_style)
+        } else if let Some(slot) = vgm_scope_slot(&block.path)
+            .or_else(|| p.iid_for_part(&block.first_name).map(|iid| iid as usize))
+            {
+                // VST parts read their own iid ring; VGM parts read the shared
+                // PSG / YM chip tap the engine publishes each block.
+                scope_snapshot_recent(
+                    slot,
+                    inner_w.saturating_mul(2).saturating_mul(SCOPE_SAMPLES_PER_BIN),
+                    &mut state.snapshot,
+                );
+                if state.snapshot.is_empty() {
+                    let bins = inner_w.saturating_mul(2);
+                    let env = state.synth_env_cache.entry((block.path.clone(), bins))
+                        .or_insert_with(|| synth_envelope_static(p, &block.first_name, bins));
+                    render_envelope(&env, inner_w, wave_rows, base_style, ph_col, ph_style)
+                } else {
+                    synth_waveform(
+                        &state.snapshot,
+                        inner_w,
+                        wave_rows,
+                        base_style,
+                        ph_col,
+                        ph_style,
+                    )
+                }
             } else {
-                synth_waveform(
-                    &state.snapshot,
-                    inner_w,
-                    wave_rows,
-                    base_style,
-                    ph_col,
-                    ph_style,
-                )
+                // No sample, no VST iid and not a VGM part: synthesize an
+                // envelope from the part's notes.
+                let bins = inner_w.saturating_mul(2);
+                let env = state.synth_env_cache.entry((block.path.clone(), bins))
+                    .or_insert_with(|| synth_envelope_static(p, &block.first_name, bins));
+                render_envelope(&env, inner_w, wave_rows, base_style, ph_col, ph_style)
+            };
+
+            for row in wave {
+                if y >= inner_h as u16 { break; }
+                lines.push(Line::from(row));
+                hit_rows.push((
+                    y,
+                    VerticalRow::Waveform {
+                        path: block.path.clone(),
+                               line: li,
+                    },
+                ));
+                y += 1;
             }
-        } else {
-            vec![
-                vec![Span::styled(" ".to_string(), base_style); inner_w];
-                wave_rows
-            ]
-        };
 
-        for row in wave {
-            if y >= inner_h as u16 { break; }
-            lines.push(Line::from(row));
-            hit_rows.push((
-                y,
-                VerticalRow::Waveform {
-                    path: block.path.clone(),
-                           line: li,
-                },
-            ));
-            y += 1;
-        }
-
-        if y < inner_h as u16 && i + 1 < blocks.len() {
-            lines.push(Line::from(""));
-            y += 1;
-        }
+            if y < inner_h as u16 && i + 1 < blocks.len() {
+                lines.push(Line::from(""));
+                y += 1;
+            }
     }
 
     f.render_widget(Paragraph::new(lines).block(outer), area);

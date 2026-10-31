@@ -11,6 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 
@@ -28,6 +29,7 @@ struct Inner {
 }
 
 static MUTE: LazyLock<ArcSwap<Inner>> = LazyLock::new(|| ArcSwap::from_pointee(Inner::default()));
+static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Copy-edit-swap.  `f` may run more than once if another writer races us.
 fn update(f: impl Fn(&mut Inner)) {
@@ -36,7 +38,11 @@ fn update(f: impl Fn(&mut Inner)) {
         f(&mut next);
         next
     });
+    GENERATION.fetch_add(1, Ordering::Relaxed);
 }
+
+/// Monotonic version for caches that depend on mute/solo state.
+pub fn generation() -> u64 { GENERATION.load(Ordering::Relaxed) }
 
 // ── audio-side read ────────────────────────────────────────────────────
 
@@ -118,6 +124,7 @@ pub fn soloed() -> Option<String> {
 
 pub fn clear_all() {
     MUTE.store(Default::default());
+    GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
 // ── render snapshot ────────────────────────────────────────────────────

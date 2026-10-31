@@ -1,9 +1,5 @@
 //! Horizontal tracker: one time-aligned column per part, with a braille
 //! waveform behind the note text and the playhead column highlighted.
-//!
-//! All note collection, state resolution, and styling is done in
-//! `super::measure::prepare_measure`. This file is purely layout:
-//! column packing, braille waveform rasterization, and hit-test tracking.
 
 use ratatui::{
     layout::Rect,
@@ -14,20 +10,20 @@ use ratatui::{
 };
 
 use std::collections::HashSet;
+use std::borrow::Cow;
 use std::sync::atomic::Ordering;
 
 use crate::player::envelope::{
     synth_envelope_live, synth_envelope_static, whole_sample_envelope, wrapped_pos,
 };
 use crate::player::notes::{value_at, ColumnLine};
-use crate::player::scope::scope_snapshot;
+use crate::player::scope::{scope_snapshot_recent, vgm_scope_slot};
 use crate::player::{Project, Transport};
 use crate::formats::trackscript::C5_HZ;
-use crate::tui::shared::braille::{braille_char, dot_bit};
+use crate::tui::shared::braille::{braille_str, dot_bit};
 use crate::tui::shared::label;
 use crate::tui::shared::note_fmt::fmt_note;
-use crate::tui::shared::note_style::NoteState;
-use crate::tui::shared::waveform::rasterize_time_y;
+use crate::tui::shared::waveform::rasterize_time_y_into;
 use crate::tui::state::{RenderState, TrackerColumnHit, TrackerHit};
 use crate::tui::theme::{Theme, Token};
 
@@ -39,8 +35,6 @@ pub fn draw(
     state: &mut RenderState,
 ) {
     let theme: Theme = state.settings.theme.clone();
-    // FIX: `synth` was unused here — note styling is handled inside
-    // measure::prepare_measure, which reads state.settings.synesthesia itself.
     let labels_cfg = state.settings.labels;
     let min_col_w = state.settings.layout.min_col_w;
     let max_col_w = state.settings.layout.max_col_w;
@@ -87,7 +81,6 @@ pub fn draw(
     let pixel_rows = char_rows * 4;
     let current_row = prep.current_row;
 
-    // Build column entries (note lines + divider lines for shim chains).
     let mut columns: Vec<Vec<ColumnLine>> = Vec::with_capacity(visible_cols);
     let mut column_rows_hit: Vec<Vec<Option<(usize, i64)>>> = Vec::with_capacity(visible_cols);
 
@@ -114,7 +107,7 @@ pub fn draw(
         }
 
         let mut last_name: Option<String> = None;
-        for pnote in &part.notes {
+        for (note_idx, pnote) in part.notes.iter().enumerate() {
             let name = &pnote.dn.source_name;
             let at_start = last_name.is_none();
             let changed = last_name.as_deref() != Some(name.as_str());
@@ -123,7 +116,7 @@ pub fn draw(
                 entries.push(ColumnLine::Divider { label: name.clone() });
                 entries_bl.push(None);
             }
-            entries.push(ColumnLine::Note(pnote.dn.clone()));
+            entries.push(ColumnLine::Note(note_idx));
             entries_bl.push(Some((pnote.block_line, pnote.start_row)));
             last_name = Some(name.clone());
         }
@@ -131,21 +124,27 @@ pub fn draw(
         column_rows_hit.push(entries_bl);
     }
 
-    // Per-column braille waveform + playhead.
     if state.last_synth_env.len() < visible_cols {
         state.last_synth_env.resize_with(visible_cols, Vec::new);
     }
-    let mut dot_matrices: Vec<Vec<Vec<bool>>> = Vec::with_capacity(visible_cols);
+    if state.dot_matrices.len() < visible_cols {
+        state.dot_matrices.resize_with(visible_cols, Vec::new);
+    }
     for col in 0..visible_cols {
         let part = &prep.parts[col];
-        let env: Vec<(f32, f32)> = if let Some(sample) = p.preview_sample_for_part(&part.first_name) {
+        let env: Cow<'_, [(f32, f32)]> = if let Some(sample) = p.preview_sample_for_part(&part.first_name) {
             let key = (part.path.clone(), pixel_rows);
-            state.sample_env_cache.entry(key)
-            .or_insert_with(|| whole_sample_envelope(&sample, pixel_rows))
-            .clone()
+            Cow::Borrowed(state.sample_env_cache.entry(key)
+                .or_insert_with(|| whole_sample_envelope(&sample, pixel_rows)))
         } else {
-            let live = p.iid_for_part(&part.first_name).and_then(|iid| {
-                scope_snapshot(iid as usize, &mut state.snapshot);
+            let live = vgm_scope_slot(&part.path)
+            .or_else(|| p.iid_for_part(&part.first_name).map(|iid| iid as usize))
+            .and_then(|slot| {
+                scope_snapshot_recent(
+                    slot,
+                    pixel_rows.saturating_mul(crate::player::envelope::SCOPE_SAMPLES_PER_BIN),
+                    &mut state.snapshot,
+                );
                 if state.snapshot.is_empty() { None } else {
                     let e = synth_envelope_live(&state.snapshot, pixel_rows);
                     if e.is_empty() { None } else { Some(e) }
@@ -153,20 +152,22 @@ pub fn draw(
             });
             match live {
                 Some(env) => {
-                    state.last_synth_env[col] = env.clone();
-                    env
+                    state.last_synth_env[col] = env;
+                    Cow::Borrowed(&state.last_synth_env[col])
                 }
                 None => {
                     let cached = &state.last_synth_env[col];
-                    if cached.len() == pixel_rows { cached.clone() }
-                    else { synth_envelope_static(p, &part.first_name, pixel_rows) }
+                    if cached.len() == pixel_rows { Cow::Borrowed(cached) }
+                    else {
+                        Cow::Borrowed(state.synth_env_cache.entry((part.path.clone(), pixel_rows))
+                            .or_insert_with(|| synth_envelope_static(p, &part.first_name, pixel_rows)))
+                    }
                 }
             }
         };
-        dot_matrices.push(rasterize_time_y(&env, col_w * 2, pixel_rows));
+        rasterize_time_y_into(&env, col_w * 2, pixel_rows, &mut state.dot_matrices[col]);
     }
 
-    // Playhead position per column (uses sample playhead tracking in state).
     let mut playhead_pys: Vec<Option<usize>> = Vec::with_capacity(visible_cols);
     for col in 0..visible_cols {
         let part = &prep.parts[col];
@@ -227,7 +228,6 @@ pub fn draw(
     let muted_bg = theme.color(Token::MutedBg);
     let playhead_fg = theme.color(Token::Playhead);
 
-    // Header.
     let mut header: Vec<Span> = Vec::new();
     let mut hit_columns: Vec<TrackerColumnHit> = Vec::with_capacity(visible_cols);
     let mut x_cursor: u16 = 0;
@@ -309,7 +309,6 @@ pub fn draw(
         x_cursor += col_w as u16 + 1;
     }
 
-    // Rows.
     let mut lines: Vec<Line> = Vec::with_capacity(char_rows + 1);
     lines.push(Line::from(header));
 
@@ -324,7 +323,35 @@ pub fn draw(
             let solo_hides_col = part.is_soloed_out;
             let playhead_char = playhead_pys[col].map(|py| py / 4 + chain_rows);
 
-            for cx in 0..col_w {
+            // Resolve and format the row once per part. The old cell loop
+            // repeated a note search, formatting, and chars().nth() per cell.
+            let (cell_text, text_style, is_note_muted) = match columns[col].get(r) {
+                Some(ColumnLine::Note(note_idx)) => {
+                    let pn = &part.notes[*note_idx];
+                    (Some(fmt_note(&pn.dn.note, pn.lookup_row, pn.dn.subs, pn.note_state)), Some(pn.style), pn.is_muted)
+                }
+                Some(ColumnLine::Divider { label }) => (
+                    Some(label.clone()),
+                    Some(Style::default().fg(ratatui::style::Color::DarkGray).add_modifier(Modifier::ITALIC)),
+                    false,
+                ),
+                None => (None, None, false),
+            };
+            let text_len = cell_text.as_ref().map_or(0, |text| text.chars().count().min(col_w));
+            if text_len > 0 {
+                let base_style = text_style.unwrap_or_default();
+                let style = if part.is_muted || solo_hides_col || is_note_muted {
+                    Style::default().fg(muted_fg).bg(muted_bg)
+                } else if playhead_char == Some(r) {
+                    base_style.fg(playhead_fg)
+                } else {
+                    base_style
+                };
+                let text: String = cell_text.as_ref().unwrap().chars().take(text_len).collect();
+                spans.push(Span::styled(text, style));
+            }
+
+            for cx in text_len..col_w {
                 let mut bits: u8 = 0;
                 for ly in 0..4 {
                     let py_signed = (r as i32 - chain_rows as i32) * 4 + ly as i32;
@@ -333,57 +360,16 @@ pub fn draw(
                     if py >= pixel_rows { continue; }
                     let px0 = cx * 2;
                     let px1 = cx * 2 + 1;
-                    if px0 < col_w * 2 && dot_matrices[col][py][px0] { bits |= dot_bit(0, ly); }
-                    if px1 < col_w * 2 && dot_matrices[col][py][px1] { bits |= dot_bit(1, ly); }
+                    let dot_width = col_w * 2;
+                    if px0 < dot_width && state.dot_matrices[col][py * dot_width + px0] { bits |= dot_bit(0, ly); }
+                    if px1 < dot_width && state.dot_matrices[col][py * dot_width + px1] { bits |= dot_bit(1, ly); }
                 }
-
-                let row_entry = columns[col].get(r);
-                let (cell_text, is_note_muted): (Option<(String, Style)>, bool) = match row_entry {
-                    Some(ColumnLine::Note(dn)) => {
-                        // Find the matching PreparedNote for style lookup.
-                        // FIX: We must match the exact pitch as well, otherwise
-                        // all notes in a chord will inherit the style of the first one.
-                        let pnote = part.notes.iter().find(|pn| {
-                            pn.dn.source_name == dn.source_name
-                            && pn.dn.note.start_row == dn.note.start_row
-                            && pn.dn.value_offset == dn.value_offset
-                            && pn.dn.note.pitch_points.first().map(|p| p.value as i64)
-                            == dn.note.pitch_points.first().map(|p| p.value as i64)
-                        });
-                        if let Some(pn) = pnote {
-                            let text = fmt_note(&pn.dn.note, pn.lookup_row, pn.dn.subs, pn.note_state);
-                            (Some((text, pn.style)), pn.is_muted)
-                        } else {
-                            // Fallback: shouldn't happen since we built from part.notes.
-                            let text = fmt_note(&dn.note, 0.0, dn.subs, NoteState::Played);
-                            (Some((text, Style::default())), false)
-                        }
-                    }
-                    Some(ColumnLine::Divider { label }) => (
-                        Some((label.clone(), Style::default().fg(ratatui::style::Color::DarkGray).add_modifier(Modifier::ITALIC))),
-                                                            false,
-                    ),
-                    None => (None, false),
-                };
-
-                let text_char: Option<char> = cell_text.as_ref()
-                .and_then(|(t, _)| t.chars().nth(cx));
 
                 let under_playhead = playhead_char == Some(r);
                 let off = part.is_muted || solo_hides_col || is_note_muted;
 
-                if let Some(ch) = text_char {
-                    let base_style = cell_text.as_ref().unwrap().1;
-                    let style = if off {
-                        Style::default().fg(muted_fg).bg(muted_bg)
-                    } else if under_playhead {
-                        base_style.fg(playhead_fg)
-                    } else {
-                        base_style
-                    };
-                    spans.push(Span::styled(ch.to_string(), style));
-                } else if bits != 0 {
-                    let ch = braille_char(bits);
+                if bits != 0 {
+                    let ch = braille_str(bits);
                     let style = if off {
                         Style::default().fg(muted_fg).bg(muted_bg)
                     } else if under_playhead {
@@ -391,7 +377,7 @@ pub fn draw(
                     } else {
                         Style::default().fg(wave_fg)
                     };
-                    spans.push(Span::styled(ch.to_string(), style));
+                    spans.push(Span::styled(ch, style));
                 } else if off {
                     spans.push(Span::styled(" ", Style::default().bg(muted_bg)));
                 } else if under_playhead {

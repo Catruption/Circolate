@@ -328,6 +328,7 @@ pub struct PlayheadState {
 
 pub struct RenderState {
     pub motion_highlights: Vec<(usize, i64)>,
+    pub motion_highlight_line: Option<(usize, u64)>,
     pub settings: Settings,
     pub config_ui: ConfigUi,
     pub player: PlayerState,
@@ -345,7 +346,9 @@ pub struct RenderState {
 
     pub playheads: HashMap<String, PlayheadState>,
     pub last_synth_env: Vec<Vec<(f32, f32)>>,
+    pub dot_matrices: Vec<Vec<bool>>,
     pub sample_env_cache: HashMap<(String, usize), Vec<(f32, f32)>>,
+    pub synth_env_cache: HashMap<(String, usize), Vec<(f32, f32)>>,
     pub snapshot: Vec<f32>,
 
     pub expanded_chains: HashSet<String>,
@@ -361,6 +364,9 @@ pub struct RenderState {
 
     pub perf_last_poll: Instant,
     pub(crate) perf_snapshot: Option<crate::player::perf::PerfSnapshot>,
+    pub(crate) ui_draw_ns: u64,
+    pub(crate) ui_draw_frames: u64,
+    pub(crate) ui_draw_worst_ns: u64,
     pub spiral_cache: Option<SpiralCache>,
 
     pub menu: MenuState,
@@ -386,7 +392,9 @@ impl RenderState {
 
             playheads: HashMap::new(),
             last_synth_env: Vec::new(),
+            dot_matrices: Vec::new(),
             sample_env_cache: HashMap::new(),
+            synth_env_cache: HashMap::new(),
             snapshot: Vec::new(),
 
             expanded_chains: HashSet::new(),
@@ -402,10 +410,14 @@ impl RenderState {
 
             perf_last_poll: Instant::now(),
             perf_snapshot: None,
+            ui_draw_ns: 0,
+            ui_draw_frames: 0,
+            ui_draw_worst_ns: 0,
             spiral_cache: None,
 
             menu: MenuState::new(),
             motion_highlights: Vec::new(),
+            motion_highlight_line: None,
         }
     }
 }

@@ -1,0 +1,163 @@
+# sn76489.chip : backend model of the TI SN76489 family (Sega PSG)
+#
+# v2. A `.chip` is a BACKEND. It advertises what it provides (per CHIP.md §5)
+# and plays `.patch` files that require those capabilities. It does not author
+# sounds itself — those are `.patch` files (CHIP.md §3).
+#
+# Written from public descriptions of the chip. Items marked "verify" should
+# be checked against hardware captures before being trusted.
+#
+# Format reference: CHIP.md v2 §2.
+
+chip 2
+name    sn76489
+title   "TI SN76489 / Sega PSG"
+family  psg
+
+clock   3579545
+step    clock / 16      # one core step per 16 clocks (~223.7 kHz at default clock)
+out     bipolar         # core output -1..1 (zero-mean mix); host DC-blocks and resamples
+
+variant sega  taps 0x0009  width 16      # SMS2 / Game Gear / Mega Drive
+variant ti    taps 0x0006  width 15      # verify
+default_variant sega
+
+# ---------------------------------------------------------------- behavior
+# How the adapter maps note events to writes on this backend.
+
+behavior
+  key     none                       # no key-on register; voice sounds when att < off
+  noteon  pitch vol
+  noteoff vol_off
+
+# ---------------------------------------------------------------- voices
+# Voice kinds this backend exposes. The adapter allocates by kind.
+
+voices
+  tone1  tone
+  tone2  tone
+  tone3  tone
+  noise  noise
+
+# ---------------------------------------------------------------- provides
+# What this backend advertises. A patch plays here iff every entry in its
+# `requires` set is satisfiable from this block. See CHIP.md §5 for the
+# vocabulary.
+
+provides
+  tone.square
+    sources  tone1 tone2 tone3
+
+  noise.lfsr
+    sources  noise
+    width    15 16
+    taps     variant
+    fb       periodic white
+    key rate -> noise_rate
+    key fb   -> noise_fb
+    dependency noise_rate=3 consumes voice tone3
+    # Note: dn and d3 are independent counters in this model. On hardware the
+    # LFSR is clocked by tone3's output when noise_rate=3, so they are phase-
+    # locked. Modeled here as independent; not bit-exact for noise_rate=3.
+
+  pitch.divider
+    voices  tone1 tone2 tone3
+    field   div
+    law     clock / (32 * n)
+    range   1..1023
+
+  amp.attenuation
+    voices  tone1 tone2 tone3 noise
+    field   att
+    steps   16
+    step_db 2.0
+    off     15
+
+# ---------------------------------------------------------------- registers
+# Native vocabulary. The field table is what the adapter and the Trackscript
+# loader speak to; nobody outside this file names registers. See CHIP.md §2.2.
+
+reg div   voices tone1 tone2 tone3        width 10  reset 0
+reg noise voices noise                    width 3   reset 0
+reg att   voices tone1 tone2 tone3 noise  width 4   reset 15
+
+field div         reg div    bits 0..9   role pitch
+field noise_rate  reg noise  bits 0..1   role param
+field noise_fb    reg noise  bit  2      role param
+field att         reg att    bits 0..3   role volume
+
+enum noise_fb periodic=0 white=1
+
+# ---------------------------------------------------------------- bus
+# Physical protocol for VGM playback. A fantasy chip omits this block and
+# the `vgm` block below, and is driven by notes only.
+#
+# Latch byte: 1 cc t dddd   cc = voice-1, t = 0 tone/noise, 1 attenuation
+# Data byte:  0 x dddddd    only meaningful for `div`; targets its high 6 bits
+#
+# See CHIP.md §2.3 for the grammar.
+
+bus latch_data
+  flag  bit 7
+  chan  bits 5..6
+  type  bit 4
+  lo    bits 0..3
+  hi    bits 0..5
+
+  route type=0  tone voices  -> div
+  route type=0  noise voice  -> noise
+  route type=1               -> att
+
+  latch div     = (reg & ~0x0F) | (lo & 0x0F)   # latch writes low 4 bits
+  latch other   = lo & mask(reg)                # noise/att get full value
+  data  div     = (reg & 0x0F) | (hi << 4)      # data writes high 6 bits
+  data  other   = ignore                        # data to noise/att is a no-op on HW
+
+  on_write noise -> nz.reset
+
+# ---------------------------------------------------------------- core
+# Primitives (implemented once in Rust; CHIP.md §2.4):
+#   divider: step cnt; if cnt <= 0 { cnt = n; q ^= 1 }; q is 0/1; rise on 0->1.
+#            dc_below m: n < m holds q at 1.
+#   lfsr   : fb  = mode ? parity(reg & taps) : reg & 1
+#            reg = (reg >> 1) | (fb << (width - 1)); q = reg & 1
+#            reset: reg = 1 << (width - 1)
+#   table  : RHS evaluated once at load; expressions may use i
+#   pick   : pick(sel, v0, v1, ...) -> v[sel], 0-based
+#   mix    : final per-step output expression
+
+core
+  divider d1  n=div[tone1]  dc_below=2          # dc_below: verify
+  divider d2  n=div[tone2]  dc_below=2
+  divider d3  n=div[tone3]  dc_below=2
+  divider dn  n=pick(noise_rate[noise], 16, 32, 64, div[tone3])  dc_below=2
+  lfsr    nz  clock=dn.rise  taps=variant.taps  width=variant.width  mode=noise_fb[noise]
+              # periodic mode = rotate-right of reset state; period 16,
+              # duty 1/16. verify against hardware capture.
+
+  table   level[16] = (i == 15) ? 0 : 10 ^ (-i / 10)   # 2 dB steps, 15 = off
+
+  # Each voice is centred on zero ((q - 0.5) * level). A unipolar mix
+  # (q * level) shifts the mean by level/2 on every note on/off and volume
+  # step, which the host DC blocker turns into a ~40 ms thump (the pops).
+  # Peak-to-peak per voice is unchanged (0.5 at full volume).
+  mix ( (d1.q - 0.5) * level[att[tone1]]
+      + (d2.q - 0.5) * level[att[tone2]]
+      + (d3.q - 0.5) * level[att[tone3]]
+      + (nz.q - 0.5) * level[att[noise]] ) * 0.5
+
+# ---------------------------------------------------------------- vgm
+# Only present on chips that match real hardware. VGM carries register
+# writes; this block says how to decode them for this chip. `bus` names the
+# block above; per-opcode port routing is for addr_data chips (see CHIP.md
+# §2 grammar, which needs a small fix to distinguish latch_data from
+# addr_data opcodes).
+
+vgm
+  header clock 0x0C  dual_bit 30  t6w28_bit 31
+  header taps  0x28  width 0x2A   flags 0x2B
+  op   0x50 bus
+  op2  0x30 bus
+
+# Not modeled: Game Gear stereo (VGM 0x4F). Semantic `pan` is ignored on
+# this backend until it is.
