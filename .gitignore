@@ -55,3 +55,5 @@ share/soundfonts/
 
 # Large example archives (these go in GitHub Releases, not the repo)
 *.halo.zip
+*.halo.zip
+*.hlz
