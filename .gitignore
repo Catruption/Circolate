@@ -43,3 +43,15 @@ Thumbs.db
 /share/soundfonts/
 /share/circolate/trackscripts/no villains.tsz
 /share/circolate/trackscripts/Carol Roll.tsz
+
+# Personal covers and memes
+share/circolate/cover/
+
+# User-provided third-party soundfonts
+share/soundfonts/
+
+# Temporary archives
+*.tar.gz
+
+# Large example archives (these go in GitHub Releases, not the repo)
+*.halo.zip
