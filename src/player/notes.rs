@@ -1,4 +1,4 @@
-//! Note model.  A trackscript event stream is parsed into `NoteRow`s
+//! Note model.  A halotext event stream is parsed into `NoteRow`s
 //! (note bodies with attached waypoints), then projected into
 //! `DisplayNote`s for a particular view's window.
 //!
@@ -6,7 +6,7 @@
 //! ratatui, colours, or note states.  Formatting for the tracker
 //! views lives in `crate::tui::shared::note_fmt`.
 
-use crate::formats::trackscript::TrackscriptEvent;
+use crate::formats::halotext::HalotextEvent;
 
 #[derive(Clone)]
 pub struct Point {
@@ -19,6 +19,11 @@ pub struct Point {
 pub struct NoteRow {
     pub start_row: f64,
     pub end_row: f64,
+    pub source_line: usize,
+    pub source_byte_column: usize,
+    pub source_end_byte_column: usize,
+    pub waypoint_lines: Vec<(f64, usize)>,
+    pub waypoint_spans: Vec<(f64, usize, usize, usize)>,
     pub dur_beats: Option<f64>,
     pub offset: u32,
     pub pitch_points: Vec<Point>,
@@ -48,7 +53,7 @@ pub enum ColumnLine {
 }
 
 pub fn split_notes(
-    events: &[TrackscriptEvent],
+    events: &[HalotextEvent],
     subs: u32,
     default_offset: u32,
 ) -> Vec<NoteRow> {
@@ -60,6 +65,8 @@ pub fn split_notes(
         if ev.is_waypoint() {
             if let Some(idx) = current {
                 let n = &mut out[idx];
+                n.waypoint_lines.push((ev.row, ev.source_line));
+                n.waypoint_spans.push((ev.row, ev.source_line, ev.source_byte_column, ev.source_end_byte_column));
                 let ramp = ev.dur_beats.unwrap_or(0.0) * subs_f;
                 if let Some(hz) = ev.pitch_hz {
                     n.pitch_points.push(Point { row: ev.row, value: hz, ramp_rows: ramp });
@@ -81,6 +88,11 @@ pub fn split_notes(
             let mut nr = NoteRow {
                 start_row: ev.row,
                 end_row,
+                source_line: ev.source_line,
+                source_byte_column: ev.source_byte_column,
+                source_end_byte_column: ev.source_end_byte_column,
+                waypoint_lines: Vec::new(),
+                waypoint_spans: Vec::new(),
                 dur_beats: ev.dur_beats,
                 offset: ev.offset.unwrap_or(default_offset),
                 pitch_points: Vec::new(),

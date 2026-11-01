@@ -1,10 +1,10 @@
-//! Part templates: a compiled form of a trackscript part, ready for
+//! Part templates: a compiled form of a halotext part, ready for
 //! placement into the arrangement.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::formats::trackscript::{TrackscriptPart, C5_HZ};
+use crate::formats::halotext::{HalotextPart, C5_HZ};
 use crate::timing::Waypoint;
 
 use super::types::{
@@ -47,7 +47,7 @@ pub(crate) struct PartTemplate {
 }
 
 pub(crate) fn build_template(
-    part: &TrackscriptPart,
+    part: &HalotextPart,
     path_to_id: &HashMap<String, u32>,
     samples: &HashMap<u32, Arc<Sample>>,
     sf2_instruments: &HashMap<String, Arc<Sf2Instrument>>,
@@ -150,7 +150,7 @@ pub(crate) fn build_template(
             // it as MIDI (the engine is installed under `spec.iid` and
             // answers MIDI note-on/off on that channel).  This is now
             // the primary path; the internal renderer below is a
-            // fallback for older trackscripts that predate the engine.
+            // fallback for older halotexts that predate the engine.
             if let Some(spec) = sf2_engine_specs.get(lookup_path) {
                 let pitch = ev.pitch_midi.unwrap_or(60).clamp(0, 127) as u8;
                 let vol_pct = ev.vol.unwrap_or(100.0).clamp(0.0, 100.0);

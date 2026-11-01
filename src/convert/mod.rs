@@ -1,5 +1,5 @@
 // src/convert/mod.rs
-//! Source → Trackscript conversion.
+//! Source → Halotext conversion.
 //!
 //! One public entry point: `convert_file` takes any supported source and
 //! returns a `Converted` bundle.  Nothing touches the disk except reading
@@ -17,7 +17,7 @@ use anyhow::Result;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
-use crate::formats::trackscript;
+use crate::formats::halotext;
 use crate::formats::{self, SourceKind};
 
 // ── public API ─────────────────────────────────────────────────────────
@@ -68,7 +68,7 @@ pub struct AuxFile {
 }
 
 pub struct Converted {
-    pub trackscript: String,
+    pub halotext: String,
     pub samples: Vec<SampleOut>,
     pub samples_json: String,
     pub aux: Vec<AuxFile>,
@@ -89,11 +89,11 @@ pub fn convert_file(src: &Path, opts: &ConvertOptions) -> Result<Converted> {
             midi::convert(&mf, src, opts)
         }
         SourceKind::Vgm => vgm::convert_vgm(src, opts), // <--- ADD THIS ARM
-        SourceKind::Trackscript => {
+        SourceKind::Halotext => {
             let text = std::fs::read_to_string(src)?;
-            trackscript::parse_str(&text)?;
+            halotext::parse_str(&text)?;
             Ok(Converted {
-                trackscript: text,
+                halotext: text,
                 samples: Vec::new(),
                samples_json: String::new(),
                aux: Vec::new(),
@@ -110,7 +110,12 @@ pub fn probe_file(src: &Path, opts: &ConvertOptions) -> Result<ProbeReport> {
 }
 
 pub fn output_stem(src: &Path) -> String {
-    let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
+    let filename = src.file_name().and_then(|s| s.to_str()).unwrap_or("output");
+    let stem = if filename.to_ascii_lowercase().ends_with(crate::spec::SOURCE_EXT) {
+        &filename[..filename.len() - crate::spec::SOURCE_EXT.len()]
+    } else {
+        src.file_stem().and_then(|s| s.to_str()).unwrap_or("output")
+    };
     let mut out = String::with_capacity(stem.len());
     let mut prev_us = false;
     for c in stem.chars() {
@@ -129,7 +134,7 @@ pub fn output_stem(src: &Path) -> String {
 pub fn default_out_dir(src: &Path) -> PathBuf {
     let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
     let dir = src.parent().unwrap_or_else(|| Path::new("."));
-    dir.join(format!("{stem}_trackscript"))
+    dir.join(format!("{stem}_halotext"))
 }
 
 // ── shared helpers ─────────────────────────────────────────────────────

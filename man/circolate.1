@@ -1,7 +1,7 @@
 .TH CIRCULATE 1 "October 2026" "circolate 0.1.0" "User Commands"
 
 .SH NAME
-circolate \- trackscript player and FL Studio/tracker converter
+circolate \- halotext player and FL Studio/tracker converter
 
 .SH SYNOPSIS
 .B circolate
@@ -15,28 +15,28 @@ circolate \- trackscript player and FL Studio/tracker converter
 .B circolate
 plays and converts tracker music, FL Studio projects, MIDI files, and
 native
-.B .trackscript
+.B .halotext
 songs.  It opens a terminal UI when invoked without a subcommand, and
 dispatches to a converter or diagnostic tool when a subcommand is given.
 
 The player supports sample-based formats (WAV, FLAC, MP3, OGG, Vorbis),
 SoundFont 2 synthesis, VST3 instrument and effect hosting, and the
-trackscript effect shim system.
+halotext effect shim system.
 
 .SH COMMANDS
 .TP
 .BR play " [\fIFILE\fR]"
 Play \fIFILE\fR, or open the player with an empty queue if no file is
 given.  Accepts
-.BR .trackscript ", " .tsz ", " .flp ", " .it ", " .mid ", " .midi ",
-or a directory containing a trackscript.  If \fIFILE\fR is omitted and
+.BR .halotext ", " .tsz ", " .flp ", " .it ", " .mid ", " .midi ",
+or a directory containing a halotext.  If \fIFILE\fR is omitted and
 .B play
 was requested explicitly, a file picker is opened.
 
 .TP
 .BR export " [\fIFILE\fR] [\-o \fIDIR\fR]"
-Convert a source file to trackscript.  Writes to
-.B trackscripts/\fISTEM\fR/
+Convert a source file to halotext.  Writes to
+.B halotexts/\fISTEM\fR/
 by default.  Pass
 .B \-a
 or
@@ -102,7 +102,7 @@ Play a note through the native SF2 engine.  Developer smoke test.
 
 .TP
 .BR list
-List trackscripts under the user and repository trackscript directories.
+List halotexts under the user and repository halotext directories.
 
 .SH OPTIONS
 Options accepted by
@@ -123,7 +123,7 @@ Start playback at the given offset in seconds.
 Additional directory to search for samples when converting.
 .TP
 .BR \-\-sf2 " \fIPATH\fR"
-Override the SoundFont referenced by MIDI or trackscript sidecars.
+Override the SoundFont referenced by MIDI or halotext sidecars.
 .TP
 .BR \-\-skip\-native
 Skip native FL Studio plugin channels during conversion.
@@ -139,7 +139,7 @@ non-zero on divergence.
 Bypass the master bus effect chain.
 .TP
 .BR \-\-no\-watch
-Disable live-reload for trackscript playback.
+Disable live-reload for halotext playback.
 .PP
 Global option:
 .TP
@@ -240,7 +240,7 @@ Play a converted song:
 .RS 4
 .nf
 circolate
-.I trackscripts/nightlight4000/nightlight4000.trackscript
+.I halotexts/nightlight4000/nightlight4000.halotext
 .fi
 .RE
 .PP
@@ -258,7 +258,7 @@ Render to WAV without opening the TUI:
 .RS 4
 .nf
 circolate play
-.I song.trackscript
+.I song.halotext
 .B \-\-render
 .I out.wav
 .B \-\-rate
@@ -295,7 +295,7 @@ non-zero indicates at least one file with unresolved dependencies.  For
 non-zero indicates cache divergence.
 
 .SH SEE ALSO
-The trackscript language reference is shipped as
+The halotext language reference is shipped as
 .I /usr/share/doc/circolate/LANGUAGE.md
 (or
 .I docs/LANGUAGE.md

@@ -1,10 +1,10 @@
 
 //! FL fidelity sidecar schema.
 //!
-//! The .trackscript is the readable arrangement.  This is everything
+//! The .halotext is the readable arrangement.  This is everything
 //! else: channel levels, envelopes, tracking, per-channel automation,
 //! exact playlist placements, multi-sample zones, and mixer insert
-//! chains.  Written next to the .trackscript as `fidelity.json`, read
+//! chains.  Written next to the .halotext as `fidelity.json`, read
 //! back by `player::load_project`.
 //!
 //! Numeric fields are `f64` throughout.  FL stores many of these as
@@ -167,7 +167,7 @@ pub struct PlaylistFidelity {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct MultiSampleFidelity {
-    /// Paths relative to the .trackscript directory.
+    /// Paths relative to the .halotext directory.
     pub files: Vec<String>,
     /// Root MIDI note per file.  `None` = player default (60).
     pub root_keys: Vec<Option<i32>>,

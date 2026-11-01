@@ -1,5 +1,5 @@
 // src/convert/song.rs
-//! Shared Trackscript assembly.
+//! Shared Halotext assembly.
 //!
 //! Both FLP and IT converters build a `Song` and call `write()`.  The
 //! writer emits one part per channel with N measures, addressed from
@@ -147,7 +147,7 @@ impl Song {
 
         // ── Config ────────────────────────────────────────────────
         out.push_str("Config\n{\n");
-        out.push_str("    TrackscriptVersion: 1.10;\n");
+        out.push_str("    HalotextVersion: 1.10;\n");
         out.push_str(&format!("    BeatsPerMinute: {};\n", fmt(self.tempo, 2)));
         out.push_str(&format!("    TimeSignature: {}/{};\n", num, den));
         out.push_str(&format!("    Subdivisions: {};\n", self.subs));

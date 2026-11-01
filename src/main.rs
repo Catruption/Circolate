@@ -1,4 +1,4 @@
-//! Trackscript player — dispatcher.
+//! Halotext player — dispatcher.
 
 #![allow(dead_code)]
 
@@ -11,6 +11,7 @@ mod log;
 mod archive;
 mod asset;
 mod audio_decode;
+mod bundle;
 mod check;
 mod convert;
 mod deps;
@@ -39,8 +40,8 @@ use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "circolate")]
-#[command(version = "0.1.0")]
-#[command(about = "Trackscript player and FL Studio/tracker converter")]
+#[command(version)]
+#[command(about = "Halotext player and FL Studio/tracker converter")]
 struct Cli {
     #[arg(value_name = "FILE", help = "Implicit play if a file is provided")]
     file: Option<String>,
@@ -97,8 +98,8 @@ fn main() -> Result<()> {
         let result = match cmd {
             Command::Play    { args } => run_app(&args, cli.no_pick),
             Command::Export  { args } => export::run(&pick_if_empty(args, cli.no_pick, pick::FILTER_SOURCE, "Export source")),
-            Command::Dump    { args } => dump::run(&pick_if_empty(args, cli.no_pick, pick::FILTER_TRACKSCRIPT, "Dump trackscript")),
-            Command::Test    { args } => test::run(&pick_if_empty(args, cli.no_pick, pick::FILTER_TRACKSCRIPT, "Test trackscript")),
+            Command::Dump    { args } => dump::run(&pick_if_empty(args, cli.no_pick, pick::FILTER_HALOTEXT, "Dump halotext")),
+            Command::Test    { args } => test::run(&pick_if_empty(args, cli.no_pick, pick::FILTER_HALOTEXT, "Test halotext")),
             Command::Check   { args } => check::run(&args),
             Command::Census  { args } => check::run_census(&args),
             Command::Measure { args } => measure::run(&args),
@@ -177,11 +178,11 @@ fn pick_if_empty(mut args: Vec<String>, no_pick: bool, filter: &str, title: &str
 }
 
 fn picker_start_dir() -> PathBuf {
-    let user = paths::user_trackscripts();
+    let user = paths::user_halotexts();
     if dir_has_entries(&user) {
         return user;
     }
-    let bundled = paths::bundled_trackscripts();
+    let bundled = paths::bundled_halotexts();
     if dir_has_entries(&bundled) {
         return bundled;
     }
@@ -203,8 +204,8 @@ fn cmd_list() -> Result<()> {
     let mut seen: HashSet<String> = HashSet::new();
 
     for (tag, dir) in [
-        ("user ", paths::user_trackscripts()),
-        ("share", paths::bundled_trackscripts()),
+        ("user ", paths::user_halotexts()),
+        ("share", paths::bundled_halotexts()),
     ] {
         let Ok(rd) = std::fs::read_dir(&dir) else {
             continue;
@@ -228,9 +229,9 @@ fn cmd_list() -> Result<()> {
     }
 
     if !any {
-        println!("no trackscripts found.");
-        println!("  user:    {}", paths::user_trackscripts().display());
-        println!("  bundled: {}", paths::bundled_trackscripts().display());
+        println!("no halotexts found.");
+        println!("  user:    {}", paths::user_halotexts().display());
+        println!("  bundled: {}", paths::bundled_halotexts().display());
     }
     Ok(())
 }

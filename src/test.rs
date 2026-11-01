@@ -1,11 +1,11 @@
-//! `trackscript-player test` — single-file diagnostic.
+//! `halotext-player test` — single-file diagnostic.
 //!
 //! Unlike `check`, which just says clean / dirty per file, `test` prints
 //! the parsed structure of one source and then runs the full probe
 //! pipeline so you can see why each channel is (or isn't) convertible.
 //!
 //! Usage:
-//!     trackscript-player test <file> [--json]
+//!     halotext-player test <file> [--json]
 //!
 //! Exit code is non-zero when the probe reports missing dependencies or
 //! unresolved fallbacks, matching `check`.
@@ -19,7 +19,7 @@ use crate::formats::flp;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Flp,
-    Trackscript,
+    Halotext,
     Unknown,
 }
 
@@ -31,7 +31,7 @@ fn detect_kind(p: &Path) -> Kind {
     .as_deref()
     {
         Some("flp") => Kind::Flp,
-        Some("trackscript") | Some("tsz") => Kind::Trackscript,
+        Some("halotext") | Some("tsz") => Kind::Halotext,
         _ => {
             // Fall back to magic sniffing so `test foo` on a renamed FLP
             // still works.
@@ -76,19 +76,19 @@ pub fn run(argv: &[String]) -> Result<()> {
 
     match detect_kind(&path) {
         Kind::Flp => test_flp(&path, json),
-        Kind::Trackscript => test_trackscript(&path),
+        Kind::Halotext => test_halotext(&path),
         Kind::Unknown => bail!(
-            "unrecognised file type: {} (expected .flp, .trackscript or .tsz)",
+            "unrecognised file type: {} (expected .flp, .halotext or .tsz)",
                                path.display()
         ),
     }
 }
 
 fn print_help() {
-    println!("usage: trackscript-player test <file> [--json]");
+    println!("usage: halotext-player test <file> [--json]");
     println!();
     println!("  Parse a source file and report why each channel does or");
-    println!("  does not convert.  Supported inputs: .flp, .trackscript, .tsz.");
+    println!("  does not convert.  Supported inputs: .flp, .halotext, .tsz.");
     println!();
     println!("  --json    emit the report as a single JSON object");
     println!();
@@ -300,9 +300,9 @@ fn print_flp_playlist(prj: &flp::Project) {
     println!();
 }
 
-// ── trackscript ────────────────────────────────────────────────────────
+// ── halotext ────────────────────────────────────────────────────────
 
-fn test_trackscript(path: &Path) -> Result<()> {
+fn test_halotext(path: &Path) -> Result<()> {
     // Text-based inspection only for now; not attempting to load it into
     // the audio engine.
     let text = std::fs::read_to_string(path)
@@ -326,7 +326,7 @@ fn test_trackscript(path: &Path) -> Result<()> {
     let remaining = lines.count();
     println!("  … {} more line(s)", remaining);
     println!();
-    println!("note: full trackscript diagnostics are not implemented yet.");
+    println!("note: full halotext diagnostics are not implemented yet.");
     Ok(())
 }
 

@@ -1,5 +1,5 @@
 // src/convert/flp.rs
-//! FLP → Trackscript converter.
+//! FLP → Halotext converter.
 
 mod classify;
 mod extract;
@@ -392,7 +392,7 @@ pub(super) fn convert(
         let mut song = Song::new(
             &title,
             source_name,
-            "flp2trackscript",
+            "flp2halotext",
             tempo,
             subs,
             (4, 4),
@@ -494,7 +494,7 @@ pub(super) fn convert(
         );
         song.post_comments.push(format!("// {}", title));
         song.post_comments.push(
-            "// converted from FL Studio project by flp2trackscript (rust)".to_string(),
+            "// converted from FL Studio project by flp2halotext (rust)".to_string(),
         );
         if !prj.author.is_empty() {
             song.post_comments.push(format!("// author: {}", prj.author));
@@ -561,10 +561,10 @@ pub(super) fn convert(
             }
         }
 
-        let trackscript = song.write();
+        let halotext = song.write();
 
         let samples_json = serde_json::to_string_pretty(&SamplesJson {
-            format: "trackscript-sample-library",
+            format: "halotext-sample-library",
                 version: 2,
                 samples: sample_meta,
                 instruments: vec![],
@@ -588,7 +588,7 @@ pub(super) fn convert(
         }
 
         Ok(Converted {
-            trackscript,
+            halotext,
             samples: sample_outs,
             samples_json,
             aux: aux_files,

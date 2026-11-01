@@ -60,6 +60,10 @@ pub struct ChipPlayer {
     engine: Box<dyn ChipCore>,
     adapter: Adapter,
     bank: HashMap<String, Patch>,
+    voice_names: Vec<String>,
+    voice_parts: HashMap<String, Arc<str>>,
+    dac_part: Option<Arc<str>>,
+    voice_mix_gains: Vec<f32>,
     host_sr: f64,
     ratio: f64,
     phase: f64,
@@ -105,6 +109,7 @@ impl ChipPlayer {
             .unwrap_or(15);
 
         let ratio = engine.step_rate() / host_sr as f64;
+        let voice_names = engine.voices();
         let scope_slot = match chip.name.as_str() {
             "sn76489" => Some(crate::player::scope::VGM_SLOT_PSG),
             "ym2612" => Some(crate::player::scope::VGM_SLOT_YM),
@@ -118,6 +123,8 @@ impl ChipPlayer {
         Ok(Self {
             engine, adapter,
             bank: HashMap::new(),
+            voice_names: voice_names.clone(), voice_parts: HashMap::new(), dac_part: None,
+            voice_mix_gains: vec![1.0; voice_names.len()],
             host_sr: host_sr as f64,
             ratio, phase: 0.0, prev: 0.0,
             dc_prev_in: 0.0, dc_prev_out: 0.0,
@@ -140,6 +147,7 @@ impl ChipPlayer {
         let chip = ym2612_chip_shell(clock);
         let backend = YmfmBackend::new(clock, host_sr)?;
         let ratio = backend.step_rate() / host_sr as f64;
+        let voice_names = backend.voices();
         let voice_scope: Vec<_> = backend.voices().iter()
             .filter_map(|v| crate::player::scope::vgm_voice_scope_slot(&v).map(|s| (s, Vec::new())))
             .collect();
@@ -149,6 +157,8 @@ impl ChipPlayer {
             engine: Box::new(backend),
             adapter,
             bank: HashMap::new(),
+            voice_names: voice_names.clone(), voice_parts: HashMap::new(), dac_part: None,
+            voice_mix_gains: vec![1.0; voice_names.len()],
             host_sr: host_sr as f64,
             ratio, phase: 0.0, prev: 0.0,
             dc_prev_in: 0.0, dc_prev_out: 0.0,
@@ -192,6 +202,7 @@ impl ChipPlayer {
         let path: &str = note.part_path.as_ref();
         if path.rsplit('/').next().map_or(false, |f| f.starts_with("DAC_")) {
             if let Some(d) = self.dac.as_mut() {
+                self.dac_part = Some(note.part_path.clone());
                 d.schedule_note(note.start, self.engine.as_mut());
             } else if chip_debug() {
                 eprintln!("CHIP dac note but no DacTrack set: {}", path);
@@ -272,10 +283,13 @@ impl ChipPlayer {
                 volume: p.volume,
             }).collect(),
             patch_name: patch.name.clone(),
-            voice_hint,
+            voice_hint: voice_hint.clone(),
         };
         match self.adapter.dispatch(&internal, patch) {
             Dispatch::Writes(ws) => {
+                if let Some(voice) = voice_hint.as_ref() {
+                    self.voice_parts.insert(voice.clone(), note.part_path.clone());
+                }
                 if chip_debug() {
                     eprintln!("CHIP dispatch: patch={} t={:.3} dur={:.4} writes={} key={}",
                               patch.name, t, dur, ws.len(), note.note);
@@ -345,6 +359,19 @@ impl ChipPlayer {
             + (DISPATCH_LOOKAHEAD_S * self.host_sr) as i64
             + out_l.len() as i64;
         self.flush_due(upto);
+        for (idx, voice) in self.voice_names.iter().enumerate() {
+            let part_gain = self.voice_parts.get(voice).map_or(1.0, |path| {
+                if crate::mixer::mute::is_part_active(path) {
+                    crate::mixer::part_volume::get(path) as f32
+                } else { 0.0 }
+            });
+            self.voice_mix_gains[idx] = gain * part_gain;
+        }
+        let dac_gain = self.dac_part.as_deref().map_or(gain, |path| {
+            if crate::mixer::mute::is_part_active(path) {
+                gain * crate::mixer::part_volume::get(path) as f32
+            } else { 0.0 }
+        });
         self.now += out_l.len() as i64;
 
         for i in 0..out_l.len() {
@@ -357,11 +384,19 @@ impl ChipPlayer {
             self.voice_acc.fill(0.0);
             while self.phase >= 1.0 {
                 self.phase -= 1.0;
-                acc += self.engine.step();
-                for (voice_idx, (_, sample)) in self.engine.voice_samples().iter().enumerate() {
+                let chip_mix = self.engine.step();
+                let samples = self.engine.voice_samples();
+                if samples.is_empty() { acc += chip_mix; }
+                for (voice_idx, (_, sample)) in samples.iter().enumerate() {
                     if let Some(acc) = self.voice_acc.get_mut(voice_idx) {
                         *acc += *sample;
                     }
+                    let part_gain = if voice_idx == 5 && self.engine.dac_enabled() {
+                        dac_gain
+                    } else {
+                        self.voice_mix_gains.get(voice_idx).copied().unwrap_or(gain)
+                    };
+                    acc += *sample * part_gain;
                 }
                 n += 1;
             }
@@ -370,7 +405,7 @@ impl ChipPlayer {
             let out_dc = s - self.dc_prev_in + 0.9995 * self.dc_prev_out;
             self.dc_prev_in = s;
             self.dc_prev_out = out_dc;
-            let g = out_dc * gain;
+            let g = out_dc;
             out_l[i] += g;
             out_r[i] += g;
             self.scope_samples.push(g);
@@ -378,15 +413,15 @@ impl ChipPlayer {
                 for (voice_idx, (_, samples)) in self.voice_scope.iter_mut().enumerate() {
                     let dac_voice = voice_idx == 5 && self.engine.dac_enabled();
                     self.voice_prev[voice_idx] = if dac_voice { 0.0 } else { self.voice_acc[voice_idx] / n as f32 };
-                    samples.push(self.voice_prev[voice_idx] * gain);
+                    samples.push(self.voice_prev[voice_idx] * self.voice_mix_gains.get(voice_idx).copied().unwrap_or(gain));
                 }
                 let dac_sample = if self.engine.dac_enabled() && self.voice_acc.len() > 5 {
-                    self.voice_acc[5] / n as f32 * gain
+                    self.voice_acc[5] / n as f32 * dac_gain
                 } else { 0.0 };
                 self.dac_scope.push(dac_sample);
             } else {
                 for (voice_idx, (_, samples)) in self.voice_scope.iter_mut().enumerate() {
-                    samples.push(self.voice_prev[voice_idx] * gain);
+                    samples.push(self.voice_prev[voice_idx] * self.voice_mix_gains.get(voice_idx).copied().unwrap_or(gain));
                 }
                 self.dac_scope.push(0.0);
             }

@@ -161,7 +161,7 @@ pub(super) fn safe_name(s: &str) -> String {
     }
 }
 
-/// Make a Trackscript identifier (readable names, not generated IDs).
+/// Make a Halotext identifier (readable names, not generated IDs).
 pub(super) fn identifier(s: &str) -> String {
     let s = safe_name(s);
     if s.chars().next().map_or(false, |c| c.is_ascii_digit()) {

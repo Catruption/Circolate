@@ -13,13 +13,13 @@ use super::timing::Timing;
 
 fn new_song(title: &str, source_name: &str, subs: u32, bpm: f64, beats: usize) -> Song {
     let sig = if beats == 3 { (3, 4) } else { (4, 4) };
-    Song::new(title, source_name, "vgm2trackscript", bpm, subs, sig, 100.0, "equal_power", "names")
+    Song::new(title, source_name, "vgm2halotext", bpm, subs, sig, 100.0, "equal_power", "names")
 }
 
 fn pitch_text(pitch: f64) -> String {
     let nearest = pitch.round();
     if (pitch - nearest).abs() < 0.025 {
-        // VGM semitones use MIDI numbering (C4=60), while Trackscript
+        // VGM semitones use MIDI numbering (C4=60), while Halotext
         // names map C5 to 60. Shift the displayed octave down so parsing
         // the name preserves the original frequency.
         return note_name(nearest as i32 - 12);
@@ -77,7 +77,7 @@ fn note_piece(
     text
 }
 
-pub(crate) fn build_trackscript(a: &Analysis, title: &str, source_name: &str, subs: u32, tm: &Timing) -> String {
+pub(crate) fn build_halotext(a: &Analysis, title: &str, source_name: &str, subs: u32, tm: &Timing) -> String {
     let bpmeas = tm.beats as f64;
     let measures = ((tm.beats_at(a.total) / bpmeas).ceil() as usize).max(1);
     let mut song = new_song(title, source_name, subs, tm.bpm, tm.beats);
@@ -149,7 +149,7 @@ pub(crate) fn build_trackscript(a: &Analysis, title: &str, source_name: &str, su
 
     song.post_comments.push("// ------------------------------------------------------------".to_string());
     song.post_comments.push(format!("// {}", title));
-    song.post_comments.push("// converted from VGM by vgm2trackscript".to_string());
+    song.post_comments.push("// converted from VGM by vgm2halotext".to_string());
     song.post_comments.push(format!("// source: {source_name}"));
     song.post_comments.push(format!("// {} measure(s); {} timbre part(s)", measures, order.len()));
     song.post_comments.push(format!(
@@ -160,7 +160,7 @@ pub(crate) fn build_trackscript(a: &Analysis, title: &str, source_name: &str, su
     song.write()
 }
 
-pub(crate) fn shadow_trackscript(total_seconds: f64, title: &str, source_name: &str, subs: u32) -> String {
+pub(crate) fn shadow_halotext(total_seconds: f64, title: &str, source_name: &str, subs: u32) -> String {
     let beats = (total_seconds * BPM / 60.0).ceil().max(1.0);
     let measures = ((beats / BEATS_PER_MEASURE).ceil() as usize).max(1);
     let mut song = new_song(title, source_name, subs, BPM, BEATS_PER_MEASURE as usize);
@@ -175,7 +175,7 @@ pub(crate) fn shadow_trackscript(total_seconds: f64, title: &str, source_name: &
     }
 
     song.post_comments.push(format!("// {}", title));
-    song.post_comments.push("// converted from VGM by vgm2trackscript (no notes extracted)".to_string());
+    song.post_comments.push("// converted from VGM by vgm2halotext (no notes extracted)".to_string());
     song.post_comments.push(format!("// source: {source_name}"));
     song.write()
 }

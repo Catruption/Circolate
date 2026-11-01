@@ -1,9 +1,9 @@
 // src/convert/it.rs
-//! IT → Trackscript converter.
+//! IT → Halotext converter.
 //!
-//! Direct port of it2trackscript.py.  Runs the IT playback state machine
+//! Direct port of it2halotext.py.  Runs the IT playback state machine
 //! row by row, produces a list of voices with pitch/volume/pan automation,
-//! then groups them into measure-sized sections and emits trackscript via
+//! then groups them into measure-sized sections and emits halotext via
 //! the shared `Song` writer.
 //!
 //! Submodules:
@@ -81,7 +81,7 @@ pub(super) fn convert(
         &source_name,
         opts.with_message,
     );
-    let trackscript = song.write();
+    let halotext = song.write();
 
     // The report and semantics JSON are computed for their side effects
     // (warnings fire, statistics gather) but not written here; a future
@@ -98,7 +98,7 @@ pub(super) fn convert(
     }];
 
     Ok(Converted {
-        trackscript,
+        halotext,
         samples: sample_outs,
         samples_json,
         aux,

@@ -142,13 +142,13 @@ pub struct Settings {
 }
 
 impl Config {
-    pub fn load_layered(trackscript_dir: Option<&Path>) -> Self {
+    pub fn load_layered(halotext_dir: Option<&Path>) -> Self {
         let mut cfg = Config::default();
         let sys = crate::paths::system_data().join("player_settings.json");
         cfg.merge_from_file(&sys);
         let user = crate::paths::user_config().join("player_settings.json");
         cfg.merge_from_file(&user);
-        if let Some(dir) = trackscript_dir {
+        if let Some(dir) = halotext_dir {
             cfg.merge_from_file(&dir.join("player_settings.json"));
         }
         cfg

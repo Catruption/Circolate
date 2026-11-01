@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::fidelity::Fidelity;
 use crate::deps::requires::Requires;
-use crate::formats::trackscript::{ShimEvent, TrackscriptEvent, TrackscriptPart};
+use crate::formats::halotext::{ShimEvent, HalotextEvent, HalotextPart};
 use crate::hosting::chip::patch::Patch;
 use crate::hosting::chip::dac::DacTrack;
 use crate::timing::TempoMap;
@@ -48,7 +48,7 @@ pub(crate) struct Project {
     pub(crate) source_dir: PathBuf,
     pub(crate) cover_path: Option<PathBuf>,
     pub(crate) fidelity: Option<Fidelity>,
-    pub(crate) parts: HashMap<String, TrackscriptPart>,
+    pub(crate) parts: HashMap<String, HalotextPart>,
     pub(crate) part_hash: HashMap<String, u64>,
     pub(crate) samples: HashMap<u32, Arc<Sample>>,
     pub(crate) path_to_id: HashMap<String, u32>,
@@ -284,7 +284,7 @@ impl Project {
         self.lines.get(li).map(|l| l.max_end).unwrap_or(0)
     }
 
-    pub(crate) fn part_events(&self, name: &str) -> &[TrackscriptEvent] {
+    pub(crate) fn part_events(&self, name: &str) -> &[HalotextEvent] {
         self.parts.get(name).map(|p| p.events.as_slice()).unwrap_or(&[])
     }
 

@@ -1,0 +1,34 @@
+{
+  "name": "halotext-highlight",
+  "publisher": "local",
+  "displayName": "Halotext Highlight",
+  "version": "0.0.2",
+  "engines": { "vscode": "^1.75.0" },
+  "main": "./extension.js",
+  "activationEvents": [
+    "onCommand:halotext.connectPlayhead",
+    "onLanguage:halotext"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "halotext",
+        "aliases": ["Halotext"],
+        "extensions": [".halotext", ".halo.txt"]
+      }
+    ],
+    "grammars": [
+      {
+        "language": "halotext",
+        "scopeName": "source.halotext",
+        "path": "./halotext.tmLanguage.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "halotext.connectPlayhead",
+        "title": "Halotext: Connect Live Playhead"
+      }
+    ]
+  }
+}

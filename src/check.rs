@@ -1,4 +1,4 @@
-//! `trackscript-player check` — recursively probe .flp files for missing deps.
+//! `halotext-player check` — recursively probe .flp files for missing deps.
 //!
 //! Never converts, never renders, never writes.
 //! Exit code is 1 if any file has missing dependencies (or a fallback
@@ -136,7 +136,7 @@ pub fn run(argv: &[String]) -> Result<()> {
 }
 
 fn print_help() {
-    println!("usage: trackscript-player check [--json] [--scaffold-fallbacks] \\");
+    println!("usage: halotext-player check [--json] [--scaffold-fallbacks] \\");
     println!("                           [--write-requirements FILE] [PATH]");
     println!();
     println!("  Recursively probe .flp files for missing dependencies.");
@@ -164,7 +164,7 @@ pub fn run_census(argv: &[String]) -> Result<()> {
                 out = Some(PathBuf::from(p));
             }
             "-h" | "--help" => {
-                println!("usage: trackscript-player census [PATH] [--out FILE]");
+                println!("usage: halotext-player census [PATH] [--out FILE]");
                 return Ok(());
             }
             other if other.starts_with('-') => bail!("unknown flag: {other}"),

@@ -1,10 +1,10 @@
 //! Storage abstraction: everything a project load needs, backed by
-//! either a directory tree or a `.tsz` archive.
+//! either a directory tree or a `.halo.zip` archive.
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
-pub const ENTRY_KEY: &str = "trackscript";
+pub const ENTRY_KEY: &str = "halotext";
 
 pub trait AssetSource: Send + Sync {
     fn read_bytes(&self, rel: &str) -> Result<Option<Vec<u8>>>;
@@ -40,14 +40,14 @@ pub trait AssetSource: Send + Sync {
 
 pub struct DirSource {
     base: PathBuf,
-    trackscript_name: String,
+    halotext_name: String,
 }
 
 impl DirSource {
-    pub fn new(base: impl Into<PathBuf>, trackscript_name: impl Into<String>) -> Self {
+    pub fn new(base: impl Into<PathBuf>, halotext_name: impl Into<String>) -> Self {
         DirSource {
             base: base.into(),
-            trackscript_name: trackscript_name.into(),
+            halotext_name: halotext_name.into(),
         }
     }
 
@@ -57,7 +57,7 @@ impl DirSource {
 
     fn resolve(&self, rel: &str) -> PathBuf {
         if rel == ENTRY_KEY {
-            self.base.join(&self.trackscript_name)
+            self.base.join(&self.halotext_name)
         } else {
             self.base.join(rel)
         }

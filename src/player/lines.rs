@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use crate::formats::trackscript::{BlockCall, CallOverrides, ShimEvent, TrackscriptPart};
+use crate::formats::halotext::{BlockCall, CallOverrides, ShimEvent, HalotextPart};
 
 #[derive(Clone)]
 pub(crate) struct LineCall {
@@ -114,7 +114,7 @@ pub(crate) fn tempo_shims_to_events(
 fn resolve_call(
     call: &BlockCall,
     blocks: &HashMap<String, Vec<String>>,
-    parts: &HashMap<String, TrackscriptPart>,
+    parts: &HashMap<String, HalotextPart>,
     rows_per_measure: f64,
     call_index: usize,
 ) -> Vec<LineCall> {
@@ -192,7 +192,7 @@ fn resolve_call(
 pub(crate) fn resolve_line(
     line: &[BlockCall],
     blocks: &HashMap<String, Vec<String>>,
-    parts: &HashMap<String, TrackscriptPart>,
+    parts: &HashMap<String, HalotextPart>,
     rows_per_measure: f64,
 ) -> ResolvedLine {
     let mut calls: Vec<LineCall> = Vec::new();

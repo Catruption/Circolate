@@ -19,7 +19,7 @@ use crate::convert::AuxFile;
 use crate::deps::registry::RegistryTable;
 
 pub const FILENAME: &str = "requires.json";
-pub const FORMAT_TAG: &str = "trackscript-requires";
+pub const FORMAT_TAG: &str = "halotext-requires";
 pub const FORMAT_VERSION: u32 = 1;
 
 // ── data model ─────────────────────────────────────────────────────────

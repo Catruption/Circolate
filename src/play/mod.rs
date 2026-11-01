@@ -10,3 +10,4 @@ pub mod offline;
 pub mod resolve;
 pub mod session;
 pub mod worker;
+pub mod playhead;

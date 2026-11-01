@@ -1,6 +1,6 @@
-//! Trackscript timing: tempo integration and value automation lanes.
+//! Halotext timing: tempo integration and value automation lanes.
 //!
-//! Rust port of the relevant parts of trackscript_timing.py. Same
+//! Rust port of the relevant parts of halotext_timing.py. Same
 //! semantics: rows are the time axis, tempo is piecewise-linear over
 //! rows, and value lanes are piecewise-linear over seconds.
 //!

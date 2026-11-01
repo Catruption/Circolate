@@ -611,5 +611,5 @@ if [ "$(basename "$0")" = "acquire.sh" ]; then
         echo "Done with $failed failure(s).  Run 'sh -x ./acquire.sh' to trace."
         exit 1
     fi
-    echo "Done.  Run 'trackscript-player check' to verify."
+    echo "Done.  Run 'halotext-player check' to verify."
 fi

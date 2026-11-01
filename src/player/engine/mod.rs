@@ -257,9 +257,8 @@ impl Engine {
     // ─────────────── chip gain ───────────────
 
     fn chip_gain(&self, iid: u16) -> f32 {
-        // Two chip players: 100 = sn76489, 101 = ym2612. The mixer's
-        // mute/volume registry doesn't track these paths, so use
-        // song_volume directly instead of zeroing out.
+        // Chip players apply per-part mute/solo and faders to their isolated
+        // hardware voices. This gain is the master/song level only.
         if iid == 100 || iid == 101 {
             return self.song_volume as f32;
         }
@@ -372,7 +371,6 @@ impl Engine {
         }
         for idx in 0..self.chip_gain_scratch.len() {
             let (iid, gain) = self.chip_gain_scratch[idx];
-            if gain <= 0.0 { continue; }
             if let Some(player) = self.chip_players.get_mut(&iid) {
                 player.render(out_l, out_r, block_start, gain);
             }

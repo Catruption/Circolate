@@ -359,18 +359,18 @@ fn event_loop(
                                             match state.menu.selected_index {
                                                 0 => {
                                                     if let Some(p) = crate::pick::pick_file(
-                                                        &crate::paths::user_trackscripts(),
-                                                                                            crate::pick::FILTER_TRACKSCRIPT,
-                                                                                            "Open Trackscript",
+                                                        &crate::paths::user_halotexts(),
+                                                                                            crate::pick::FILTER_HALOTEXT,
+                                                                                            "Open Halotext",
                                                     ) {
                                                         return Ok(LoopOutcome::Next(p.to_string_lossy().into_owned()));
                                                     }
                                                 }
                                                 1 => {
                                                     if let Some(p) = crate::pick::pick_file(
-                                                        &crate::paths::user_trackscripts(),
-                                                                                            crate::pick::FILTER_TRACKSCRIPT,
-                                                                                            "Dump Trackscript",
+                                                        &crate::paths::user_halotexts(),
+                                                                                            crate::pick::FILTER_HALOTEXT,
+                                                                                            "Dump Halotext",
                                                     ) {
                                                         let path_str = p.to_string_lossy().into_owned();
                                                         crate::log_event!("tui.menu.dump_started", path: path_str.clone());

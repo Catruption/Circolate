@@ -1,11 +1,11 @@
 #!/bin/sh
-# run.sh — unified launcher for trackscript-player.
+# run.sh — unified launcher for halotext-player.
 
 self=$(readlink -f "$0")
 share_dir=$(dirname "$self")
 root=$(dirname "$share_dir")
 bin="$root/target/release/circolate"
-trackscripts="$root/trackscripts"
+halotexts="$root/halotexts"
 
 # ── self-heal desktop file paths ───────────────────────────────────────
 for d in "$share_dir"/*.desktop; do
@@ -29,14 +29,14 @@ usage: run.sh <verb> [args] [flags]
 
   (no args)          open the player with no song
   <file>             play <file>  (implicit "play")
-  play [file]        play a song.  Accepts a .trackscript, .tsz, source
-                     file, or a directory containing a trackscript.
-  export <file>      export to trackscripts/<stem>/
-  export -a <file>   export to trackscripts/<stem>.tsz
+  play [file]        play a song.  Accepts a .halotext, .tsz, source
+                     file, or a directory containing a halotext.
+  export <file>      export to halotexts/<stem>/
+  export -a <file>   export to halotexts/<stem>.tsz
   dump   [file]      print parsed structure as JSON
   test   [file]      run single-file diagnostics
   check  [path]      recursively probe .flp sources for missing
-                     dependencies, and .trackscript/.tsz files for
+                     dependencies, and .halotext/.tsz files for
                      referenced samples/instruments that are missing.
                      .mid/.midi/.it sources are skipped (the binary
                      cannot probe them). __MACOSX dirs and macOS
@@ -63,7 +63,7 @@ usage: run.sh <verb> [args] [flags]
                      VST3 smoke test
   sf2-smoke <file.sf2> [--bank N] [--patch N] [--note N] [--list] [--out FILE.wav]
                      SF2 engine smoke test
-  list               list trackscripts/
+  list               list halotexts/
   rebuild            cargo build --release
   help               this message
 
@@ -71,9 +71,9 @@ Flags (passed through to the binary):
   --render F --rate N --start N --samples-dir D -o D --archive --sf2 D
   --skip-native --no-cache --no-master-fx --no-watch
 
-When a .mid is selected, or a trackscript whose Config says
+When a .mid is selected, or a halotext whose Config says
 "SoundFont: ask;", a second dialog asks which SoundFont to use.
-Cancel it to fall back to the SF2 baked into the trackscript (or, for
+Cancel it to fall back to the SF2 baked into the halotext (or, for
 a raw MIDI, whatever the converter finds on disk).
 EOF
 }
@@ -128,8 +128,8 @@ case "$verb" in
         ;;
 
     list)
-        [ ! -d "$trackscripts" ] && { echo "no trackscripts directory"; exit 0; }
-        for entry in "$trackscripts"/* "$trackscripts"/.[!.]*; do
+        [ ! -d "$halotexts" ] && { echo "no halotexts directory"; exit 0; }
+        for entry in "$halotexts"/* "$halotexts"/.[!.]*; do
             [ -e "$entry" ] || continue
             name=$(basename "$entry")
             if [ -d "$entry" ]; then
@@ -180,7 +180,7 @@ block_has_problems() {
 }
 
 # ── dependency scanners used by `check` ────────────────────────────────
-check_trackscript() {
+check_halotext() {
     ts="$1"
     ts_dir=$(dirname "$ts")
     missing=$(grep -oE "'(samples|instruments)/[^']*'" "$ts" 2>/dev/null \
@@ -207,14 +207,14 @@ check_tsz() {
         return 1
     fi
     ts=$(find "$tmpd" -maxdepth 3 -type f \
-             \( -name '*.trackscript' -o -name 'trackscript' \) 2>/dev/null \
+             \( -name '*.halotext' -o -name 'halotext' \) 2>/dev/null \
          | head -1)
     rc=0
     if [ -z "$ts" ]; then
-        printf '  no trackscript inside archive\n'
+        printf '  no halotext inside archive\n'
         rc=1
     else
-        check_trackscript "$ts"
+        check_halotext "$ts"
         rc=$?
     fi
     rm -rf "$tmpd"
@@ -260,16 +260,16 @@ if [ -d "$file" ]; then
             ts_dir="$file"
             ts_file=""
 
-            if [ -f "$ts_dir/trackscript" ]; then
-                ts_file="$ts_dir/trackscript"
+            if [ -f "$ts_dir/halotext" ]; then
+                ts_file="$ts_dir/halotext"
             else
-                for cand in "$ts_dir"/*.trackscript; do
+                for cand in "$ts_dir"/*.halotext; do
                     [ -f "$cand" ] && ts_file="$cand" && break
                 done
             fi
 
             if [ -z "$ts_file" ]; then
-                echo "no trackscript found in $ts_dir" >&2
+                echo "no halotext found in $ts_dir" >&2
                 exit 1
             fi
             file="$ts_file"
@@ -277,8 +277,8 @@ if [ -d "$file" ]; then
     esac
 fi
 
-play_filter='*.trackscript *.tsz *.flp *.it *.mid *.midi|Trackscript sources'
-test_filter='*.trackscript *.tsz *.flp *.it *.mid *.midi|Trackscript sources'
+play_filter='*.halotext *.tsz *.flp *.it *.mid *.midi|Halotext sources'
+test_filter='*.halotext *.tsz *.flp *.it *.mid *.midi|Halotext sources'
 src_filter='*.flp *.it *.mid *.midi|FLP / IT / MIDI sources'
 
 # ── SoundFont picker ───────────────────────────────────────────────────
@@ -293,7 +293,7 @@ maybe_pick_sf2() {
         *.[mM][iI][dD]|*.[mM][iI][dD][iI])
             needs_sf2=1
             ;;
-        *trackscript)
+        *halotext)
             grep -q '^[[:space:]]*SoundFont:[[:space:]]*ask' "$1" 2>/dev/null && needs_sf2=1
             ;;
         *.tsz)
@@ -353,11 +353,11 @@ case "$verb" in
         stem=${stem%.*}
 
         case " $passthru " in
-            *' --archive '*|*' -a '*) out="$trackscripts/$stem.tsz" ;;
-            *) out="$trackscripts/$stem" ;;
+            *' --archive '*|*' -a '*) out="$halotexts/$stem.tsz" ;;
+            *) out="$halotexts/$stem" ;;
         esac
 
-        mkdir -p "$trackscripts"
+        mkdir -p "$halotexts"
         exec "$bin" export "$@" "$file" -o "$out"
         ;;
 
@@ -488,32 +488,32 @@ $(find -L "$target" \
     2>/dev/null)
 EOF
 
-        # 2. Trackscripts — shell-level referenced-file check.
+        # 2. Halotexts — shell-level referenced-file check.
         while IFS= read -r ts; do
             [ -z "$ts" ] && continue
             n_ts_total=$((n_ts_total + 1))
-            ts_out=$(check_trackscript "$ts")
+            ts_out=$(check_halotext "$ts")
             ts_rc=$?
             if [ "$ts_rc" -eq 0 ]; then
                 if [ "$check_only_unresolved" = 1 ]; then
                     n_skipped_clean=$((n_skipped_clean + 1))
                     continue
                 fi
-                printf '\n── TRACKSCRIPT: %s ──\n' "$ts"
+                printf '\n── HALOTEXT: %s ──\n' "$ts"
                 echo "  all referenced samples/instruments present"
             else
-                printf '\n── TRACKSCRIPT: %s ──\n' "$ts"
+                printf '\n── HALOTEXT: %s ──\n' "$ts"
                 printf '%s\n' "$ts_out"
             fi
             n_ts=$((n_ts + 1))
         done <<EOF
 $(find -L "$target" \
     -type d \( -name target -o -name .git -o -name __pycache__ -o -name __MACOSX -o -name .Trashes \) -prune \
-    -o -type f -name '*.trackscript' ! -name '._*' -print \
+    -o -type f -name '*.halotext' ! -name '._*' -print \
     2>/dev/null)
 EOF
 
-        # 3. TSZ archives — extract, then check the inner trackscript.
+        # 3. TSZ archives — extract, then check the inner halotext.
         while IFS= read -r tsz; do
             [ -z "$tsz" ] && continue
             n_tsz_total=$((n_tsz_total + 1))
@@ -540,14 +540,14 @@ EOF
 
         printf '\n────────────────────────────────────────────────────────────\n'
         if [ "$check_only_unresolved" = 1 ]; then
-            printf 'followed %d symlink(s); showed %d of %d FLP(s), %d of %d trackscript(s), %d of %d tsz archive(s); %d hidden as clean; %d non-FLP source(s) skipped; %d binary check(s) failed\n' \
+            printf 'followed %d symlink(s); showed %d of %d FLP(s), %d of %d halotext(s), %d of %d tsz archive(s); %d hidden as clean; %d non-FLP source(s) skipped; %d binary check(s) failed\n' \
                 "$n_links" \
                 "$n_src" "$n_src_total" \
                 "$n_ts" "$n_ts_total" \
                 "$n_tsz" "$n_tsz_total" \
                 "$n_skipped_clean" "$n_skipped_nonflp" "$failed"
         else
-            printf 'followed %d symlink(s); checked %d FLP(s), %d trackscript(s), %d tsz archive(s); %d non-FLP source(s) skipped; %d binary check(s) failed\n' \
+            printf 'followed %d symlink(s); checked %d FLP(s), %d halotext(s), %d tsz archive(s); %d non-FLP source(s) skipped; %d binary check(s) failed\n' \
                 "$n_links" "$n_src_total" "$n_ts_total" "$n_tsz_total" \
                 "$n_skipped_nonflp" "$failed"
         fi

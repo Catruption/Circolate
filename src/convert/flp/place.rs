@@ -355,7 +355,7 @@ pub(super) fn end_tick_of(placed: &HashMap<u16, Vec<Placed>>, iid: u16) -> u32 {
 
 // ── shim emission ──────────────────────────────────────────────────────
 //
-// Shim helpers for the FLP → trackscript conversion.  The top-level
+// Shim helpers for the FLP → halotext conversion.  The top-level
 // `convert/flp.rs` calls `channel_shims` once the FLP parser has
 // exposed each channel's mixer insert (`Channel.insert`), then appends
 // the returned `@<ƒSlug()>` strings to each channel's call line in

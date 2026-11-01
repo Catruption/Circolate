@@ -1,8 +1,8 @@
-//! `trackscript-player export` — convert a source file to trackscript.
+//! `halotext-player export` — convert a source file to halotext.
 //!
 //! Two output shapes:
-//!   * directory (default) — trackscript + samples/ + instruments/ + samples.json
-//!   * archive (--archive) — a single .tsz file
+//!   * directory (default) — a .halo.txt file plus manifest and assets
+//!   * archive (--archive) — a single .halo.zip file
 //!
 //! Both share the same `convert_file` pipeline; only the write-back
 //! step differs.
@@ -74,7 +74,7 @@ pub fn run(argv: &[String]) -> Result<()> {
 
     let src = src.ok_or_else(|| {
         anyhow!(
-            "usage: trackscript-player export <file> [-o DIR] [--archive] \
+            "usage: halotext-player export <file> [-o DIR] [--archive] \
 [--include-plugins[=free|all]] [--pitch names|hz]"
         )
     })?;
@@ -88,7 +88,7 @@ pub fn run(argv: &[String]) -> Result<()> {
         write_directory_output(&src, &conv, &stem, out_dir.as_deref())?;
     }
 
-    print_footer(&conv.trackscript);
+    print_footer(&conv.halotext);
     Ok(())
 }
 
@@ -100,66 +100,17 @@ fn write_directory_output(
     stem: &str,
     out_dir: Option<&Path>,
 ) -> Result<()> {
-    let out = out_dir
-    .map(|p| p.to_path_buf())
-    .unwrap_or_else(|| {
-        // FIX: Point to the standard user trackscripts directory.
-        // We append `stem` so multiple exports of the same project don't
-        // overwrite each other's samples/ folders.
-        paths::export_dir().join(stem)
-    });
-
-    std::fs::create_dir_all(&out)
-    .with_context(|| format!("creating {}", out.display()))?;
-
-    let ts_path = out.join(format!("{}.trackscript", stem));
-    std::fs::write(&ts_path, &conv.trackscript)
-    .with_context(|| format!("writing {}", ts_path.display()))?;
-
-    for s in &conv.samples {
-        let p = out.join(&s.rel_path);
-        if let Some(parent) = p.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&p, &s.wav)
-        .with_context(|| format!("writing {}", p.display()))?;
-    }
-
-    for a in &conv.aux {
-        let p = out.join(&a.rel_path);
-        if let Some(parent) = p.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&p, &a.bytes)
-        .with_context(|| format!("writing {}", p.display()))?;
-    }
-
-    if !conv.samples_json.is_empty() {
-        let sj = out.join("samples.json");
-        std::fs::write(&sj, &conv.samples_json)
-        .with_context(|| format!("writing {}", sj.display()))?;
-    }
-
+    let out = out_dir.map(Path::to_path_buf).unwrap_or_else(|| paths::export_dir().join(stem));
+    std::fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
+    let main_filename = format!("{}{}", stem, crate::spec::SOURCE_EXT);
     let cover = find_cover_for_source(src);
-    if let Some((name, bytes)) = &cover {
-        let dest = out.join(name);
-        let _ = std::fs::write(&dest, bytes);
-    }
-
-    let title = src.file_stem().and_then(|s| s.to_str()).unwrap_or(stem);
     let cover_arg = cover.as_ref().map(|(n, b)| (n.as_str(), b.as_slice()));
-    let entry_path = format!("{}.trackscript", stem);
-
-    archive::write_manifest_and_requires(
-        &out,
-        conv,
-        &entry_path,
-        title,
-        44100,
-        cover_arg,
+    archive::write_bundle_directory(
+        &out, conv, &main_filename,
+        src.file_stem().and_then(|s| s.to_str()).unwrap_or(stem),
+        44100, cover_arg,
     )?;
-
-    println!("wrote {}", ts_path.display());
+    println!("wrote {}", out.join(main_filename).display());
     Ok(())
 }
 
@@ -174,7 +125,7 @@ fn write_archive_output(
 ) -> Result<()> {
     let out_path = match out_dir {
         Some(p) => {
-            if p.extension().and_then(|s| s.to_str()) == Some(archive::EXTENSION) {
+            if archive::is_archive_path(p) {
                 p.to_path_buf()
             } else {
                 std::fs::create_dir_all(p)
@@ -183,7 +134,7 @@ fn write_archive_output(
             }
         }
         None => {
-            // FIX: Point to the standard user trackscripts directory.
+            // FIX: Point to the standard user halotexts directory.
             let dir = paths::export_dir();
             std::fs::create_dir_all(&dir)
             .with_context(|| format!("creating {}", dir.display()))?;
@@ -203,14 +154,13 @@ fn write_archive_output(
         Some(other) => bail!("unknown --include-plugins value: {other}"),
     };
 
-    let opts = archive::WriteOptions {
-        flac_max_ratio: 0.95,
-        include_plugins: include,
-    };
+    let opts = archive::WriteOptions { include_plugins: include };
 
+    let main_filename = format!("{}{}", stem, crate::spec::SOURCE_EXT);
     let manifest = archive::write_archive(
         &out_path,
         conv,
+        &main_filename,
         title,
         44100,
         cover_arg,
@@ -285,9 +235,9 @@ fn find_cover_for_source(src: &Path) -> Option<(String, Vec<u8>)> {
 
 // ── footer printing ────────────────────────────────────────────────────
 
-fn print_footer(trackscript: &str) {
+fn print_footer(halotext: &str) {
     let mut in_footer = false;
-    for line in trackscript.lines() {
+    for line in halotext.lines() {
         if line.starts_with("// ------") {
             in_footer = true;
         } else if in_footer && line.starts_with("//") {

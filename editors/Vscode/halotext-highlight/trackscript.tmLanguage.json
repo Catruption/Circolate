@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
-  "name": "Trackscript",
-  "scopeName": "source.trackscript",
+  "name": "Halotext",
+  "scopeName": "source.halotext",
   "patterns": [
     { "include": "#comments" },
     { "include": "#sections" },
@@ -14,59 +14,59 @@
   "repository": {
     "comments": {
       "patterns": [
-        { "name": "comment.line.double-slash.trackscript",
+        { "name": "comment.line.double-slash.halotext",
           "match": "//.*$" }
       ]
     },
     "sections": {
       "patterns": [
-        { "name": "keyword.control.section.trackscript",
+        { "name": "keyword.control.section.halotext",
           "match": "\\b(Config|BlockList|BlockArray)\\b" }
       ]
     },
     "config-keys": {
       "patterns": [
-        { "name": "entity.other.attribute-name.trackscript",
-          "match": "\\b(TrackscriptVersion|BeatsPerMinute|TimeSignature|Subdivisions|SongVolume|PanningLaw|Overlap|PitchDefault|Tempo|GlobalVolume|GlobalPan|GlobalTuning)\\b" },
-        { "name": "constant.language.trackscript",
+        { "name": "entity.other.attribute-name.halotext",
+          "match": "\\b(HalotextVersion|BeatsPerMinute|TimeSignature|Subdivisions|SongVolume|PanningLaw|Overlap|PitchDefault|Tempo|GlobalVolume|GlobalPan|GlobalTuning)\\b" },
+        { "name": "constant.language.halotext",
           "match": "\\b(linear|equal_power|stack|hz|names)\\b" }
       ]
     },
     "calls": {
       "patterns": [
-        { "name": "entity.name.function.trackscript",
+        { "name": "entity.name.function.halotext",
           "match": "ƒ[A-Za-z_]\\w*(?=\\()" },
-        { "name": "variable.other.trackscript",
+        { "name": "variable.other.halotext",
           "match": "ƒ[A-Za-z_]\\w*" },
-        { "name": "string.other.path.trackscript",
+        { "name": "string.other.path.halotext",
           "match": "ƒ'[^']*'(?:\\(\\d+\\))?" }
       ]
     },
     "fields": {
       "patterns": [
-        { "name": "constant.numeric.position.trackscript",
+        { "name": "constant.numeric.position.halotext",
           "match": "§[\\d.]+(?:/[\\d.]+)?" },
-        { "name": "constant.numeric.pitch.trackscript",
+        { "name": "constant.numeric.pitch.halotext",
           "match": "#(?:[A-Ga-g][#b]?-?\\d+|\\d+(?:\\.\\d+)?)(?:[+\\-*±][\\d.]+(?:[→^][\\d.]+(?:/[\\d.]+)?)?(?::\\d+)?)?" },
-        { "name": "constant.numeric.length.trackscript",
+        { "name": "constant.numeric.length.halotext",
           "match": "~[\\d.]+(?:[+\\-*±][\\d.]+(?:[→^][\\d.]+(?:/[\\d.]+)?)?(?::\\d+)?)?" },
-        { "name": "constant.numeric.volume.trackscript",
+        { "name": "constant.numeric.volume.halotext",
           "match": "%-?[\\d.]+(?:[+\\-*±][\\d.]+(?:[→^][\\d.]+(?:/[\\d.]+)?)?(?::\\d+)?)?" },
-        { "name": "constant.numeric.pan.trackscript",
+        { "name": "constant.numeric.pan.halotext",
           "match": "¶-?[\\d.]+(?:[+\\-*±][\\d.]+(?:[→^][\\d.]+(?:/[\\d.]+)?)?(?::\\d+)?)?" },
-        { "name": "keyword.operator.trackscript",
+        { "name": "keyword.operator.halotext",
           "match": "[+*±→^]" }
       ]
     },
     "strings": {
       "patterns": [
-        { "name": "string.quoted.single.trackscript",
+        { "name": "string.quoted.single.halotext",
           "begin": "'", "end": "'" }
       ]
     },
     "numbers": {
       "patterns": [
-        { "name": "constant.numeric.float.trackscript",
+        { "name": "constant.numeric.float.halotext",
           "match": "\\d+(?:\\.\\d+)?" }
       ]
     }

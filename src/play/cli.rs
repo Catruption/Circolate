@@ -15,6 +15,7 @@ pub struct Args {
     pub no_master_fx: bool,
     pub no_watch: bool,
     pub sf2_override: Option<PathBuf>,
+    pub ipc: Option<PathBuf>, // <-- NEW
 }
 
 pub fn parse_args(argv: &[String]) -> Result<Args> {
@@ -29,6 +30,8 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
     let mut no_master_fx = false;
     let mut no_watch = false;
     let mut sf2_override: Option<PathBuf> = None;
+    let mut ipc: Option<PathBuf> = None; // <-- NEW
+
     while let Some(a) = it.next() {
         match a.as_str() {
             "--render" => {
@@ -58,6 +61,11 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
                     it.next().ok_or_else(|| anyhow!("--sf2 needs a path"))?,
                 ))
             }
+            "--ipc" => {
+                ipc = Some(PathBuf::from(
+                    it.next().ok_or_else(|| anyhow!("--ipc needs a socket path"))?,
+                ))
+            }
             "--skip-native" => skip_native = true,
             "--no-cache" => no_cache = true,
             "--verify-cache" => verify = true,
@@ -69,15 +77,16 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
     }
     Ok(Args {
         song,
-       render,
-       rate,
-       start,
-       no_cache,
-       verify,
-       samples_dir,
-       skip_native,
-       no_master_fx,
-       no_watch,
-       sf2_override,
+        render,
+        rate,
+        start,
+        no_cache,
+        verify,
+        samples_dir,
+        skip_native,
+        no_master_fx,
+        no_watch,
+        sf2_override,
+        ipc, // <-- NEW
     })
 }

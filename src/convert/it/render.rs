@@ -371,7 +371,7 @@ pub(super) fn build_song(
     let mut song = Song::new(
         title,
         source_name,
-        "it2trackscript",
+        "it2halotext",
         first_bpm,
         ROWS_PER_BEAT,
         (4, 4),
@@ -404,7 +404,7 @@ pub(super) fn build_song(
         .push("// ------------------------------------------------------------".to_string());
     song.post_comments.push(format!("// {}", title));
     song.post_comments.push(format!(
-        "// Converted from {} by it2trackscript",
+        "// Converted from {} by it2halotext",
         source_name
     ));
     song.post_comments.push("//".to_string());

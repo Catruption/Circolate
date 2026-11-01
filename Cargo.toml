@@ -1,8 +1,8 @@
 [package]
 name = "circolate"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "Trackscript player and FL Studio/tracker converter"
+description = "Halotext player and FL Studio/tracker converter"
 repository = "https://github.com/yourusername/circolate"
 license = "GPL-3.0-or-later"
 readme = "README.md"

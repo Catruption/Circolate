@@ -24,7 +24,7 @@ pub(super) fn make_report(
 
     let mut r: Vec<String> = Vec::new();
 
-    r.push(format!("it2trackscript report for {}", source_name));
+    r.push(format!("it2halotext report for {}", source_name));
     r.push(format!("title: {}", m.title));
     r.push(format!("source archive: source/{} (byte-exact)", source_name));
     r.push(format!(
@@ -59,7 +59,7 @@ pub(super) fn make_report(
 
     r.push(String::new());
 
-    r.push("Trackscript structure:".into());
+    r.push("Halotext structure:".into());
     r.push(format!("  reusable pattern definitions: {}", unique_part_count));
     r.push(format!(
         "  pattern placements in BlockList: {}",
@@ -237,10 +237,10 @@ pub(super) fn build_semantics_json(
         .collect();
 
     let data = json!({
-        "format": "trackscript-semantics",
+        "format": "halotext-semantics",
         "version": 1,
         "source": source_name,
-        "converter": "it2trackscript",
+        "converter": "it2halotext",
         "source_archive": format!("source/{}", source_name),
         "module": {
             "title": module.title,

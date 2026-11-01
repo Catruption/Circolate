@@ -73,8 +73,8 @@ pub fn play_one(
         let sample_rate = stream_config.sample_rate.0;
         let channels = stream_config.channels as usize;
 
-        let is_watchable_trackscript = song.map_or(false, |p| {
-            !is_archive(p) && matches!(SourceKind::from_path(p), Ok(SourceKind::Trackscript))
+        let is_watchable_halotext = song.map_or(false, |p| {
+            !is_archive(p) && matches!(SourceKind::from_path(p), Ok(SourceKind::Halotext))
         });
 
         let (project, cache_owned, project_path, _guard) = match song {
@@ -130,7 +130,7 @@ pub fn play_one(
                                  loop_wraps: AtomicI64::new(0),
         });
 
-        let reload_slot = if is_watchable_trackscript && !args.no_watch {
+        let reload_slot = if is_watchable_halotext && !args.no_watch {
             let slot = Arc::new(ReloadSlot {
                 pending: Mutex::new(None),
             });
@@ -157,6 +157,19 @@ pub fn play_one(
 
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = channel();
         let (wrap_tx, wrap_rx): (Sender<Msg>, Receiver<Msg>) = channel();
+
+        // Keep the editor playhead available during ordinary playback. The
+        // CLI flag remains an override for clients using a custom socket path.
+        let ipc_path = args.ipc.as_deref().unwrap_or_else(|| Path::new("/tmp/circolate.sock"));
+        let source_file = std::fs::canonicalize(&project_path)
+            .unwrap_or_else(|_| project_path.clone());
+        crate::play::playhead::spawn_ipc_server(
+            ipc_path.to_string_lossy().into_owned(),
+            source_file.to_string_lossy().into_owned(),
+            Arc::clone(&transport),
+            Arc::clone(&project),
+            settings.synesthesia,
+        );
 
         let lookahead = sample_rate as i64 * 2;
         {

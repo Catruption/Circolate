@@ -2,7 +2,7 @@
 //! Standard MIDI File parsing.
 //!
 //! Wraps `midly` and flattens the event stream into a per-channel note
-//! list.  Nothing here emits trackscript; the shape is chosen so the
+//! list.  Nothing here emits halotext; the shape is chosen so the
 //! converter doesn't have to touch midly types.
 //!
 //! Format 0 and 1 are supported.  Format 2 (independent sequences) is
@@ -163,7 +163,7 @@ pub fn parse_bytes(bytes: &[u8]) -> Result<MidiFile> {
                 }
                 TrackEventKind::Meta(MetaMessage::Tempo(us)) => {
                     // Honour only the file's initial tempo.  Later
-                    // tempo changes would need trackscript tempo shims,
+                    // tempo changes would need halotext tempo shims,
                     // which is a later pass.
                     if tick == 0 {
                         initial_bpm = 60_000_000.0 / us.as_int() as f64;

@@ -1,15 +1,15 @@
 // src/convert/midi.rs
-//! MIDI → Trackscript converter.
+//! MIDI → Halotext converter.
 //!
 //! Multi-SF2 aware.  If the source file's directory contains several
 //! SoundFonts — one per instrument, as game-rip archives often do —
 //! each MIDI channel is matched to the SF2 whose preset table
 //! contains that channel's `(bank, program)`.  Channels with no match
 //! fall back to a default bank; if there's no default either, the
-//! channel is given a placeholder so the Trackscript can still be generated.
+//! channel is given a placeholder so the Halotext can still be generated.
 //!
 //! When every channel resolves to the same SF2 (a plain GM MIDI), the
-//! trackscript writes `SoundFont: ask;` so the launcher can offer to
+//! halotext writes `SoundFont: ask;` so the launcher can offer to
 //! override it at play time.  When channels resolve to different
 //! SF2s (a game-rip archive), the per-channel mapping is meaningful
 //! and no prompt is written.
@@ -114,7 +114,7 @@ pub(super) fn convert(
     let mut song = Song::new(
         &title,
         source_name,
-        "midi2trackscript",
+        "midi2halotext",
         mf.initial_bpm,
         subs,
         (num as u32, den as u32),
@@ -172,7 +172,7 @@ pub(super) fn convert(
     );
     song.post_comments.push(format!("// {}", title));
     song.post_comments.push(
-        "// converted from Standard MIDI File by midi2trackscript".to_string(),
+        "// converted from Standard MIDI File by midi2halotext".to_string(),
     );
     song.post_comments.push(format!("// source: {source_name}"));
     song.post_comments.push(format!(
@@ -193,10 +193,10 @@ pub(super) fn convert(
         ));
     }
 
-    let trackscript = song.write();
+    let halotext = song.write();
 
     Ok(Converted {
-        trackscript,
+        halotext,
        samples: Vec::new(),
        samples_json: String::new(),
        aux,

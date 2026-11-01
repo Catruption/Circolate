@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use crate::mixer::mute;
 use crate::player::{Project, Transport};
 use crate::player::notes::{split_notes, value_at};
-use crate::formats::trackscript::hz_to_note;
+use crate::formats::halotext::hz_to_note;
 use super::analysis_mir::{self, N, Features};
 use super::motion;
 use super::theory;
@@ -30,59 +30,42 @@ pub struct AnalysisReport {
 /// 17-measure analysis every frame.
 pub fn motion_highlights(project: &Project, line_idx: usize) -> Vec<(usize, i64)> {
     let snap = mute::snapshot();
-    let mut notes = Vec::new();
+    let mut by_part: std::collections::BTreeMap<String, Vec<N>> = std::collections::BTreeMap::new();
     for call in project.line_calls(line_idx) {
         let Some(path) = project.part_path(&call.name) else { continue };
         if snap.soloed_part.as_deref().is_some_and(|solo| solo != path)
-            || snap.muted_parts.contains(path) {
-            continue;
-        }
+            || snap.muted_parts.contains(path) { continue; }
         let subs = project.part_subs_per_beat(&call.name);
         let start = call.pattern_measure_start;
         let end = start + call.pattern_measure_len;
-        for note in split_notes(
-            project.part_events(&call.name), subs,
-            project.part_sample_offset_u32(&call.name),
-        ) {
+        for note in split_notes(project.part_events(&call.name), subs,
+            project.part_sample_offset_u32(&call.name)) {
             if note.start_row < start || note.start_row >= end { continue; }
-            notes.push(N {
+            by_part.entry(call.name.clone()).or_default().push(N {
                 start: note.start_row - start,
                 end: note.end_row - start,
                 pitch: hz_to_note(value_at(&note.pitch_points, note.start_row).unwrap_or(440.0)),
-                beats: (note.end_row - note.start_row) / subs as f64,
+                beats: (note.end_row - note.start_row) / subs.max(1) as f64,
             });
         }
     }
-    notes.sort_by(|a, b| a.start.partial_cmp(&b.start)
-        .unwrap_or(std::cmp::Ordering::Equal).then(a.pitch.cmp(&b.pitch)));
-    if notes.is_empty() { return Vec::new(); }
-
-    let lowest = notes.iter().map(|n| n.pitch).min().unwrap_or(0);
-    let lowest_notes: Vec<i32> = notes.iter().map(|n| n.pitch)
-        .filter(|p| *p <= lowest + 2).collect();
-    let pedal = lowest_notes.len() >= 2
-        && lowest_notes.iter().max().unwrap() - lowest_notes.iter().min().unwrap() <= 2;
-    let mut melody: Vec<(f64, i32)> = Vec::new();
-    let mut last_time = -1.0_f64;
-    for n in &notes {
-        if n.start > last_time + 0.1 {
-            melody.push((n.start, n.pitch));
-            last_time = n.start;
-        } else if let Some(last) = melody.last_mut() {
-            last.1 = last.1.max(n.pitch);
-        }
-    }
+    let upper = by_part.iter()
+        .filter(|(name, notes)| !is_rhythm_part(name) && notes.len() >= 3)
+        .max_by(|a, b| mean_pitch(a.1).partial_cmp(&mean_pitch(b.1)).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(_, notes)| analysis_mir::top_line(notes)).unwrap_or_default();
+    let bass = by_part.iter()
+        .filter(|(name, notes)| !is_rhythm_part(name) && notes.len() >= 2)
+        .min_by(|a, b| mean_pitch(a.1).partial_cmp(&mean_pitch(b.1)).unwrap_or(std::cmp::Ordering::Equal));
     let mut out = Vec::new();
-    for pair in melody.windows(2) {
-        if (pair[1].1 - pair[0].1).abs() >= 7 {
-            out.push((line_idx, pair[0].0 as i64));
-            out.push((line_idx, pair[1].0 as i64));
+    for pair in upper.windows(2) {
+        if (pair[1].pitch - pair[0].pitch).abs() >= 7 {
+            out.push((line_idx, pair[0].start as i64));
+            out.push((line_idx, pair[1].start as i64));
         }
     }
-    if pedal {
-        for n in &notes {
-            if n.pitch <= lowest + 2 { out.push((line_idx, n.start as i64)); }
-        }
+    if let Some((_, notes)) = bass.filter(|(_, notes)| motion::calculate_motion(notes).is_pedal) {
+        let lowest = notes.iter().map(|n| n.pitch).min().unwrap_or(0);
+        out.extend(notes.iter().filter(|n| n.pitch <= lowest + 2).map(|n| (line_idx, n.start as i64)));
     }
     out.sort_unstable();
     out.dedup();
@@ -92,7 +75,23 @@ pub fn motion_highlights(project: &Project, line_idx: usize) -> Vec<(usize, i64)
 fn midi_to_name(midi: i32) -> String {
     let names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
     let octave = midi / 12;
-    format!("{}{}", names[(midi % 12) as usize], octave)
+    format!("{}{}", names[midi.rem_euclid(12) as usize], octave)
+}
+
+
+fn part_label(name: &str) -> &str {
+    name.rsplit('/').next().unwrap_or(name).split('_').next().unwrap_or(name)
+}
+
+fn is_rhythm_part(name: &str) -> bool {
+    let n = part_label(name).to_ascii_lowercase();
+    n.starts_with("dac") || n.starts_with("noise") || n.contains("drum")
+        || n.contains("kick") || n.contains("snare") || n.contains("perc")
+}
+
+fn mean_pitch(notes: &[N]) -> f64 {
+    if notes.is_empty() { return 0.0; }
+    notes.iter().map(|n| n.pitch as f64).sum::<f64>() / notes.len() as f64
 }
 
 pub fn analyze(project: &Project, tp: &Transport, line_idx: usize) -> AnalysisReport {
@@ -103,6 +102,8 @@ pub fn analyze(project: &Project, tp: &Transport, line_idx: usize) -> AnalysisRe
     let mut project_notes = Vec::new();
     let mut measure_notes_by_part: std::collections::BTreeMap<String, Vec<N>> = std::collections::BTreeMap::new();
     let mut prev_measure_notes_by_part: std::collections::BTreeMap<String, Vec<N>> = std::collections::BTreeMap::new();
+    let mut part_subs: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    let mut slide_observations: Vec<(f64, String)> = Vec::new();
     let mut total_measure_notes = 0;
 
     let pos = tp.position.load(Ordering::Relaxed).max(0);
@@ -130,9 +131,10 @@ pub fn analyze(project: &Project, tp: &Transport, line_idx: usize) -> AnalysisRe
             let measure_end = measure_start + call.pattern_measure_len;
             let notes = split_notes(
                 project.part_events(&call.name),
-                                    subs,
-                                    project.part_sample_offset_u32(&call.name)
+                subs,
+                project.part_sample_offset_u32(&call.name),
             );
+            if k == 0 { part_subs.insert(call.name.clone(), subs.max(1) as f64); }
 
             for note in notes {
                 if note.start_row < measure_start || note.start_row >= measure_end { continue; }
@@ -144,6 +146,26 @@ pub fn analyze(project: &Project, tp: &Transport, line_idx: usize) -> AnalysisRe
                 let n_struct = N { start: local_start, end: local_end, pitch, beats };
 
                 if k == 0 {
+                    if let Some(base) = note.pitch_points.first().map(|p| p.value).filter(|v| *v > 0.0) {
+                        let mut largest = 0.0_f64;
+                        let mut bend = None;
+                        for point in note.pitch_points.iter().skip(1) {
+                            if point.value <= 0.0 { continue; }
+                            let semitones = 12.0 * (point.value / base).log2();
+                            if semitones.abs() > largest {
+                                largest = semitones.abs();
+                                bend = Some((point, semitones));
+                            }
+                        }
+                        if let Some((point, semitones)) = bend.filter(|_| largest >= 0.35) {
+                            let beat = (point.row - measure_start) / subs.max(1) as f64 + 1.0;
+                            let ramp = point.ramp_rows / subs.max(1) as f64;
+                            let direction = if semitones > 0.0 { "up" } else { "down" };
+                            slide_observations.push((largest, format!(
+                                "{} bends {} {:.1} semitones near beat {:.2} over {:.2} beats.",
+                                part_label(&call.name), direction, largest, beat, ramp)));
+                        }
+                    }
                     project_notes.push(N { start: note.start_row, end: note.end_row, pitch, beats });
                     measure_notes_by_part.entry(call.name.clone()).or_default().push(n_struct);
                     total_measure_notes += 1;
@@ -183,18 +205,22 @@ pub fn analyze(project: &Project, tp: &Transport, line_idx: usize) -> AnalysisRe
     }
     active_parts.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let mut split = analysis_mir::Split { melody: vec![], harmony: vec![] };
-    for (name, notes) in &measure_notes_by_part {
-        let part_split = analysis_mir::split_roles(notes, name);
-        split.melody.extend(part_split.melody);
-        split.harmony.extend(part_split.harmony);
-    }
-    let mut prev_split = analysis_mir::Split { melody: vec![], harmony: vec![] };
-    for (name, notes) in &prev_measure_notes_by_part {
-        let part_split = analysis_mir::split_roles(notes, name);
-        prev_split.melody.extend(part_split.melody);
-        prev_split.harmony.extend(part_split.harmony);
-    }
+    // Use the highest-register pitched part as a clearly labelled upper line.
+    // Halotext does not carry reliable lead/bass role metadata, so do not
+    // pretend that a filename heuristic identifies the actual lead.
+    let upper_part = measure_notes_by_part.iter()
+        .filter(|(name, notes)| !is_rhythm_part(name) && notes.len() >= 3)
+        .max_by(|a, b| mean_pitch(a.1).partial_cmp(&mean_pitch(b.1)).unwrap_or(std::cmp::Ordering::Equal));
+    let upper_name = upper_part.map(|(name, _)| name.clone());
+    let upper_source = upper_part.map(|(_, notes)| notes.as_slice()).unwrap_or(&[]);
+    let upper_notes = analysis_mir::top_line(upper_source);
+    let beat_scale = upper_name.as_ref().and_then(|name| part_subs.get(name).copied()).unwrap_or(1.0).max(1.0);
+    let upper_notes_beats: Vec<N> = upper_notes.iter().map(|n| N {
+        start: n.start / beat_scale, end: n.end / beat_scale, pitch: n.pitch, beats: n.beats,
+    }).collect();
+    let prev_upper_notes = upper_name.as_ref()
+        .and_then(|name| prev_measure_notes_by_part.get(name))
+        .map(|notes| analysis_mir::top_line(notes)).unwrap_or_default();
 
     all_pitches.sort_unstable();
     all_pitches.dedup();
@@ -209,14 +235,14 @@ pub fn analyze(project: &Project, tp: &Transport, line_idx: usize) -> AnalysisRe
     let hist = analysis_mir::histogram(&project_notes);
     let (tonic, major) = analysis_mir::estimate_key(&hist);
     let roman = chord_obj.as_ref().map(|c| analysis_mir::roman(c, tonic));
-    let motif = analysis_mir::find_motif(&split.melody);
+    let motif = analysis_mir::find_motif(&upper_notes_beats);
 
-    let contour_source: Vec<N> = if split.melody.is_empty() {
-        measure_notes_by_part.values().flatten().cloned().collect()
+    let contour = if upper_notes.is_empty() {
+        "No clear upper line (fewer than three pitched attacks)".to_string()
     } else {
-        split.melody.clone()
+        format!("{}: {}", upper_name.as_deref().map(part_label).unwrap_or("upper part"),
+            analysis_mir::melody_contour(&upper_notes_beats))
     };
-    let contour = analysis_mir::melody_contour(&contour_source);
     let scale = if unique_pcs.is_empty() {
         "Empty".to_string()
     } else if unique_pcs.len() == 1 {
@@ -228,65 +254,47 @@ pub fn analyze(project: &Project, tp: &Transport, line_idx: usize) -> AnalysisRe
     let average_pitch = if all_pitches.is_empty() { None } else {
         Some(all_pitches.iter().map(|&p| p as f64).sum::<f64>() / all_pitches.len() as f64)
     };
-    let melody_mean = if split.melody.is_empty() { None } else {
-        Some(split.melody.iter().map(|n| n.pitch as f64).sum::<f64>() / split.melody.len() as f64)
-    };
-    let prev_melody_mean = if prev_split.melody.is_empty() { None } else {
-        Some(prev_split.melody.iter().map(|n| n.pitch as f64).sum::<f64>() / prev_split.melody.len() as f64)
-    };
+    let melody_mean = if upper_notes.is_empty() { None } else { Some(mean_pitch(&upper_notes)) };
+    let prev_melody_mean = if prev_upper_notes.is_empty() { None } else { Some(mean_pitch(&prev_upper_notes)) };
 
     let onsets_per_beat = total_measure_notes as f64 / rpmeasure;
     let prev_onsets_per_beat = if prev_measure_notes_by_part.is_empty() { None } else {
         Some(prev_measure_notes_by_part.values().map(|v| v.len()).sum::<usize>() as f64 / rpmeasure)
     };
 
-    let mut has_bends = false;
-    for call in project.line_calls(line_idx) {
-        let subs = project.part_subs_per_beat(&call.name);
-        let notes = split_notes(project.part_events(&call.name), subs, project.part_sample_offset_u32(&call.name));
-        for note in notes {
-            if note.start_row <= current_row && current_row < note.end_row && note.pitch_points.len() > 1 {
-                has_bends = true;
-                break;
-            }
-        }
-    }
+    let has_bends = !slide_observations.is_empty();
 
-    let motion_feats = motion::calculate_motion(&measure_notes_by_part.values().flatten().cloned().collect::<Vec<_>>());
-    let prev_motion_feats = motion::calculate_motion(&prev_measure_notes_by_part.values().flatten().cloned().collect::<Vec<_>>());
+    let mut motion_feats = motion::calculate_motion(&upper_notes);
+    let bass_part = measure_notes_by_part.iter()
+        .filter(|(name, notes)| !is_rhythm_part(name) && notes.len() >= 2)
+        .min_by(|a, b| mean_pitch(a.1).partial_cmp(&mean_pitch(b.1)).unwrap_or(std::cmp::Ordering::Equal));
+    if let Some((_, bass_notes)) = bass_part { motion_feats.is_pedal = motion::calculate_motion(bass_notes).is_pedal; }
+    let prev_motion_feats = upper_name.as_ref()
+        .and_then(|name| prev_measure_notes_by_part.get(name))
+        .map(|notes| motion::calculate_motion(notes)).unwrap_or_default();
 
-    // --- X-RAY MOTION HIGHLIGHTS ---
+    // Mark leaps on the selected upper line only; combining simultaneous
+    // pitches from different parts creates false octave jumps.
     let mut motion_highlight: Vec<(usize, i64)> = Vec::new();
-    {
-        let mut all_current: Vec<N> = measure_notes_by_part.values().flatten().cloned().collect();
-        all_current.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal).then(a.pitch.cmp(&b.pitch)));
-        let mut melody: Vec<(f64, i32)> = Vec::new();
-        let mut last_time = -1.0_f64;
-        for n in &all_current {
-            if n.start > last_time + 0.1 {
-                melody.push((n.start, n.pitch));
-                last_time = n.start;
-            } else if let Some(last) = melody.last_mut() {
-                if n.pitch > last.1 { last.1 = n.pitch; }
-            }
+    let mut ordered_upper = upper_notes.clone();
+    ordered_upper.sort_by(|a, b| a.start.partial_cmp(&b.start)
+        .unwrap_or(std::cmp::Ordering::Equal).then(a.pitch.cmp(&b.pitch)));
+    for pair in ordered_upper.windows(2) {
+        if (pair[1].pitch - pair[0].pitch).abs() >= 7 {
+            motion_highlight.push((line_idx, pair[0].start as i64));
+            motion_highlight.push((line_idx, pair[1].start as i64));
         }
-        for w in melody.windows(2) {
-            if (w[1].1 - w[0].1).abs() >= 7 {
-                motion_highlight.push((line_idx, w[0].0 as i64));
-                motion_highlight.push((line_idx, w[1].0 as i64));
-            }
-        }
-        if motion_feats.is_pedal {
-            let lowest = motion_feats.lowest_pitch;
-            for n in &all_current {
-                if n.pitch <= lowest + 2 {
-                    motion_highlight.push((line_idx, n.start as i64));
-                }
-            }
-        }
-        motion_highlight.sort_unstable();
-        motion_highlight.dedup();
     }
+    if motion_feats.is_pedal {
+        if let Some((_, bass_notes)) = bass_part {
+            let lowest = bass_notes.iter().map(|n| n.pitch).min().unwrap_or(0);
+            for n in bass_notes.iter().filter(|n| n.pitch <= lowest + 2) {
+                motion_highlight.push((line_idx, n.start as i64));
+            }
+        }
+    }
+    motion_highlight.sort_unstable();
+    motion_highlight.dedup();
 
     let features = Features {
         chord: chord_obj.clone(), roman, contour: contour.clone(),
@@ -294,29 +302,58 @@ pub fn analyze(project: &Project, tp: &Transport, line_idx: usize) -> AnalysisRe
         has_motif: motif.is_some(), has_bends, unique_pc_count: unique_pcs.len(),
         active_pitches: all_pitches.len(), average_pitch,
         motion: motion_feats.clone(), prev_motion: prev_motion_feats,
+        outside_scale_notes: unique_pcs.iter().filter(|&&pc| {
+            let scale: &[i32] = if major { &[0, 2, 4, 5, 7, 9, 11] } else { &[0, 2, 3, 5, 7, 8, 10] };
+            !scale.contains(&(pc - tonic).rem_euclid(12))
+        }).map(|&pc| analysis_mir::NAMES[pc as usize].to_string()).collect(),
     };
 
-    let explanations = theory::explain_emotional(&features);
+    let mut explanations = Vec::new();
+    if let Some(motif) = &motif {
+        explanations.push(format!("{}: {}.", upper_name.as_deref().map(part_label).unwrap_or("Upper line"), motif));
+    }
+    if let Some((_, slide)) = slide_observations.iter().max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)) {
+        explanations.push(slide.clone());
+    }
+    if upper_part.is_some() {
+        let upper_onsets: Vec<f64> = upper_notes_beats.iter().map(|n| n.start).collect();
+        let mut drum_onsets: Vec<f64> = measure_notes_by_part.iter()
+            .filter(|(part, _)| is_rhythm_part(part))
+            .flat_map(|(part, notes)| {
+                let subs = part_subs.get(part).copied().unwrap_or(1.0);
+                notes.iter().map(move |n| n.start / subs)
+            }).collect();
+        drum_onsets.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        drum_onsets.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+        if upper_onsets.len() >= 3 && drum_onsets.len() >= 2 {
+            let aligned = upper_onsets.iter().filter(|&&beat| drum_onsets.iter().any(|d| (d - beat).abs() <= 0.125)).count();
+            explanations.push(format!("Percussion aligns with {}/{} upper-line attacks within 1/8 beat.",
+                aligned, upper_onsets.len()));
+        }
+    }
+    explanations.extend(theory::explain_observations(&features));
+    explanations.truncate(4);
+    if explanations.is_empty() { explanations.push("No clear repeated figure, pitch bend, or large upper-line leap in this measure.".into()); }
     let mut intervals = Vec::new();
     let mut chromatic_grid = "·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·".to_string();
 
     if !all_pitches.is_empty() {
         let mut grid = vec!['·'; 12];
-        for &p in &all_pitches { grid[(p % 12) as usize] = '●'; }
+        for &p in &all_pitches { grid[p.rem_euclid(12) as usize] = '●'; }
         chromatic_grid = grid.iter().map(|c| c.to_string()).collect::<Vec<_>>().join("  ");
-        let root_midi = all_pitches[0];
-        let root_pc = root_midi % 12;
+        let root_pc = chord_obj.as_ref().map_or_else(
+            || all_pitches[0].rem_euclid(12), |c| c.root_pc.rem_euclid(12));
+        let mut seen_intervals = BTreeSet::new();
         for &p in &all_pitches {
-            let diff = (p % 12 - root_pc + 12) % 12;
+            let diff = (p.rem_euclid(12) - root_pc).rem_euclid(12);
             let name = match diff {
                 1 => "Minor 2nd", 2 => "Major 2nd", 3 => "Minor 3rd", 4 => "Major 3rd",
                 5 => "Perfect 4th", 6 => "Tritone", 7 => "Perfect 5th", 8 => "Minor 6th",
                 9 => "Major 6th", 10 => "Minor 7th", 11 => "Major 7th", _ => continue,
             };
-            intervals.push(name.to_string());
+            if seen_intervals.insert(diff) { intervals.push(name.to_string()); }
         }
     }
-    intervals.dedup();
 
     let motion_register = if motion_feats.highest_pitch > 72 {
         "High".to_string()
@@ -327,8 +364,10 @@ pub fn analyze(project: &Project, tp: &Transport, line_idx: usize) -> AnalysisRe
     };
 
     AnalysisReport {
-        active_parts, chord: chord_obj.map_or("None".into(), |c| c.name),
-        root: all_pitches.first().map_or("-".into(), |&p| midi_to_name(p)),
+        active_parts, chord: chord_obj.as_ref().map_or("None".into(), |c| c.name.clone()),
+        root: chord_obj.as_ref().map_or_else(
+            || all_pitches.first().map_or("-".into(), |&p| midi_to_name(p)),
+            |c| analysis_mir::NAMES[c.root_pc.rem_euclid(12) as usize].to_string()),
         intervals, chromatic_grid, scale, contour, motif, explanations,
         motion_anchor: motion_feats.is_pedal, motion_leap: motion_feats.biggest_leap,
         motion_register, motion_highlight,

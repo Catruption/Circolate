@@ -197,7 +197,7 @@ pub(super) fn build_samples_json(
     }
 
     let out = json!({
-        "format": "trackscript-sample-library",
+        "format": "halotext-sample-library",
         "version": 2,
         "samples": samples,
         "instruments": instruments,

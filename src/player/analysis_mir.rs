@@ -58,6 +58,23 @@ pub fn split_roles(notes: &[N], instrument_name: &str) -> Split {
     Split { melody, harmony }
 }
 
+/// Collapse simultaneous notes to the highest pitch at each attack time.
+/// This provides a conservative upper-line contour without mixing channels.
+pub fn top_line(notes: &[N]) -> Vec<N> {
+    let mut sorted = notes.to_vec();
+    sorted.sort_by(|a, b| a.start.partial_cmp(&b.start)
+        .unwrap_or(std::cmp::Ordering::Equal).then(a.pitch.cmp(&b.pitch)));
+    let mut out: Vec<N> = Vec::new();
+    let mut i = 0;
+    while i < sorted.len() {
+        let mut j = i + 1;
+        while j < sorted.len() && (sorted[j].start - sorted[i].start).abs() < 0.01 { j += 1; }
+        if let Some(note) = sorted[i..j].iter().max_by_key(|n| n.pitch) { out.push((*note).clone()); }
+        i = j;
+    }
+    out
+}
+
 pub fn sounding_at(notes: &[N], row: f64) -> Vec<i32> {
     notes.iter().filter(|n| n.start <= row && row < n.end).map(|n| n.pitch).collect()
 }
@@ -93,6 +110,7 @@ pub struct Chord {
     pub root_doubled: usize,
     pub span_octaves: f64,
     pub inverted: bool,
+    pub outside_intervals: Vec<i32>,
 }
 
 pub fn identify(pitches: &[i32]) -> Option<Chord> {
@@ -100,12 +118,17 @@ pub fn identify(pitches: &[i32]) -> Option<Chord> {
     let top = *pitches.iter().max()?;
     let pcs: BTreeSet<i32> = pitches.iter().map(|p| p.rem_euclid(12)).collect();
 
-    let mut best: Option<(i32, i32, &'static str, Vec<i32>)> = None;
+    let mut best: Option<(i32, i32, &'static str, Vec<i32>, Vec<i32>)> = None;
 
     for &root in &pcs {
         for (suffix, tpl) in TEMPLATES {
-            let hit = tpl.iter().filter(|&&iv| pcs.contains(&((root + iv) % 12))).count() as i32;
-            if hit < tpl.len() as i32 {
+            let matched: Vec<i32> = tpl.iter().copied()
+                .filter(|&iv| pcs.contains(&((root + iv) % 12))).collect();
+            let hit = matched.len() as i32;
+            // Permit one missing chord tone (for example a maj7 shell with
+            // no fifth), but avoid naming a chord from a single coincidental
+            // interval.
+            if hit < 2 || tpl.len() - matched.len() > 1 {
                 continue;
             }
 
@@ -117,18 +140,21 @@ pub fn identify(pitches: &[i32]) -> Option<Chord> {
                 }
             }
 
-            let mut score = hit * 2;
+            let missing: Vec<i32> = tpl.iter().copied()
+                .filter(|&iv| !pcs.contains(&((root + iv) % 12))).collect();
+            let mut score = hit * 3 - missing.len() as i32 * 2 - extra_notes.len() as i32 * 2;
             if root == bass.rem_euclid(12) {
-                score += 5;
+                score += 3;
             }
+            if missing.is_empty() { score += 2; }
 
-            if best.as_ref().map_or(true, |&(b, _, _, _)| score > b) {
-                best = Some((score, root, suffix, extra_notes));
+            if best.as_ref().map_or(true, |&(b, r, _, _, _)| score > b || (score == b && root == bass.rem_euclid(12) && r != bass.rem_euclid(12))) {
+                best = Some((score, root, suffix, missing, extra_notes));
             }
         }
     }
 
-    let (_, root, suffix, extra_notes) = best?;
+    let (_, root, suffix, missing, extra_notes) = best?;
     let has = |iv: i32| pcs.contains(&((root + iv) % 12));
 
     let mut final_name = format!("{}{}", NAMES[root as usize], suffix);
@@ -142,6 +168,13 @@ pub fn identify(pitches: &[i32]) -> Option<Chord> {
             final_name = format!("{}(add {})", final_name, extra_names.join(","));
         }
     }
+    if !missing.is_empty() {
+        let names: Vec<&str> = missing.iter().map(|&iv| match iv {
+            0 => "root", 1 => "b9", 2 => "9", 3 => "b3", 4 => "3", 5 => "11",
+            6 => "b5", 7 => "5", 8 => "b13", 9 => "13", 10 => "b7", 11 => "7", _ => "?",
+        }).collect();
+        final_name.push_str(&format!(" (no {})", names.join("/")));
+    }
 
     Some(Chord {
         root_pc: root,
@@ -152,6 +185,7 @@ pub fn identify(pitches: &[i32]) -> Option<Chord> {
          root_doubled: pitches.iter().filter(|p| p.rem_euclid(12) == root).count(),
          span_octaves: (top - bass) as f64 / 12.0,
          inverted: bass.rem_euclid(12) != root,
+         outside_intervals: extra_notes,
     })
 }
 
@@ -216,44 +250,43 @@ pub fn scale_summary(pcs: &BTreeSet<i32>, tonic: i32, major: bool) -> String {
 pub fn melody_contour(melody: &[N]) -> String {
     let mut m = melody.to_vec();
     m.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
-    if m.len() < 3 {
-        return "Too few melody notes".into();
+    if m.len() < 2 {
+        return "Too few notes to describe contour".into();
     }
 
     let steps: Vec<i32> = m.windows(2).map(|w| w[1].pitch - w[0].pitch).collect();
-
-    if steps.iter().all(|s| s.abs() == 2) {
-        return "Whole-Tone run (ascending/descending): dreamlike, floating, unresolved".into();
-    }
-
-    if steps.iter().all(|s| s.abs() == 1) {
-        return "Chromatic run: intense, climbing tension".into();
-    }
-
-    let n = steps.len();
-    let leaps = steps.iter().filter(|s| s.abs() > 4).count();
-    let stepwise = steps.iter().filter(|s| (1..=2).contains(&s.abs())).count();
     let net = m.last().unwrap().pitch - m[0].pitch;
-
-    if leaps * 3 > n {
-        "Leaping: dramatic, disjointed".into()
-    } else if stepwise * 2 >= n && net.abs() <= 2 {
-        "Stepwise, circling its start: hypnotic, conversational".into()
-    } else if stepwise * 2 >= n {
-        format!("Stepwise, {}: smooth, flowing", if net > 0 { "rising" } else { "falling" })
-    } else {
-        "Mixed steps and skips: unpredictable".into()
-    }
+    let low = m.iter().map(|n| n.pitch).min().unwrap_or(0);
+    let high = m.iter().map(|n| n.pitch).max().unwrap_or(0);
+    let leaps = steps.iter().filter(|s| s.abs() >= 7).count();
+    let direction = if net > 0 { "rises" } else if net < 0 { "falls" } else { "returns to its starting pitch" };
+    format!("{} attacks; range {}–{}; overall {} {} st; {} leaps of 7+ st",
+        m.len(), format!("{}{}", NAMES[low.rem_euclid(12) as usize], low.div_euclid(12)),
+        format!("{}{}", NAMES[high.rem_euclid(12) as usize], high.div_euclid(12)),
+        direction, net.abs(), leaps)
 }
 
 pub fn find_motif(melody: &[N]) -> Option<String> {
     let mut m = melody.to_vec();
     m.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
-    let pcs: Vec<i32> = m.iter().map(|n| n.pitch.rem_euclid(12)).collect();
-    for p in 2..=6 {
-        if pcs.len() >= 2 * p && pcs[..p] == pcs[p..2 * p] {
-            let fig: Vec<&str> = pcs[..p].iter().map(|&x| NAMES[x as usize]).collect();
-            return Some(format!("{}-note figure repeating: {}", p, fig.join(" ")));
+    for p in (3..=6).rev() {
+        if m.len() < 2 * p { continue; }
+        for first in 0..=m.len() - 2 * p {
+            for second in first + p..=m.len() - p {
+                let same_intervals = (0..p - 1).all(|k| {
+                    m[first + k + 1].pitch - m[first + k].pitch
+                        == m[second + k + 1].pitch - m[second + k].pitch
+                });
+                let same_rhythm = (0..p - 1).all(|k| {
+                    let a = m[first + k + 1].start - m[first + k].start;
+                    let b = m[second + k + 1].start - m[second + k].start;
+                    (a - b).abs() <= 0.08 * m[first + k].beats.max(1.0)
+                });
+                if same_intervals && same_rhythm {
+                    return Some(format!("{}-note interval/rhythm figure repeats at beats {:.2} and {:.2}",
+                        p, m[first].start + 1.0, m[second].start + 1.0));
+                }
+            }
         }
     }
     None
@@ -274,4 +307,5 @@ pub struct Features {
     pub average_pitch: Option<f64>,
     pub motion: MotionFeatures,
     pub prev_motion: MotionFeatures, // <--- ADD THIS
+    pub outside_scale_notes: Vec<String>,
 }

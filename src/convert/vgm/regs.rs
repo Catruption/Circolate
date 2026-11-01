@@ -215,7 +215,7 @@ pub(crate) enum TimbreSnapshot {
     Psg(PsgRegs),
     /// Raw-sample DAC channel. Playback is handled by
     /// `hosting::chip::dac::DacState`, which bypasses the adapter.
-    /// This variant exists so the trackscript carries a DAC channel;
+    /// This variant exists so the halotext carries a DAC channel;
     /// the adapter path (requires sample.pcm) is a dead-end fallback.
     Dac,
 }

@@ -1,4 +1,4 @@
-//! VGM → trackscript + chip patches.
+//! VGM → halotext + chip patches.
 
 pub(crate) mod analyze;
 pub(crate) mod dac;
@@ -6,7 +6,7 @@ pub(crate) mod psg;
 pub(crate) mod regs;
 pub(crate) mod timing;
 pub(crate) mod tracker;
-pub(crate) mod trackscript;
+pub(crate) mod halotext;
 pub(crate) mod util;
 
 use anyhow::{Context, Result};
@@ -15,7 +15,7 @@ use std::path::Path;
 use super::{AuxFile, ConvertOptions, Converted};
 use analyze::analyze;
 use timing::detect_timing;
-use trackscript::{build_trackscript, shadow_trackscript};
+use halotext::{build_halotext, shadow_halotext};
 
 pub(crate) const VGM_RATE: f64 = 44100.0;
 pub(crate) const BPM: f64 = 120.0;
@@ -63,7 +63,7 @@ pub fn convert_vgm(path: &Path, opts: &ConvertOptions) -> Result<Converted> {
 
     let analysis = analyze(&raw_bytes)?;
 
-    let (trackscript, patches, grid_text) = match &analysis {
+    let (halotext, patches, grid_text) = match &analysis {
         Some(a) if a.notes.iter().any(|n| !n.is_empty()) => {
             let tm = detect_timing(a, subs);
             use std::collections::HashMap;
@@ -84,7 +84,7 @@ pub fn convert_vgm(path: &Path, opts: &ConvertOptions) -> Result<Converted> {
                 let rel = format!("banks/{}/{}.patch", title, name);
                 patches.push((rel, body.into_bytes()));
             }
-            (build_trackscript(a, &title, &source_name, subs, &tm), patches, format!("{}{}", timing::grid_report(a, &tm, subs), dac::report(&raw_bytes, a.total)))
+            (build_halotext(a, &title, &source_name, subs, &tm), patches, format!("{}{}", timing::grid_report(a, &tm, subs), dac::report(&raw_bytes, a.total)))
         }
         _ => {
             let total_seconds = analysis
@@ -92,7 +92,7 @@ pub fn convert_vgm(path: &Path, opts: &ConvertOptions) -> Result<Converted> {
             .map(|a| a.total as f64 / VGM_RATE)
             .filter(|s| *s > 0.0)
             .unwrap_or(FALLBACK_SECONDS);
-            (shadow_trackscript(total_seconds, &title, &source_name, subs), Vec::new(), String::new())
+            (shadow_halotext(total_seconds, &title, &source_name, subs), Vec::new(), String::new())
         }
     };
 
@@ -105,7 +105,7 @@ pub fn convert_vgm(path: &Path, opts: &ConvertOptions) -> Result<Converted> {
     }
 
     Ok(Converted {
-        trackscript,
+        halotext,
        samples: Vec::new(),
        samples_json: String::new(),
        aux,

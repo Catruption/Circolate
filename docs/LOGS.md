@@ -644,7 +644,7 @@ load={load} worst={worst} overruns={overruns} voices={voices} vst={vst} shim={sh
 
 - since 0.1.0
 
-- End-of-parse count: how much was in the trackscript.
+- End-of-parse count: how much was in the halotext.
 
 ### `player.install.vst_not_found` — WARN
 
@@ -1071,7 +1071,7 @@ Dump failed: {err}
 ### `tui.menu.export_started` — INFO
 
 ```
-Exporting {path} to trackscript directory...
+Exporting {path} to halotext directory...
 ```
 
 - fields: `path`

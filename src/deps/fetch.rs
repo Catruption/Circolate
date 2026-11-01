@@ -1,4 +1,4 @@
-//! `trackscript-player fetch` — download missing fallback plugins.
+//! `halotext-player fetch` — download missing fallback plugins.
 //!
 //! Walks `fallbacks.json`, checks each entry's `provides` path, and either
 //! reports "already present" or runs the acquire step.  Idempotent:
@@ -22,7 +22,7 @@ pub fn run(argv: &[String]) -> Result<()> {
                 only = Some(it.next().context("--only needs a name")?.clone());
             }
             "-h" | "--help" => {
-                println!("usage: trackscript-player fetch [--dry] [--only NAME]");
+                println!("usage: halotext-player fetch [--dry] [--only NAME]");
                 return Ok(());
             }
             other => bail!("unknown flag: {other}"),

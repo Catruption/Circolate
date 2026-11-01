@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use crate::formats::trackscript::TrackscriptPart;
+use crate::formats::halotext::HalotextPart;
 
 use super::stretch;
 use super::template::{build_template, PartTemplate};
@@ -87,7 +87,7 @@ impl Cache {
     pub(crate) fn template(
         &mut self,
         hash: u64,
-        part: &TrackscriptPart,
+        part: &HalotextPart,
         path_to_id: &HashMap<String, u32>,
         samples: &HashMap<u32, Arc<Sample>>,
         sf2_instruments: &HashMap<String, Arc<Sf2Instrument>>,
@@ -186,7 +186,7 @@ pub(crate) fn fingerprint(s: &Sample) -> u64 {
 }
 
 pub(crate) fn hash_part(
-    part: &TrackscriptPart,
+    part: &HalotextPart,
     path_to_id: &HashMap<String, u32>,
     fps: &HashMap<u32, u64>,
 ) -> u64 {

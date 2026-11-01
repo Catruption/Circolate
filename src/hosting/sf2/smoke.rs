@@ -1,4 +1,4 @@
-//! `trackscript-player sf2-smoke <file.sf2>` — load an SF2 through the
+//! `halotext-player sf2-smoke <file.sf2>` — load an SF2 through the
 //! native engine, play a note, dump a WAV.  Proves the engine works
 //! without any VST plumbing.
 
@@ -14,7 +14,7 @@ const BLOCK: usize = 512;
 pub fn run(argv: &[String]) -> Result<()> {
     let Some(path) = argv.first() else {
         bail!(
-            "usage: trackscript-player sf2-smoke <file.sf2> \
+            "usage: halotext-player sf2-smoke <file.sf2> \
 [--bank N] [--patch N] [--note N] [--rate N] [--list] [--out FILE.wav]"
         );
     };

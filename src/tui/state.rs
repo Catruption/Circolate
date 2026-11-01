@@ -43,8 +43,8 @@ pub struct MenuState {
 impl MenuState {
     pub fn new() -> Self {
         let mut directories = Vec::new();
-        directories.push(crate::paths::user_trackscripts().to_string_lossy().into_owned());
-        directories.push(crate::paths::bundled_trackscripts().to_string_lossy().into_owned());
+        directories.push(crate::paths::user_halotexts().to_string_lossy().into_owned());
+        directories.push(crate::paths::bundled_halotexts().to_string_lossy().into_owned());
         Self {
             selected_index: 0,
             edit_mode: None,

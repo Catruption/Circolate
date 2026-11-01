@@ -1,7 +1,7 @@
-//! `trackscript-player dump` — print a source file's parsed structure.
+//! `halotext-player dump` — print a source file's parsed structure.
 //!
-//! Prints the *source* IR, not the trackscript translation.  For `.flp` and
-//! `.it` this is the raw parse; for `.trackscript` it is the parsed
+//! Prints the *source* IR, not the halotext translation.  For `.flp` and
+//! `.it` this is the raw parse; for `.halotext` it is the parsed
 //! structure as JSON.
 //!
 //! By default, also writes every plugin state blob to `<file>.states/`
@@ -26,7 +26,7 @@ pub fn run(argv: &[String]) -> Result<()> {
             "--raw" => raw_events = true,
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: trackscript-player dump [--no-states] [--raw] <file.flp|file.it|file.mid|file.trackscript>"
+                    "usage: halotext-player dump [--no-states] [--raw] <file.flp|file.it|file.mid|file.halotext>"
                 );
                 return Ok(());
             }
@@ -43,7 +43,7 @@ pub fn run(argv: &[String]) -> Result<()> {
     }
 
     let Some(arg) = path_arg else {
-        bail!("usage: trackscript-player dump [--no-states] [--raw] <file.flp|file.it|file.trackscript>");
+        bail!("usage: halotext-player dump [--no-states] [--raw] <file.flp|file.it|file.halotext>");
     };
     let path = Path::new(arg);
 
@@ -77,8 +77,8 @@ pub fn run(argv: &[String]) -> Result<()> {
             let module = formats::it::parse_file(path)?;
             println!("{}", serde_json::to_string_pretty(&module)?);
         }
-        SourceKind::Trackscript => {
-            let parsed = crate::formats::trackscript::parse_file(path)?;
+        SourceKind::Halotext => {
+            let parsed = crate::formats::halotext::parse_file(path)?;
             println!("{}", serde_json::to_string_pretty(&parsed)?);
         }
         SourceKind::Midi => {

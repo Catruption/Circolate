@@ -5,18 +5,18 @@
 //! in /usr/share/circolate, user config in $XDG_CONFIG_HOME, and
 //! downloaded plugins in $XDG_DATA_HOME.
 //!
-//! Trackscripts are split into two roots:
+//! Halotexts are split into two roots:
 //!
-//! - `bundled_trackscripts()` — package data, read-only after install
-//!   (`/usr/share/circolate/trackscripts/`)
-//! - `user_trackscripts()` — user exports, always writable
-//!   (`~/.local/share/circolate/trackscripts/`)
+//! - `bundled_halotexts()` — package data, read-only after install
+//!   (`/usr/share/circolate/halotexts/`)
+//! - `user_halotexts()` — user exports, always writable
+//!   (`~/.local/share/circolate/halotexts/`)
 //!
 //! `resolve_track(name)` searches both, user first, so a user export
 //! shadows the bundled demo of the same name.
 //!
 //! Plugins are resolved **by name only**.  Any path recorded in a
-//! trackscript, `.instrument` sidecar, or `plugins_inventory.json` is
+//! halotext, `.instrument` sidecar, or `plugins_inventory.json` is
 //! ignored — those were written on whatever machine did the
 //! conversion, are almost certainly stale, and may leak the author's
 //! home directory.  `find_plugin()` and `find_plugin_vst3()` are the
@@ -136,27 +136,27 @@ fn xdg_data_dirs() -> Vec<PathBuf> {
     .collect()
 }
 
-// ── trackscripts ──────────────────────────────────────────────────────
+// ── halotexts ──────────────────────────────────────────────────────
 
-pub fn user_trackscripts() -> PathBuf {
-    user_data().join("trackscripts")
+pub fn user_halotexts() -> PathBuf {
+    user_data().join("halotexts")
 }
 
-pub fn bundled_trackscripts() -> PathBuf {
-    system_data().join("trackscripts")
+pub fn bundled_halotexts() -> PathBuf {
+    system_data().join("halotexts")
 }
 
-pub fn trackscripts_dir() -> PathBuf {
-    let user = user_trackscripts();
+pub fn halotexts_dir() -> PathBuf {
+    let user = user_halotexts();
     if user.is_dir() {
         return user;
     }
-    let bundled = bundled_trackscripts();
+    let bundled = bundled_halotexts();
     if bundled.is_dir() {
         return bundled;
     }
     if let Some(repo) = repo_root() {
-        let dev = repo.join("trackscripts");
+        let dev = repo.join("halotexts");
         if dev.is_dir() {
             return dev;
         }
@@ -164,11 +164,11 @@ pub fn trackscripts_dir() -> PathBuf {
     user
 }
 
-/// Where new trackscripts go.  Always returns a directory that exists on
+/// Where new halotexts go.  Always returns a directory that exists on
 /// disk — creating it if necessary — so a first-run export never silently
 /// falls back to the current working directory.
 pub fn export_dir() -> PathBuf {
-    let dir = user_trackscripts();
+    let dir = user_halotexts();
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!(
             "warning: could not create export dir {}: {}",
@@ -179,7 +179,7 @@ pub fn export_dir() -> PathBuf {
     dir
 }
 
-/// Resolve a user-typed name to a concrete trackscript path.  See the
+/// Resolve a user-typed name to a concrete halotext path.  See the
 /// module docs for search order.
 pub fn resolve_track(name: &str) -> Result<PathBuf> {
     let name = name.trim();
@@ -192,23 +192,23 @@ pub fn resolve_track(name: &str) -> Result<PathBuf> {
     }
 
     // Search order: user exports shadow bundled demos, which shadow the
-    // dev-checkout copy under <repo>/trackscripts/.  The dev dir is only
+    // dev-checkout copy under <repo>/halotexts/.  The dev dir is only
     // present when running from source, so it's a no-op after install.
-    let mut roots = vec![user_trackscripts(), bundled_trackscripts()];
+    let mut roots = vec![user_halotexts(), bundled_halotexts()];
     if let Some(repo) = repo_root() {
-        roots.push(repo.join("trackscripts"));
+        roots.push(repo.join("halotexts"));
     }
 
     let mut searched: Vec<PathBuf> = Vec::new();
     for dir in roots {
-        for ext in ["", ".tsz", ".trackscript", ".flp", ".it", ".mid", ".midi", ".vgm", ".vgz"] {
+        for ext in ["", ".halo.txt", ".halo.zip", ".flp", ".it", ".mid", ".midi", ".vgm", ".vgz"] {
             let candidate = dir.join(format!("{}{}", name, ext));
             searched.push(candidate.clone());
             if candidate.is_file() {
                 return Ok(candidate);
             }
         }
-        let dir_form = dir.join(name).join("trackscript");
+        let dir_form = dir.join(name).join("halotext");
         searched.push(dir_form.clone());
         if dir_form.is_file() {
             return Ok(dir_form);

@@ -1,5 +1,5 @@
 // src/convert/flp/render.rs
-//! Part rendering: notes in a measure → Trackscript `<...>` events,
+//! Part rendering: notes in a measure → Halotext `<...>` events,
 //! combined into one section per measure by the caller.
 
 use std::collections::BTreeMap;

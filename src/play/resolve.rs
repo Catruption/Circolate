@@ -1,4 +1,4 @@
-//! Turning a source path into a playable trackscript.
+//! Turning a source path into a playable halotext.
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
@@ -11,9 +11,7 @@ use super::audio::Silence;
 use super::cli::Args;
 
 pub fn is_archive(path: &Path) -> bool {
-    path.extension()
-    .and_then(|s| s.to_str())
-    .map_or(false, |e| e.eq_ignore_ascii_case(archive::EXTENSION))
+    archive::is_archive_path(path)
 }
 
 // ── temporary bundle ───────────────────────────────────────────────────
@@ -40,8 +38,8 @@ impl TempBundle {
     }
 
     pub fn write(&self, c: &convert::Converted, stem: &str) -> Result<PathBuf> {
-        let ts_path = self.dir.join(format!("{}.trackscript", stem));
-        std::fs::write(&ts_path, &c.trackscript)?;
+        let ts_path = self.dir.join(format!("{}{}", stem, crate::spec::SOURCE_EXT));
+        std::fs::write(&ts_path, &c.halotext)?;
         for s in &c.samples {
             let p = self.dir.join(&s.rel_path);
             if let Some(parent) = p.parent() {
@@ -76,7 +74,7 @@ pub fn resolve_source(src: &Path, args: &Args) -> Result<(PathBuf, Option<TempBu
         return Ok((src.to_path_buf(), None));
     }
     match SourceKind::from_path(src)? {
-        SourceKind::Trackscript => Ok((src.to_path_buf(), None)),
+        SourceKind::Halotext => Ok((src.to_path_buf(), None)),
         _ => {
             let mut opts = ConvertOptions::default();
             if let Some(d) = &args.samples_dir {

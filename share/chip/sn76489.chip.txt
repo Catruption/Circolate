@@ -74,7 +74,7 @@ provides
     off     15
 
 # ---------------------------------------------------------------- registers
-# Native vocabulary. The field table is what the adapter and the Trackscript
+# Native vocabulary. The field table is what the adapter and the Halotext
 # loader speak to; nobody outside this file names registers. See CHIP.md §2.2.
 
 reg div   voices tone1 tone2 tone3        width 10  reset 0

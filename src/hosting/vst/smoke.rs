@@ -1,4 +1,4 @@
-//! `trackscript-player vst-smoke <plugin.vst3>` — load one VST3, send a
+//! `halotext-player vst-smoke <plugin.vst3>` — load one VST3, send a
 //! note, render two seconds, report peak level.  Smoke test for the shim.
 //!
 //! Also exposes `render_stats()`, used by `measure.rs`. The point of
@@ -62,7 +62,7 @@ pub fn run(argv: &[String]) -> Result<()> {
 
     let Some(path) = args.first() else {
         bail!(
-            "usage: trackscript-player vst-smoke <plugin.vst3> [state.file] [--dump-params]"
+            "usage: halotext-player vst-smoke <plugin.vst3> [state.file] [--dump-params]"
         );
     };
     let path = PathBuf::from(path.as_str());
@@ -71,7 +71,7 @@ pub fn run(argv: &[String]) -> Result<()> {
         let path_str = path.to_str()
         .ok_or_else(|| anyhow::anyhow!("non-UTF8 plugin path"))?;
         let mut host = VstHost::load(path_str, &[], SR)?;
-        eprintln!("parameters of {} (slot N is used as `αN` / `βN` / … in the trackscript shim):", path.display());
+        eprintln!("parameters of {} (slot N is used as `αN` / `βN` / … in the halotext shim):", path.display());
         let n = host.dump_params();
         if n < 0 {
             eprintln!("(plugin has no IEditController; no parameters)");

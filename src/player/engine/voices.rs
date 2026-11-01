@@ -1,7 +1,7 @@
 //! Sample voice scheduling and rendering.
 
 use super::*;
-use crate::formats::trackscript::C5_HZ;
+use crate::formats::halotext::C5_HZ;
 use crate::mixer::mute;
 use crate::timing::AutomationLane;
 use crate::player::project::Sf2VoiceEnvelope;

@@ -111,9 +111,9 @@ pub fn run(argv: &[String]) -> Result<()> {
 }
 
 fn print_help() {
-    println!("usage: trackscript-player measure <plugin.vst3>");
-    println!("       trackscript-player measure --only NAME");
-    println!("       trackscript-player measure --all [--out FILE]");
+    println!("usage: halotext-player measure <plugin.vst3>");
+    println!("       halotext-player measure --only NAME");
+    println!("       halotext-player measure --all [--out FILE]");
     println!();
     println!("  Measure a plugin's default-patch output level (RMS + peak in");
     println!("  dBFS) by playing a sustained C4 at velocity 100 through it.");

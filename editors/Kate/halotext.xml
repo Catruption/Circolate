@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE language SYSTEM "language.dtd">
-<language name="Trackscript" section="Sources" version="2" kateversion="5.0" extensions="*.trackscript" mimetype="" license="MIT" author="">
+<language name="Halotext" section="Sources" version="2" kateversion="5.0" extensions="*.halo.txt;*.halotext" mimetype="" license="MIT" author="">
   <highlighting>
 
     <list name="keywords">
@@ -15,7 +15,7 @@
       <item>GlobalTuning</item>
     </list>
     <list name="keys">
-      <item>TrackscriptVersion</item>
+      <item>HalotextVersion</item>
       <item>BeatsPerMinute</item>
       <item>TimeSignature</item>
       <item>Subdivisions</item>

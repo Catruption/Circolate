@@ -11,7 +11,7 @@ use crate::audio_decode::decode_audio;
 use crate::deps::index::PluginIndex;
 use crate::fidelity::{Fidelity, FIDELITY_FILENAME};
 use crate::deps::requires::{self, Requires};
-use crate::formats::trackscript::parse_str;
+use crate::formats::halotext::parse_str;
 use crate::hosting::chip::patch::Patch;
 use crate::hosting::chip::patch::parse as parse_patch;
 use crate::timing::TempoMap;
@@ -85,8 +85,8 @@ pub(crate) fn load_project_from_source(
 ) -> Result<(Arc<Project>, Cache)> {
     let ts_text = source
     .read_text(ENTRY_KEY)
-    .context("reading trackscript")?
-    .ok_or_else(|| anyhow::anyhow!("source has no trackscript: {}", source.describe()))?;
+    .context("reading halotext")?
+    .ok_or_else(|| anyhow::anyhow!("source has no halotext: {}", source.describe()))?;
     let parsed = parse_str(&ts_text)?;
     let cfg = &parsed.config;
 
@@ -166,7 +166,7 @@ pub(crate) fn load_project_from_source(
     let has_patch_parts = parsed.parts.values()
     .any(|p| p.sample_path.ends_with(".patch"));
 
-    // Load VGM bytes for legacy trackscripts (`vgm_embedded/...` sources).
+    // Load VGM bytes for legacy halotexts (`vgm_embedded/...` sources).
     let vgm_bytes_opt = source.read_bytes("audio.vgm").ok().flatten();
     let vgm_dac = vgm_bytes_opt.as_deref()
         .and_then(crate::hosting::chip::dac::extract_dac_track);
@@ -182,8 +182,8 @@ pub(crate) fn load_project_from_source(
                 );
             }
         }
-        // Fallback for trackscripts that don't name a playable source.
-        // Skip when the trackscript uses chip patches — those are the
+        // Fallback for halotexts that don't name a playable source.
+        // Skip when the halotext uses chip patches — those are the
         // real playback path.
         if vgm_instruments.is_empty() && !has_patch_parts {
             for part in parsed.parts.values() {
@@ -508,7 +508,7 @@ pub(crate) fn load_project_from_dir(
     ts_path: &Path, sample_rate: u32, use_cache: bool, quiet: bool,
 ) -> Result<(Arc<Project>, Cache)> {
     let base = ts_path.parent().unwrap_or_else(|| Path::new("."));
-    let name = ts_path.file_name().and_then(|s| s.to_str()).unwrap_or("trackscript");
+    let name = ts_path.file_name().and_then(|s| s.to_str()).unwrap_or("halotext");
     let title = ts_path.file_stem().and_then(|s| s.to_str());
     let source = DirSource::new(base.to_path_buf(), name.to_string());
     load_project_from_source(&source, sample_rate, use_cache, quiet, title)
@@ -525,8 +525,7 @@ pub(crate) fn load_project_from_archive(
 pub(crate) fn load_project(
     path: &Path, sample_rate: u32, use_cache: bool, quiet: bool,
 ) -> Result<(Arc<Project>, Cache)> {
-    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-    if ext.eq_ignore_ascii_case(crate::archive::EXTENSION) {
+    if crate::archive::is_archive_path(path) {
         load_project_from_archive(path, sample_rate, use_cache, quiet)
     } else {
         load_project_from_dir(path, sample_rate, use_cache, quiet)

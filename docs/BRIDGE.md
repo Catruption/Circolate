@@ -17,7 +17,7 @@ meet.
 .vgm --lift--> .bank (.patch files + samples)
                     |
                     v
-              Trackscript <--> Timeline <--adapter--> .chip core --> audio
+              Halotext <--> Timeline <--adapter--> .chip core --> audio
 ```
 
 Design rules:

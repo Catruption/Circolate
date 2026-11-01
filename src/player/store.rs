@@ -1,6 +1,6 @@
 //! Process-wide caches that outlive a single `Project` load.
 //!
-//! A reload re-parses the trackscript, but nearly everything it
+//! A reload re-parses the halotext, but nearly everything it
 //! references is unchanged: audio files, SoundFonts, the plugin list.
 //! These stores hand back the *same* `Arc`s for unchanged content, so a
 //! reload costs a hash comparison instead of a decode, and two copies of
@@ -34,7 +34,7 @@ impl std::fmt::Write for HashWriter {
 }
 
 /// Hash anything `Debug` without allocating the string.  Every
-/// trackscript type derives `Debug`, so a field added later is covered
+/// halotext type derives `Debug`, so a field added later is covered
 /// automatically.  Don't feed it a `HashMap` (iteration order is random);
 /// sort into a `Vec` first.
 pub(crate) fn hash_debug<T: Debug + ?Sized>(t: &T) -> u64 {

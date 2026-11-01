@@ -3,11 +3,11 @@
 //! Every `install_*` function operates on a live `player::Engine` and
 //! attaches one kind of host: VST3 instruments, native SF2 engines,
 //! master FX chain, or effect shims (fallback VST3s for effects the
-//! trackscript references but the user doesn't have).
+//! halotext references but the user doesn't have).
 //!
 //! **Plugin resolution is by name only.**  Recorded `Path:` fields are
 //! never consulted — see the module docs on `crate::paths` for the
-//! reasoning.  The transitional bridge for old trackscripts (which
+//! reasoning.  The transitional bridge for old halotexts (which
 //! still carry a `Path:` but no `plugin_name` field on
 //! `VstInstrument`) is to derive the name from
 //! `plugin_path.file_stem()`; the path itself is never printed or

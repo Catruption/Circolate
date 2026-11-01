@@ -1,4 +1,4 @@
-# Trackscript language reference
+# Halotext language reference
 
 <!-- Generated from src/spec.rs. Do not edit by hand. -->
 
@@ -17,7 +17,7 @@
 | composite | `ƒName(ƒA, ƒB, ...);` | Defines a block as a list of calls. No body; the arguments are the body. Distinguished from a part by the args not starting with `<`.  A composite's measure timeline is the concatenation of its calls' timelines. |
 | call | `ƒName();  ƒName(1,2,3);  ƒName(1<%50>, 2<%75>);` | Calls a definition from a BlockList line.  An empty argument list plays every measure of the definition in its natural order.  Bare integers select specific measures and set the order they play in — `ƒName(3,1,2)` plays measure 3, then 1, then 2.  A `<...>` override block after a measure number applies to just that measure; the override fields are `%vol`, `¶pan`, `~dur`, and `ƒsource`, matching the field shapes used on a note.  A call's duration is the sum of the durations of its selected measures; the BlockList cursor advances by that amount.  Some fields with a note-shaped meaning (position, pitch) have no place in a call's override block and are ignored if present. |
 | shim-syntax | `@<§pos, ~len, ◊mix, %gain, ¶pan, ƒName(params)>;` | Syntax for attaching an effect or reserved-global automation to a window of song time.  Standalone form has its own BlockList line; call-attached form is `ƒName(args)@<ƒTarget(params)>;` and inherits the call's start position and duration when `§`/`~` are omitted.  The target (`ƒName`) is either an effect function or a reserved global (see *Shim targets*).  Universal shim fields are `§` start, `~` length, `◊` dry/wet, `%` output gain, and `¶` output pan; waypoints (`&`) ramp any of them.  Effect parameters are positional: the slot index is a bijective base-10 run of Greek letters (`α1` is slot 1, `αδ6.0` is slot 14) followed by the value.  Target names use the slug character set `[A-Za-z_][A-Za-z0-9_.-]*`, so `Fruity Reeverb 2` is written `Fruity_Reeverb_2` — matching the converter's sidecar naming. |
-| shim-effects *(planned)* | `call-attached:  ƒName(args)@<ƒTarget(params)>;  (parses; effect targets are not yet consumed by the player)` | Effect targets on shims are parsed and stored in `TrackscriptFile.shims`, but the mixer does not yet route voices through them.  Only `ƒTempo` (via the legacy `Tempo { … }` section) currently drives audio.  Wiring the effect path is tracked as *shim-effects*.  See the *Shim targets* table below for the per-target status. |
+| shim-effects *(planned)* | `call-attached:  ƒName(args)@<ƒTarget(params)>;  (parses; effect targets are not yet consumed by the player)` | Effect targets on shims are parsed and stored in `HalotextFile.shims`, but the mixer does not yet route voices through them.  Only `ƒTempo` (via the legacy `Tempo { … }` section) currently drives audio.  Wiring the effect path is tracked as *shim-effects*.  See the *Shim targets* table below for the per-target status. |
 
 ## Fields by context
 
@@ -67,8 +67,8 @@ A call's duration is the sum of the durations of the measures it selects.  With 
 |---|---|---|---|
 | `` | note | A note-on. | 1.10 |
 | `&` | waypoint | Changes properties of the preceding note or shim at a later position instead of starting a new note. Waypoints cross section boundaries; a section header between them is a layout marker, not a break. | 1.10 |
-| `=` | (undocumented) | Recognised by the parser; its meaning is not defined in trackscript.rs. | 1.10 |
-| `▲` | (undocumented) | Recognised by the parser; its meaning is not defined in trackscript.rs. | 1.10 |
+| `=` | (undocumented) | Recognised by the parser; its meaning is not defined in halotext.rs. | 1.10 |
+| `▲` | (undocumented) | Recognised by the parser; its meaning is not defined in halotext.rs. | 1.10 |
 | `@` | shim | Attaches an effect or reserved-global automation to a window. The last field of `@<...>` is `ƒName(args)`; Name is an effect function or a reserved global. See the *Shim targets* table for what is currently consumed. | 1.11 |
 
 ## Operators
@@ -84,7 +84,7 @@ A call's duration is the sum of the durations of the measures it selects.  With 
 
 ## Shim targets
 
-**Implementation status.**  Shim *syntax* is parsed and stored in `TrackscriptFile.shims`, but effect targets are **not yet consumed by the player** — attaching a reverb shim currently has no audible effect.  Only `ƒTempo` via the legacy `Tempo { … }` section drives audio today.  See the *Shim targets* table below for per-target status.
+**Implementation status.**  Shim *syntax* is parsed and stored in `HalotextFile.shims`, but effect targets are **not yet consumed by the player** — attaching a reverb shim currently has no audible effect.  Only `ƒTempo` via the legacy `Tempo { … }` section drives audio today.  See the *Shim targets* table below for per-target status.
 
 An effect shim attaches an effect to a window of song time.  Its target is the last field: `ƒName(params)`, where Name is either an effect function or a reserved global.  The universal shim fields are position (`§`), length (`~`), dry/wet mix (`◊`), output gain (`%`), and pan (`¶`); waypoints (`&`) ramp any of them, in the block's own coordinate frame.
 
@@ -111,13 +111,13 @@ When a shim's window ends, its effect is removed abruptly unless the writer supp
 |---|---|---|---|
 | `ƒTempo` | song | implemented | Drives tempo. Only the legacy `Tempo { … }` section currently reaches the engine; a `ƒTempo` BlockList shim parses but does not change tempo yet. |
 | `ƒGlobalVolume · ƒGlobalPan · ƒGlobalTuning` *(planned)* | song | not yet implemented | Reserved names; parsed as `Plan` — no engine consumer. |
-| `ƒ<EffectName>(params)` *(planned)* | part/bus | not yet implemented | Effect target, e.g. `ƒFruity_Reeverb_2(α25, β5)`. Parsed and stored in `TrackscriptFile.shims`. **Not yet consumed by the mixer** — attaching a reverb has no audible effect today. |
+| `ƒ<EffectName>(params)` *(planned)* | part/bus | not yet implemented | Effect target, e.g. `ƒFruity_Reeverb_2(α25, β5)`. Parsed and stored in `HalotextFile.shims`. **Not yet consumed by the mixer** — attaching a reverb has no audible effect today. |
 
 ## Config keys
 
 | Key | Type | Default | Meaning | Parser |
 |---|---|---|---|---|
-| `TrackscriptVersion` | number | - | Format version the file was written for. | stores only |
+| `HalotextVersion` | number | - | Format version the file was written for. | stores only |
 | `BeatsPerMinute` | number | 120 | Starting tempo. Time-varying tempo is the `ƒTempo` shim. | reads |
 | `TimeSignature` | a/b | 4/4 | Time signature. | reads |
 | `Subdivisions` | integer | 4 | Rows per beat. | reads |

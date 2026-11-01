@@ -108,7 +108,7 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, theme: &Theme, line_idx: usize, repor
     lines.push(Line::from(""));
 
     // ── Why (fixed 4 slots) ──
-    lines.push(Line::from(Span::styled(" WHY DOES IT FEEL LIKE THIS?", header_style)));
+    lines.push(Line::from(Span::styled(" WHAT STANDS OUT?", header_style)));
     let expl_count = report.explanations.len().min(EXPLANATION_SLOTS);
     for i in 0..expl_count {
         lines.push(Line::from(""));

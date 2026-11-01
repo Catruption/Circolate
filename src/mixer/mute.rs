@@ -66,6 +66,14 @@ pub fn is_note_active(part_path: &str, block_line: usize, start_row: i64) -> boo
         .is_some_and(|rows| rows.contains(&(block_line, start_row)))
 }
 
+/// Whether the part is enabled by part mute/solo state, ignoring individual
+/// note mutes. Used by continuous chip voices after their notes are dispatched.
+pub fn is_part_active(part_path: &str) -> bool {
+    let s = MUTE.load();
+    !s.soloed_part.as_deref().is_some_and(|p| p != part_path)
+        && !s.muted_parts.contains(part_path)
+}
+
 // ── mutators ───────────────────────────────────────────────────────────
 
 pub fn toggle_note_mute(part_path: &str, block_line: usize, start_row: i64) {

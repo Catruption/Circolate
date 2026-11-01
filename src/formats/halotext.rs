@@ -1,4 +1,4 @@
-//! Trackscript parser.
+//! Halotext parser.
 //!
 //! 1.11 syntax:
 //!
@@ -55,9 +55,14 @@ pub const NOTE_NAMES: [&str; 12] = [
 // ── data model ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
-pub struct TrackscriptEvent {
+pub struct HalotextEvent {
     pub op: String,
     pub row: f64,
+    /// One-based line number in the source Halotext file.
+    pub source_line: usize,
+    /// Zero-based UTF-8 byte columns for editor integrations.
+    pub source_byte_column: usize,
+    pub source_end_byte_column: usize,
     pub pitch_midi: Option<i32>,
     pub pitch_hz: Option<f64>,
     pub vol: Option<f64>,
@@ -74,7 +79,7 @@ pub struct TrackscriptEvent {
     pub raw: String,
 }
 
-impl TrackscriptEvent {
+impl HalotextEvent {
     pub fn is_waypoint(&self) -> bool {
         self.op == crate::spec::EV_WAYPOINT
     }
@@ -82,7 +87,7 @@ impl TrackscriptEvent {
 
 #[derive(Debug, Clone, Serialize)]
 #[allow(dead_code)]
-pub struct TrackscriptPart {
+pub struct HalotextPart {
     pub name: String,
     pub sample_path: String,
     pub beats_per_measure: u32,
@@ -90,8 +95,8 @@ pub struct TrackscriptPart {
     pub len_beats: Option<f64>,
     pub sample_offset: u32,
     pub src_bpm: Option<f64>,
-    pub events: Vec<TrackscriptEvent>,
-    pub measures: Vec<Vec<TrackscriptEvent>>,
+    pub events: Vec<HalotextEvent>,
+    pub measures: Vec<Vec<HalotextEvent>>,
     pub section_lengths: Vec<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_vol: Option<f64>,
@@ -216,13 +221,13 @@ pub struct LyricEvent {
 
 #[derive(Debug, Default, Serialize)]
 #[allow(dead_code)]
-pub struct TrackscriptFile {
+pub struct HalotextFile {
     pub config: Config,
     pub tempo_events: Vec<(f64, f64, f64)>,
     pub block_list: Vec<Vec<BlockCall>>,
     pub shims: Vec<ShimEvent>,
     pub blocks: HashMap<String, Vec<String>>,
-    pub parts: HashMap<String, TrackscriptPart>,
+    pub parts: HashMap<String, HalotextPart>,
     pub notes: Vec<NoteEvent>,
     pub lyrics: Vec<LyricEvent>,
 }
@@ -896,20 +901,36 @@ fn parse_part_events(
     subs: u32,
     _beats_per_measure: u32,
     absolute_offset_rows: f64,
-) -> Vec<TrackscriptEvent> {
+    source_offset: usize,
+    source_line_starts: &[usize],
+) -> Vec<HalotextEvent> {
     let event_rx = event_rx();
     let src_rx = source_rx();
 
-    let body = body.trim();
+    let trimmed = body.trim();
+    let body_offset = body.len() - body.trim_start().len();
+    let body = trimmed;
     let mut events = Vec::new();
 
     for em in event_rx.captures_iter(body) {
         let op = em.name("op").map(|m| m.as_str()).unwrap_or("").to_string();
         let inner = em.name("body").map(|m| m.as_str()).unwrap_or("");
+        let match_start = em.get(0).map_or(0, |m| m.start());
+        let match_end = em.get(0).map_or(match_start, |m| m.end());
+        let source_start = source_offset + body_offset + match_start;
+        let source_end = source_offset + body_offset + match_end;
+        let source_line = source_line_at(source_line_starts, source_start);
+        let source_line_start = source_line_starts
+            .get(source_line.saturating_sub(1))
+            .copied()
+            .unwrap_or(source_start);
 
-        let mut ev = TrackscriptEvent {
+        let mut ev = HalotextEvent {
             op,
             row: 0.0,
+            source_line,
+            source_byte_column: source_start.saturating_sub(source_line_start),
+            source_end_byte_column: source_end.saturating_sub(source_line_start),
             pitch_midi: None,
             pitch_hz: None,
             vol: None,
@@ -998,21 +1019,33 @@ fn parse_part_events(
     events
 }
 
+fn source_line_at(line_starts: &[usize], offset: usize) -> usize {
+    let mut low = 0usize;
+    let mut high = line_starts.len();
+    while low < high {
+        let mid = (low + high) / 2;
+        if line_starts[mid] <= offset { low = mid + 1; } else { high = mid; }
+    }
+    low.max(1)
+}
+
 // ── part body parser ───────────────────────────────────────────────────
 
 enum BodyItem {
-    Measure(Vec<TrackscriptEvent>),
+    Measure(Vec<HalotextEvent>),
     SubBlock { name: String, items: Vec<BodyItem> },
 }
 
 struct Cursor<'a> {
     s: &'a str,
     pos: usize,
+    source_offset: usize,
+    source_line_starts: &'a [usize],
 }
 
 impl<'a> Cursor<'a> {
-    fn new(s: &'a str, pos: usize) -> Self {
-        Cursor { s, pos }
+    fn new(s: &'a str, pos: usize, source_offset: usize, source_line_starts: &'a [usize]) -> Self {
+        Cursor { s, pos, source_offset, source_line_starts }
     }
 
     fn eof(&self) -> bool {
@@ -1096,7 +1129,7 @@ fn parse_identifier(c: &mut Cursor) -> String {
     c.s[start..c.pos].to_string()
 }
 
-fn parse_measure(c: &mut Cursor, subs: u32, beats: u32) -> Vec<TrackscriptEvent> {
+fn parse_measure(c: &mut Cursor, subs: u32, beats: u32) -> Vec<HalotextEvent> {
     let mut events = Vec::new();
     loop {
         c.skip_h_ws();
@@ -1117,7 +1150,14 @@ fn parse_measure(c: &mut Cursor, subs: u32, beats: u32) -> Vec<TrackscriptEvent>
             break;
         };
         let ev_str = &c.s[start..end];
-        if let Some(ev) = parse_part_events(ev_str, subs, beats, 0.0).into_iter().next() {
+        if let Some(ev) = parse_part_events(
+            ev_str,
+            subs,
+            beats,
+            0.0,
+            c.source_offset + start,
+            c.source_line_starts,
+        ).into_iter().next() {
             events.push(ev);
         }
         c.pos = end;
@@ -1203,7 +1243,7 @@ fn parse_body(c: &mut Cursor, subs: u32, beats: u32) -> Vec<BodyItem> {
     items
 }
 
-fn flatten_body_items(items: &[BodyItem], out: &mut Vec<Vec<TrackscriptEvent>>) {
+fn flatten_body_items(items: &[BodyItem], out: &mut Vec<Vec<HalotextEvent>>) {
     for item in items {
         match item {
             BodyItem::Measure(events) => out.push(events.clone()),
@@ -1215,7 +1255,7 @@ fn flatten_body_items(items: &[BodyItem], out: &mut Vec<Vec<TrackscriptEvent>>) 
 fn register_sub_blocks(
     items: &[BodyItem],
     args: &PartArgs,
-    parts: &mut HashMap<String, TrackscriptPart>,
+    parts: &mut HashMap<String, HalotextPart>,
 ) {
     for item in items {
         if let BodyItem::SubBlock { name, items: sub_items } = item {
@@ -1246,9 +1286,9 @@ struct PartArgs {
 fn make_part(
     name: String,
     args: &PartArgs,
-    measures: Vec<Vec<TrackscriptEvent>>,
+    measures: Vec<Vec<HalotextEvent>>,
     section_lengths: Vec<f64>,
-) -> TrackscriptPart {
+) -> HalotextPart {
     let mut events = Vec::new();
     let mut offset = 0.0;
     for (i, evs) in measures.iter().enumerate() {
@@ -1259,7 +1299,7 @@ fn make_part(
         }
         offset += section_lengths.get(i).copied().unwrap_or(0.0);
     }
-    TrackscriptPart {
+    HalotextPart {
         name,
         sample_path: args.sample_path.clone(),
         beats_per_measure: args.beats_per_measure,
@@ -1279,9 +1319,13 @@ fn make_part(
 // ── block array ────────────────────────────────────────────────────────
 
 type BlockMap = HashMap<String, Vec<String>>;
-type PartMap = HashMap<String, TrackscriptPart>;
+type PartMap = HashMap<String, HalotextPart>;
 
-fn parse_block_array(body: &str) -> (BlockMap, PartMap) {
+fn parse_block_array(
+    body: &str,
+    source_offset: usize,
+    source_line_starts: &[usize],
+) -> (BlockMap, PartMap) {
     let bytes = body.as_bytes();
     let src_rx = source_rx();
     let call_rx = call_rx();
@@ -1397,7 +1441,7 @@ fn parse_block_array(body: &str) -> (BlockMap, PartMap) {
             default_dur,
         };
 
-        let mut measures: Vec<Vec<TrackscriptEvent>> = Vec::new();
+        let mut measures: Vec<Vec<HalotextEvent>> = Vec::new();
         let mut section_lengths: Vec<f64> = Vec::new();
         let mut body_items: Vec<BodyItem> = Vec::new();
 
@@ -1423,7 +1467,14 @@ fn parse_block_array(body: &str) -> (BlockMap, PartMap) {
 
                 let bracket_close = match_pair(body, bracket_open, b'[', b']');
                 let events_str = &body[bracket_open + 1..bracket_close];
-                let evs = parse_part_events(events_str, sec_s, sec_b, 0.0);
+                let evs = parse_part_events(
+                    events_str,
+                    sec_s,
+                    sec_b,
+                    0.0,
+                    source_offset + bracket_open + 1,
+                    source_line_starts,
+                );
                 measures.push(evs);
                 section_lengths.push(sec_b as f64 * sec_s as f64);
 
@@ -1433,7 +1484,7 @@ fn parse_block_array(body: &str) -> (BlockMap, PartMap) {
                 }
             }
         } else {
-            let mut cur = Cursor::new(body, pos);
+            let mut cur = Cursor::new(body, pos, source_offset, source_line_starts);
             body_items = parse_body(&mut cur, subs_per_beat, beats_per_measure);
             pos = cur.pos;
 
@@ -1466,8 +1517,10 @@ fn section_rx(keyword: &str) -> Regex {
     .unwrap()
 }
 
-pub fn parse_str(text: &str) -> Result<TrackscriptFile> {
+pub fn parse_str(text: &str) -> Result<HalotextFile> {
     let text = strip_comments(text);
+    let mut source_line_starts = vec![0usize];
+    source_line_starts.extend(text.match_indices('\n').map(|(i, _)| i + 1));
 
     let config_rx = section_rx("Config");
     let config = extract_block(&text, &config_rx)
@@ -1486,29 +1539,43 @@ pub fn parse_str(text: &str) -> Result<TrackscriptFile> {
 
     let ba_rx = section_rx("BlockArray");
     let (blocks, parts) = extract_block(&text, &ba_rx)
-    .map(parse_block_array)
+    .map(|block| {
+        let source_offset = block.as_ptr() as usize - text.as_ptr() as usize;
+        parse_block_array(block, source_offset, &source_line_starts)
+    })
     .unwrap_or_default();
 
     let mut lyrics = Vec::new();
     let lyrics_rx = section_rx("Lyrics");
     if let Some(block) = extract_block(&text, &lyrics_rx) {
+        let block_source_offset = block.as_ptr() as usize - text.as_ptr() as usize;
         let frame_len = 4.0 * config.subdivisions as f64; // Assumes 4/4 time
         let mut row_offset = 0.0;
+        let mut block_offset = 0usize;
 
         // Process the Lyrics block line by line
-        for raw_line in block.lines() {
+        for raw_line in block.split('\n') {
             let line = raw_line.trim();
             if line.is_empty() {
+                block_offset += raw_line.len() + 1;
                 continue;
             }
             // A semicolon means "skip one measure"
             if line == ";" {
                 row_offset += frame_len;
+                block_offset += raw_line.len() + 1;
                 continue;
             }
 
             // Parse the events on this line
-            let events = parse_part_events(line, config.subdivisions, 4, row_offset);
+            let events = parse_part_events(
+                raw_line,
+                config.subdivisions,
+                4,
+                row_offset,
+                block_source_offset + block_offset,
+                &source_line_starts,
+            );
             let mut segments = Vec::new();
             for ev in events {
                 if let Some(text) = ev.lyric {
@@ -1530,6 +1597,7 @@ pub fn parse_str(text: &str) -> Result<TrackscriptFile> {
 
             // Move to the next measure
             row_offset += frame_len;
+            block_offset += raw_line.len() + 1;
         }
     }
 
@@ -1581,7 +1649,7 @@ pub fn parse_str(text: &str) -> Result<TrackscriptFile> {
         eprintln!("ts: {} parts parsed, {} shims", parts.len(), shims.len());
     }
 
-    Ok(TrackscriptFile {
+    Ok(HalotextFile {
         config,
        tempo_events: tempo,
        block_list,
@@ -1593,7 +1661,7 @@ pub fn parse_str(text: &str) -> Result<TrackscriptFile> {
     })
 }
 
-pub fn parse_file(path: &Path) -> Result<TrackscriptFile> {
+pub fn parse_file(path: &Path) -> Result<HalotextFile> {
     let text = fs::read_to_string(path)
     .map_err(|e| anyhow!("reading {}: {}", path.display(), e))?;
     parse_str(&text)
