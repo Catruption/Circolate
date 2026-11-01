@@ -34,3 +34,6 @@ Then build Circolate:
 ```bash
 cargo build --release
 ```
+## Development Notes
+
+This project was built as a directed collaboration with AI. The architecture, language design (Halotext), visualizer, and overall project direction are human-designed. AI was used as a pair-programmer to assist with boilerplate, refactoring, and Rust implementation details.
