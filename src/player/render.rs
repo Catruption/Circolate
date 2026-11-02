@@ -138,7 +138,19 @@ pub(crate) fn render_offline(
         count: engine.sf2_engine_count(),
     );
 
+    crate::play::install::install_shims(
+        &mut engine,
+        project,
+        crate::play::install::find_share_dir().as_deref(),
+    );
+
     crate::player::inserts::install_chains(&mut engine, project, project.sample_rate);
+
+    crate::play::install::install_chip_players(
+        &mut engine,
+        project,
+        crate::play::install::find_share_dir().as_deref(),
+    );
 
     if !no_master_fx {
         match EffectChain::load_default(project.sample_rate) {
@@ -163,6 +175,7 @@ pub(crate) fn render_offline(
     let first = loader.seek(start, start + lookahead);
     engine.apply_seek(start, first.samples);
     engine.ingest_vst(first.vsts);
+    engine.ingest_chip(first.chips);
 
     let total = (project.total_samples - start) as usize;
     let mut l = vec![0f32; total];
@@ -173,6 +186,7 @@ pub(crate) fn render_offline(
         let batch = loader.load_due(engine.pos + lookahead);
         engine.ingest(batch.samples);
         engine.ingest_vst(batch.vsts);
+        engine.ingest_chip(batch.chips);
         engine.render(&mut l[i..i + n], &mut r[i..i + n], 1);
         i += n;
     }

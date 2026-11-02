@@ -135,7 +135,7 @@ pub fn draw(
         let env: Cow<'_, [(f32, f32)]> = if let Some(sample) = p.preview_sample_for_part(&part.first_name) {
             let key = (part.path.clone(), pixel_rows);
             Cow::Borrowed(state.sample_env_cache.entry(key)
-                .or_insert_with(|| whole_sample_envelope(&sample, pixel_rows)))
+            .or_insert_with(|| whole_sample_envelope(&sample, pixel_rows)))
         } else {
             let live = vgm_scope_slot(&part.path)
             .or_else(|| p.iid_for_part(&part.first_name).map(|iid| iid as usize))
@@ -143,7 +143,7 @@ pub fn draw(
                 scope_snapshot_recent(
                     slot,
                     pixel_rows.saturating_mul(crate::player::envelope::SCOPE_SAMPLES_PER_BIN),
-                    &mut state.snapshot,
+                                      &mut state.snapshot,
                 );
                 if state.snapshot.is_empty() { None } else {
                     let e = synth_envelope_live(&state.snapshot, pixel_rows);
@@ -160,7 +160,7 @@ pub fn draw(
                     if cached.len() == pixel_rows { Cow::Borrowed(cached) }
                     else {
                         Cow::Borrowed(state.synth_env_cache.entry((part.path.clone(), pixel_rows))
-                            .or_insert_with(|| synth_envelope_static(p, &part.first_name, pixel_rows)))
+                        .or_insert_with(|| synth_envelope_static(p, &part.first_name, pixel_rows)))
                     }
                 }
             }
@@ -332,8 +332,8 @@ pub fn draw(
                 }
                 Some(ColumnLine::Divider { label }) => (
                     Some(label.clone()),
-                    Some(Style::default().fg(ratatui::style::Color::DarkGray).add_modifier(Modifier::ITALIC)),
-                    false,
+                                                        Some(Style::default().fg(ratatui::style::Color::DarkGray).add_modifier(Modifier::ITALIC)),
+                                                        false,
                 ),
                 None => (None, None, false),
             };

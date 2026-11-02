@@ -136,7 +136,9 @@ pub fn worker(
         } else if !wrap_ready {
             let pos = tp.position.load(Ordering::Relaxed);
             let horizon = pos + lookahead;
+            let t0 = std::time::Instant::now();
             let batch = loader.load_due(horizon);
+            crate::player::perf::record_worker_load(t0.elapsed().as_nanos() as u64);
             let empty = batch.samples.is_empty()
             && batch.vsts.is_empty()
             && batch.chips.is_empty();
@@ -159,7 +161,9 @@ pub fn worker(
                 && total > 0
                 && pos + tail_margin >= total
                 {
+                    let t1 = std::time::Instant::now();
                     let tail = loader.load_due(i64::MAX);
+                    crate::player::perf::record_worker_load(t1.elapsed().as_nanos() as u64);
                     if !(tail.samples.is_empty()
                         && tail.vsts.is_empty()
                         && tail.chips.is_empty())

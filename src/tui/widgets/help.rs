@@ -2,7 +2,7 @@
 
 use ratatui::{
     layout::Rect,
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
@@ -10,9 +10,14 @@ use ratatui::{
 
 use crate::tui::theme::{Theme, Token};
 
+/// Accent color for the help widget.
+/// Light blue is the universal "information" color.
+const HELP_ACCENT: Color = Color::LightBlue;
+
 pub fn draw(f: &mut Frame<'_>, area: Rect, theme: &Theme) {
     let w = 56u16.min(area.width.saturating_sub(4));
-    let h = 22u16.min(area.height.saturating_sub(4));
+    // Bumped to 24 to fit the new 'P' keybinding row without clipping
+    let h = 24u16.min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
 
     // FIXED: Biased vertical centering (60% top, 40% bottom)
@@ -25,7 +30,7 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, theme: &Theme) {
 
     let help_bg = theme.color(Token::HelpBg);
     let key = Style::default()
-    .fg(theme.color(Token::HelpKey))
+    .fg(HELP_ACCENT)
     .bg(help_bg)
     .add_modifier(Modifier::BOLD);
     let desc = Style::default().fg(theme.color(Token::HelpFg)).bg(help_bg);
@@ -52,6 +57,7 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, theme: &Theme) {
     lines.push(row("click queue", "type · enter plays · esc leaves"));
     lines.push(row("pgup / pgdn", "loop count (or click [n])"));
     lines.push(row("?", "toggle this help"));
+    lines.push(row("P", "toggle performance stats"));
     lines.push(row("a", "toggle analysis"));
     lines.push(row("q / esc", "quit"));
     lines.push(Line::from(Span::styled("", desc)));
@@ -72,7 +78,7 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, theme: &Theme) {
     let block = Block::default()
     .borders(Borders::ALL)
     .border_set(theme.border_set())
-    .border_style(Style::default().fg(theme.color(Token::HelpKey)))
+    .border_style(Style::default().fg(HELP_ACCENT))
     .title(" Help ")
     .style(Style::default().bg(help_bg));
 

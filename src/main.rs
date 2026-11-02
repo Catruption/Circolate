@@ -124,6 +124,16 @@ fn main() -> Result<()> {
 
 fn run_app(args: &[String], _no_pick: bool) -> Result<()> {
     let play_args = play::cli::parse_args(args)?;
+
+    // --- ADD THIS BLOCK ---
+    if play_args.render.is_some() {
+        return play::offline::render(&play_args);
+    }
+    if play_args.verify {
+        return play::offline::verify_cache(&play_args);
+    }
+    // ----------------------
+
     let mut current_song = play_args.song.clone();
     let queue = tui::state::QueueState::new();
 

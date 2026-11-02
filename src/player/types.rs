@@ -27,8 +27,6 @@ impl Sample {
 
 pub(crate) struct VstInstrument {
     pub(crate) iid: u16,
-    /// Display name as recorded in the sidecar.  Used to look up an
-    /// embedded bundle when loading from an archive.
     pub(crate) name: String,
     pub(crate) plugin_path: PathBuf,
     pub(crate) state_bytes: Vec<u8>,
@@ -42,15 +40,12 @@ pub(crate) struct VstInstrument {
 /// Kept separate from the engine itself because `Project` is behind an
 /// `Arc` and immutable; the engine is stateful and gets installed into
 /// `player::Engine` in `play.rs`.
+#[derive(Clone)]
 pub(crate) struct Sf2EngineSpec {
-    /// On-disk path to the .sf2 file.  Materialized from the source
-    /// into the plugin cache if the sidecar lives in an archive.
     pub(crate) sf2_path: PathBuf,
     pub(crate) bank: u8,
     pub(crate) preset: u8,
     pub(crate) gain: f32,
-    /// MIDI channel id this engine answers to.  Same iid space as
-    /// `VstInstrument.iid`.
     pub(crate) iid: u16,
 }
 
@@ -83,8 +78,6 @@ pub(crate) struct Sf2VoiceSpec {
     pub sample_id: u32,
     pub pitch_hz: f64,
     pub env: Sf2VoiceEnvelope,
-    /// Zone pan as -1.0 (left) .. 1.0 (right).  SF2 gen 17 is -500..500;
-    /// stereo samples are a hard-left zone plus a hard-right zone.
     pub pan: f64,
 }
 
@@ -97,9 +90,7 @@ struct Sf2ZoneEntry {
     sample_id: u32,
     root_key: u8,
     tune_cents: i16,
-    /// Cents per key (100 = chromatic, 0 = every key at the sample's pitch).
     scale_tuning: i16,
-    /// SF2 pan, -500..500.
     pan: i16,
     env: Sf2VoiceEnvelope,
 }
@@ -110,8 +101,6 @@ pub(crate) struct Sf2Instrument {
 }
 
 impl Sf2Instrument {
-    /// Copy of this instrument with every sample id shifted by `delta`,
-    /// so one cached build can be placed at any id range.
     pub(crate) fn rebased(&self, delta: u32) -> Sf2Instrument {
         let mut zones = self.zones.clone();
         for z in &mut zones {
@@ -124,16 +113,10 @@ impl Sf2Instrument {
         self.zones.len() as u32
     }
 
-    /// Sample id of the first zone.  Used by the waveform renderer to
-    /// preview *something* representative for an SF2 part — the exact
-    /// zone depends on the note being played, but the first one is a
-    /// reasonable stand-in for the shape of the instrument.
     pub(crate) fn first_zone_sample_id(&self) -> Option<u32> {
         self.zones.first().map(|z| z.sample_id)
     }
 
-    /// Resolve a note to a single voice (the first layer).  `resolve_all`
-    /// is the real implementation; this stays for callers that want one.
     #[allow(dead_code)]
     pub(crate) fn resolve(
         &self,
@@ -144,17 +127,6 @@ impl Sf2Instrument {
         self.resolve_all(key, vel, fine_pitch_cents).into_iter().next()
     }
 
-    /// Resolve a note to EVERY voice it should sound.  SF2 zones overlap by
-    /// design: a stereo sample is a left zone plus a right zone, and layered
-    /// presets stack zones over the same keys.  All zones whose key and
-    /// velocity ranges contain the note play together.  If none match, the
-    /// nearest zone is used so out-of-range notes still sound.
-    ///
-    /// `fine_pitch_cents` is the per-note detune in cents (0.0 = none).
-    ///
-    /// Velocity only selects zones here.  The note's own volume already
-    /// scales loudness (`TVoice::vol`), so no second velocity attenuation
-    /// is applied; doing both made notes tens of dB too quiet.
     pub(crate) fn resolve_all(
         &self,
         key: u8,
@@ -196,7 +168,6 @@ fn key_distance(z: &Sf2ZoneEntry, key: u8) -> i32 {
     }
 }
 
-/// Closest zone by key distance, optionally requiring the velocity to fit.
 fn nearest_zone<'a>(
     zones: &'a [Sf2ZoneEntry],
     key: u8,
@@ -217,8 +188,6 @@ fn nearest_zone<'a>(
 }
 
 fn voice_for_zone(z: &Sf2ZoneEntry, key: u8, fine_pitch_cents: f64) -> Sf2VoiceSpec {
-    // Scale tuning is cents per key: 100 = chromatic, 0 = every key plays
-    // at the sample's own pitch (typical for drum zones).
     let semitones = (key as i32 - z.root_key as i32) as f64 * (z.scale_tuning as f64 / 100.0)
         + z.tune_cents as f64 / 100.0
         + fine_pitch_cents / 100.0;
@@ -230,8 +199,6 @@ fn voice_for_zone(z: &Sf2ZoneEntry, key: u8, fine_pitch_cents: f64) -> Sf2VoiceS
     }
 }
 
-/// Per-instrument overrides for generated Slicex SoundFonts. Ordinary SF2
-/// instruments pass `None` and retain their parsed zone settings.
 #[derive(Clone, Copy)]
 pub(crate) struct Sf2InstrumentOverrides {
     pub pan: f64,
@@ -387,9 +354,6 @@ impl MultiSampleInstrument {
         }
     }
 
-    /// Resolve a note to (sample_id, pitch_hz).  `fine_pitch_cents` is
-    /// the per-note detune in cents from the FLP `fine_pitch` byte,
-    /// already scaled by the emitter.  0.0 means no offset.
     pub(crate) fn resolve(
         &self,
         key: u8,

@@ -244,6 +244,14 @@ impl Engine {
             // 4. Decide which hosts render this chunk (no allocation)
             let mut n_render = 0usize;
             for (idx, slot) in hosts.iter().enumerate() {
+                // Only the host that receives this iid's note events may
+                // render, tick the tail, or feed the scope. Duplicate hosts
+                // sharing an iid would otherwise burn the shared tail counter
+                // and push silence into the same scope ring.
+                if iid_to_host_idx.get(&slot.iid) != Some(&idx) {
+                    render_flags[idx] = false;
+                    continue;
+                }
                 let has_held = vst_held.get(&slot.iid).copied().unwrap_or(0) != 0;
                 let tail = vst_tail.get(&slot.iid).copied().unwrap_or(0);
                 let on = has_held || tail > 0;
@@ -278,6 +286,9 @@ impl Engine {
 
             // 6. Sequential mix pass
             for (idx, slot) in hosts.iter().enumerate() {
+                if iid_to_host_idx.get(&slot.iid) != Some(&idx) {
+                    continue;
+                }
                 let rendered = render_flags[idx];
                 let host_gain = vst_gains.get(&slot.iid).copied().unwrap_or(1.0);
                 let part_scale = iid_to_part_path

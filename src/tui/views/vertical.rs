@@ -650,7 +650,7 @@ pub fn draw(
             let bins = inner_w.saturating_mul(2);
             let key = (block.path.clone(), bins);
             let env = state.sample_env_cache.entry(key)
-                .or_insert_with(|| whole_sample_envelope(&sample, bins));
+            .or_insert_with(|| whole_sample_envelope(&sample, bins));
             render_envelope(env, inner_w, wave_rows, base_style, ph_col, ph_style)
         } else if let Some(slot) = vgm_scope_slot(&block.path)
             .or_else(|| p.iid_for_part(&block.first_name).map(|iid| iid as usize))
@@ -660,12 +660,12 @@ pub fn draw(
                 scope_snapshot_recent(
                     slot,
                     inner_w.saturating_mul(2).saturating_mul(SCOPE_SAMPLES_PER_BIN),
-                    &mut state.snapshot,
+                                      &mut state.snapshot,
                 );
                 if state.snapshot.is_empty() {
                     let bins = inner_w.saturating_mul(2);
                     let env = state.synth_env_cache.entry((block.path.clone(), bins))
-                        .or_insert_with(|| synth_envelope_static(p, &block.first_name, bins));
+                    .or_insert_with(|| synth_envelope_static(p, &block.first_name, bins));
                     render_envelope(&env, inner_w, wave_rows, base_style, ph_col, ph_style)
                 } else {
                     synth_waveform(
@@ -682,7 +682,7 @@ pub fn draw(
                 // envelope from the part's notes.
                 let bins = inner_w.saturating_mul(2);
                 let env = state.synth_env_cache.entry((block.path.clone(), bins))
-                    .or_insert_with(|| synth_envelope_static(p, &block.first_name, bins));
+                .or_insert_with(|| synth_envelope_static(p, &block.first_name, bins));
                 render_envelope(&env, inner_w, wave_rows, base_style, ph_col, ph_style)
             };
 

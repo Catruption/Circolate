@@ -29,6 +29,13 @@ pub struct AnalysisReport {
 /// from the full theory report so ordinary tracker redraws don't rebuild a
 /// 17-measure analysis every frame.
 pub fn motion_highlights(project: &Project, line_idx: usize) -> Vec<(usize, i64)> {
+    let t = std::time::Instant::now();
+    let out = motion_highlights_inner(project, line_idx);
+    crate::player::perf::record_motion(t.elapsed().as_nanos() as u64);
+    out
+}
+
+fn motion_highlights_inner(project: &Project, line_idx: usize) -> Vec<(usize, i64)> {
     let snap = mute::snapshot();
     let mut by_part: std::collections::BTreeMap<String, Vec<N>> = std::collections::BTreeMap::new();
     for call in project.line_calls(line_idx) {
@@ -95,6 +102,13 @@ fn mean_pitch(notes: &[N]) -> f64 {
 }
 
 pub fn analyze(project: &Project, tp: &Transport, line_idx: usize) -> AnalysisReport {
+    let t = std::time::Instant::now();
+    let out = analyze_inner(project, tp, line_idx);
+    crate::player::perf::record_analysis(t.elapsed().as_nanos() as u64);
+    out
+}
+
+fn analyze_inner(project: &Project, tp: &Transport, line_idx: usize) -> AnalysisReport {
     let snap = mute::snapshot();
     let mut active_parts_map: std::collections::HashMap<String, Vec<i32>> = std::collections::HashMap::new();
     let mut all_pitches = Vec::new();

@@ -131,9 +131,9 @@ pub fn rasterize_time_y(
 /// Rasterize into a reusable buffer to keep tracker redraws allocation-free.
 pub fn rasterize_time_y_into(
     env: &[(f32, f32)],
-    w_dots: usize,
-    h_dots: usize,
-    dots: &mut Vec<bool>,
+                             w_dots: usize,
+                             h_dots: usize,
+                             dots: &mut Vec<bool>,
 ) {
     let width = w_dots.max(1);
     let height = h_dots.max(1);

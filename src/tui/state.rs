@@ -58,6 +58,7 @@ pub struct PlayerState {
     pub show_help: bool,
     pub show_config: bool,
     pub show_analysis: bool,
+    pub show_perf: bool,
     pub loop_enabled: bool,
     pub loop_measures: HashSet<usize>,
     pub last_loop_check_measure: Option<usize>,
@@ -260,6 +261,7 @@ pub enum NotchTag {
     Help,
     Settings,
     Analysis,
+    Perf,
 }
 
 #[derive(Debug, Clone)]
@@ -364,9 +366,6 @@ pub struct RenderState {
 
     pub perf_last_poll: Instant,
     pub(crate) perf_snapshot: Option<crate::player::perf::PerfSnapshot>,
-    pub(crate) ui_draw_ns: u64,
-    pub(crate) ui_draw_frames: u64,
-    pub(crate) ui_draw_worst_ns: u64,
     pub spiral_cache: Option<SpiralCache>,
 
     pub menu: MenuState,
@@ -410,9 +409,6 @@ impl RenderState {
 
             perf_last_poll: Instant::now(),
             perf_snapshot: None,
-            ui_draw_ns: 0,
-            ui_draw_frames: 0,
-            ui_draw_worst_ns: 0,
             spiral_cache: None,
 
             menu: MenuState::new(),

@@ -98,10 +98,12 @@ impl Cache {
         if self.enabled {
             if let Some(t) = self.map.get(&hash) {
                 self.hits += 1;
+                crate::player::perf::record_cache_hit();
                 return Arc::clone(t);
             }
         }
         self.misses += 1;
+        crate::player::perf::record_cache_miss();
         let t = Arc::new(build_template(
             part,
             path_to_id,
@@ -198,6 +200,9 @@ pub(crate) fn hash_part(
         }
     };
     part.sample_path.hash(&mut h);
+    part.sample_offset.hash(&mut h);
+    part.preset.hash(&mut h);       // NEW
+    part.bank.hash(&mut h);         // NEW
     sample_key(&part.sample_path).hash(&mut h);
     part.sample_offset.hash(&mut h);
     part.src_bpm.map(f64::to_bits).hash(&mut h);

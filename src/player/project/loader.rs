@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -30,13 +30,8 @@ const TAIL_SECONDS: f64 = 0.05;
 const VST_TRIM: f32 = 0.6;
 const FALLBACK_VST_TRIM: f32 = 0.7;
 
-/// Base `iid` for chip patch players. Above any plausible `source_channel`
-/// (VST/SF2 use 0..15) and distinct from the VGM placeholder 9999.
 const PATCH_IID_BASE: u16 = 20_000;
 
-/// A part whose playback is driven by the chip layer — either an emulated
-/// `.vgm` or a synthesised `.patch`. Both need the "notes played at their
-/// own durations" treatment rather than "sample plays once per note".
 fn is_chip_playable_part(sample_path: &str) -> bool {
     sample_path.to_lowercase().contains("vgm") || sample_path.ends_with(".patch")
 }
@@ -134,6 +129,14 @@ pub(crate) fn load_project_from_source(
                 let smp = Sample { left, right, stereo, rate, loop_pts };
                 fps.insert(s.id, fingerprint(&smp));
                 samples.insert(s.id, Arc::new(smp));
+
+                // Bare-filename alias so `ƒ'X.wav'` resolves.
+                if let Some(base) = Path::new(&rel).file_name().and_then(|f| f.to_str()) {
+                    if base != rel.as_str() {
+                        path_to_id.entry(base.to_string()).or_insert(s.id);
+                    }
+                }
+
                 if let Some(stripped) = rel.strip_prefix("./") {
                     path_to_id.insert(stripped.to_string(), s.id);
                 }
@@ -159,17 +162,19 @@ pub(crate) fn load_project_from_source(
     let mut vst_instruments: HashMap<String, Arc<VstInstrument>> = HashMap::new();
     let mut vgm_instruments: HashMap<String, Arc<VgmInstrument>> = HashMap::new();
 
+    // (sidecar_stem, plugin_name) captured during instrument loop,
+    // consumed after the loop so aliases point at the final Arc.
+    let mut vst_aliases: Vec<(String, String)> = Vec::new();
+
     let mut next_sf2_id: u32 = 10_000;
     let mut vst_index: Option<PluginIndex> = None;
 
-    // Chip patch parts, if any. Determines whether the VGM fallback may fire.
     let has_patch_parts = parsed.parts.values()
     .any(|p| p.sample_path.ends_with(".patch"));
 
-    // Load VGM bytes for legacy halotexts (`vgm_embedded/...` sources).
     let vgm_bytes_opt = source.read_bytes("audio.vgm").ok().flatten();
     let vgm_dac = vgm_bytes_opt.as_deref()
-        .and_then(crate::hosting::chip::dac::extract_dac_track);
+    .and_then(crate::hosting::chip::dac::extract_dac_track);
     if let Some(vgm_bytes) = vgm_bytes_opt.as_ref() {
         for part in parsed.parts.values() {
             if part.sample_path.to_lowercase().contains("vgm") {
@@ -182,9 +187,6 @@ pub(crate) fn load_project_from_source(
                 );
             }
         }
-        // Fallback for halotexts that don't name a playable source.
-        // Skip when the halotext uses chip patches — those are the
-        // real playback path.
         if vgm_instruments.is_empty() && !has_patch_parts {
             for part in parsed.parts.values() {
                 vgm_instruments.insert(
@@ -215,7 +217,6 @@ pub(crate) fn load_project_from_source(
             };
             match parse_patch(&text) {
                 Ok(patch) => {
-                    // Two chip players total: 100 = sn76489, 101 = ym2612.
                     let iid: u16 = if patch.requires.iter()
                     .any(|r| r.capability == "fm.operator" || r.capability == "sample.pcm") { 101 } else { 100 };
                     patch_iids.insert(part.sample_path.clone(), iid);
@@ -238,7 +239,6 @@ pub(crate) fn load_project_from_source(
         );
     }
 
-    // Parse instruments (VST / SF2) — unchanged.
     for entry in source.list("instruments", Some("instrument")) {
         let rel = if entry.starts_with("instruments/") || entry.starts_with("./instruments/") {
             entry.trim_start_matches("./").to_string()
@@ -319,6 +319,8 @@ pub(crate) fn load_project_from_source(
                 let _ = materialize_sf2_reference(source, &mut state_bytes);
             }
 
+            vst_aliases.push((sidecar_rel.clone(), inst.plugin.clone()));
+
             vst_instruments.insert(
                 sidecar_rel,
                 Arc::new(VstInstrument {
@@ -332,19 +334,242 @@ pub(crate) fn load_project_from_source(
         }
     }
 
-    let n_fallback = vst_instruments.values().filter(|v| v.fallback).count();
-    if n_fallback > 1 {
-        let spread = 1.0 / (n_fallback as f32).sqrt();
-        for v in vst_instruments.values_mut() {
-            if !v.fallback { continue; }
-            let scaled = Arc::new(VstInstrument {
-                iid: v.iid, name: v.name.clone(), plugin_path: v.plugin_path.clone(),
-                                  state_bytes: v.state_bytes.clone(), fallback: v.fallback,
-                                  gain: v.gain * spread,
-            });
-            *v = scaled;
+    // Alias by sidecar stem (intent name) and plugin name so migrated
+    // references resolve. First sidecar with a given key wins. Every alias
+    // shares the same Arc as the sidecar entry.
+    for (sidecar, plugin) in vst_aliases {
+        let Some(arc) = vst_instruments.get(&sidecar).cloned() else { continue };
+        if let Some(stem) = Path::new(&sidecar).file_stem().and_then(|s| s.to_str()) {
+            vst_instruments
+            .entry(format!("{}.vst3", stem))
+            .or_insert_with(|| arc.clone());
+        }
+        if !plugin.is_empty() {
+            vst_instruments
+            .entry(format!("{}.vst3", plugin))
+            .or_insert_with(|| arc.clone());
         }
     }
+
+    // ── MIGRATION: VST references without .instrument sidecars ──────────
+    // Parts may say `ƒ'ZENOLOGY.vst3'` even when `ZENOLOGY.instrument`
+    // doesn't exist. Resolve each unresolved VST reference by:
+    //   1. Trying the direct name (`ZENOLOGY` → plugin scan)
+    //   2. Falling back to `parsed.fallbacks[key]` (substitute plugin + gain)
+    // Registers under the halotext's reference key so parts resolve.
+
+    let mut vst_keys_needed = HashSet::new();
+    for part in parsed.parts.values() {
+        let p = &part.sample_path;
+        if p.ends_with(".vst3") || p.ends_with(".vst") || p.ends_with(".so") {
+            vst_keys_needed.insert(p.clone());
+        }
+    }
+
+    for key in vst_keys_needed {
+        if vst_instruments.contains_key(&key) { continue; }
+
+        let direct_name = Path::new(&key)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
+
+        let direct = embedded_plugins.get(&direct_name).cloned().filter(|p| p.exists())
+        .or_else(|| {
+            let idx = vst_index.get_or_insert_with(PluginIndex::scan);
+            idx.find_vst3(&direct_name).cloned()
+        });
+
+        let (plugin_name, plugin_path, gain_mult, is_fallback) = if let Some(path) = direct {
+            (direct_name.clone(), path, 1.0f32, false)
+        } else if let Some(spec) = parsed.fallbacks.get(&key) {
+            let use_name = Path::new(&spec.use_)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&spec.use_)
+            .to_string();
+
+            let path = embedded_plugins.get(&use_name).cloned().filter(|p| p.exists())
+            .or_else(|| {
+                let idx = vst_index.get_or_insert_with(PluginIndex::scan);
+                idx.find_vst3(&use_name).cloned()
+            });
+
+            let Some(path) = path else {
+                crate::log_event!("player.vst.unresolved_fallback", key: key.clone(), plugin: use_name.clone());
+                continue;
+            };
+
+            let g = spec.gain.unwrap_or(1.0) as f32;
+            (use_name, path, g, true)
+        } else {
+            crate::log_event!("player.vst.unresolved", key: key.clone());
+            continue;
+        };
+
+        // Keep the original iid from fidelity.json so scope mapping stays
+        // intact. If there is no match, pick the lowest id that no VST *or
+        // SF2 engine* already uses (SF2 channels share the 0..15 range).
+        let source_iid = fidelity.as_ref().and_then(|f| {
+            f.channels.values().find(|c| {
+                c.name == direct_name || c.name == plugin_name
+            }).map(|c| c.iid as u16)
+        }).unwrap_or_else(|| {
+            let mut id = 0;
+            while vst_instruments.values().any(|v| v.iid == id)
+                || sf2_engine_specs.values().any(|s| s.iid == id)
+                {
+                    id += 1;
+                }
+                id
+        });
+
+        let inst = Arc::new(VstInstrument {
+            iid: source_iid,
+            name: plugin_name.clone(),
+                            plugin_path,
+                            state_bytes: Vec::new(),
+                            fallback: is_fallback,
+                            gain: gain_mult * VST_TRIM * if is_fallback { FALLBACK_VST_TRIM } else { 1.0 },
+        });
+
+        vst_instruments.insert(key.clone(), Arc::clone(&inst));
+        if plugin_name != direct_name {
+            vst_instruments.entry(format!("{}.vst3", plugin_name)).or_insert_with(|| inst.clone());
+        }
+        vst_instruments.insert(direct_name.clone(), inst);
+    }
+
+    // ── MIGRATION: SF2 references without .instrument sidecars ─────────
+    // Parts may say `ƒ'samples/X.sf2'(preset)` directly.  Resolve each
+    // unique (path, bank, preset) triple into an Sf2Instrument + Sf2EngineSpec,
+    // keyed by the composite `path#preset` string.  Parts referencing the
+    // old `.instrument` sidecar form are already registered above and are
+    // left alone.
+
+    let mut sf2_keys_needed: HashSet<(String, i16, i16)> = HashSet::new();
+    for part in parsed.parts.values() {
+        if part.sample_path.ends_with(".sf2") {
+            let preset = part.preset.unwrap_or(0);
+            let bank = part.bank.unwrap_or(0);
+            sf2_keys_needed.insert((part.sample_path.clone(), bank, preset));
+        }
+    }
+
+    for (path, bank, preset) in sf2_keys_needed {
+        let composite = if bank == 0 {
+            format!("{}#{}", path, preset)
+        } else {
+            format!("{}#{}:{}", path, bank, preset)
+        };
+
+        if sf2_engine_specs.contains_key(&composite) {
+            continue;
+        }
+
+        let sf2_bytes = match source.read_bytes(&path) {
+            Ok(Some(b)) => b,
+            _ => {
+                crate::log_event!("player.sf2.read_failed", path: path.clone());
+                continue;
+            }
+        };
+        let sf2_on_disk = match materialize_sf2_file(source, &path) {
+            Ok(Some(p)) => p,
+            _ => continue,
+        };
+
+        // Allocate iid avoiding VSTs and existing SF2 engines
+        let iid = {
+            let mut id = 0u16;
+            while id < u16::MAX
+                && (vst_instruments.values().any(|v| v.iid == id)
+                || sf2_engine_specs.values().any(|s| s.iid == id))
+                {
+                    id += 1;
+                }
+                id
+        };
+
+        if let Ok(obj) = build_sf2_instrument(
+            &sf2_bytes,
+            bank as u16,
+            preset as u16,
+            next_sf2_id,
+            &mut samples,
+            None,
+        ) {
+            next_sf2_id += obj.zone_count_hint() + 1;
+            sf2_instruments.insert(composite.clone(), Arc::new(obj));
+        }
+
+        sf2_engine_specs.insert(
+            composite.clone(),
+                                Sf2EngineSpec {
+                                    sf2_path: sf2_on_disk,
+                                    bank: bank as u8,
+                                    preset: preset as u8,
+                                    gain: 1.0,
+                                    iid,
+                                },
+        );
+
+        // Alias basename form so `ƒ'X.sf2'(preset)` also resolves
+        if let Some(base) = Path::new(&path).file_name().and_then(|s| s.to_str()) {
+            let base_composite = if bank == 0 {
+                format!("{}#{}", base, preset)
+            } else {
+                format!("{}#{}:{}", base, bank, preset)
+            };
+            if base_composite != composite {
+                if let Some(arc) = sf2_instruments.get(&composite).cloned() {
+                    sf2_instruments.entry(base_composite.clone()).or_insert(arc);
+                }
+                if let Some(spec) = sf2_engine_specs.get(&composite).cloned() {
+                    sf2_engine_specs.entry(base_composite).or_insert(spec);
+                }
+            }
+        }
+    }
+    // ─────────────────────────────────────────────────────────────────────
+
+    // Fallback gain spread, applied once per *unique* instrument. Aliases
+    // share an Arc, so counting map entries overcounts and over-attenuates,
+    // and replacing each entry separately would split one instrument into
+    // several unrelated Arcs. Scale each unique instrument once and point
+    // every alias at the same scaled Arc.
+    {
+        let mut unique: HashMap<*const VstInstrument, Arc<VstInstrument>> = HashMap::new();
+        for v in vst_instruments.values() {
+            if v.fallback {
+                unique.entry(Arc::as_ptr(v)).or_insert_with(|| Arc::clone(v));
+            }
+        }
+        let n_fallback = unique.len();
+        if n_fallback > 1 {
+            let spread = 1.0 / (n_fallback as f32).sqrt();
+            let scaled: HashMap<*const VstInstrument, Arc<VstInstrument>> = unique
+            .iter()
+            .map(|(ptr, v)| {
+                (*ptr, Arc::new(VstInstrument {
+                    iid: v.iid,
+                    name: v.name.clone(),
+                                plugin_path: v.plugin_path.clone(),
+                                state_bytes: v.state_bytes.clone(),
+                                fallback: v.fallback,
+                                gain: v.gain * spread,
+                }))
+            })
+            .collect();
+            for v in vst_instruments.values_mut() {
+                if let Some(s) = scaled.get(&Arc::as_ptr(v)) {
+                    *v = Arc::clone(s);
+                }
+            }
+        }
+    }
+    // ───────────────────────────────────────────────────────────────────
 
     let requires: Option<Requires> = match source.read_text(requires::FILENAME)? {
         Some(text) => requires::parse(&text).ok(),

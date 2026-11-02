@@ -33,7 +33,7 @@ pub fn vgm_voice_scope_slot(voice: &str) -> Option<usize> {
 pub fn vgm_scope_slot(path: &str) -> Option<usize> {
     let lower = path.to_ascii_lowercase();
     let tail = lower.rsplit('/').next().unwrap_or(&lower)
-        .strip_suffix(".patch").unwrap_or(lower.rsplit('/').next().unwrap_or(&lower));
+    .strip_suffix(".patch").unwrap_or(lower.rsplit('/').next().unwrap_or(&lower));
     if let Some((prefix, _)) = tail.split_once('_') {
         let voice = match prefix {
             "fm1" => "ch1", "fm2" => "ch2", "fm3" => "ch3",
@@ -48,28 +48,28 @@ pub fn vgm_scope_slot(path: &str) -> Option<usize> {
     if ["fm", "dac"].iter().any(|p| tail.starts_with(p)
         && tail.as_bytes().get(p.len()).copied() == Some(b'_')) {
         return Some(VGM_SLOT_YM);
-    }
-    if ["psg", "noise"].iter().any(|p| tail.starts_with(p)
-        && tail.as_bytes().get(p.len()).copied() == Some(b'_')) {
-        return Some(VGM_SLOT_PSG);
-    }
-    let num = |prefix: &str, max: usize| -> Option<usize> {
-        let n: usize = tail.strip_prefix(prefix)?.parse().ok()?;
-        if (1..=max).contains(&n) { Some(n - 1) } else { None }
-    };
-    if tail == "dac" {
-        Some(VGM_SLOT_DAC)
-    } else if tail == "noise" {
-        Some(VGM_SLOT_NOISE)
-    } else if tail.starts_with("fm") {
-        Some(num("fm", 6).map_or(VGM_SLOT_YM, |i| VGM_SLOT_FM0 + i))
-    } else if tail.starts_with("psg") {
-        Some(num("psg", 3).map_or(VGM_SLOT_PSG, |i| VGM_SLOT_PSG0 + i))
-    } else if lower.contains("vgm") {
-        Some(VGM_SLOT_YM) // bare `vgm_embedded` placeholder part
-    } else {
-        None
-    }
+        }
+        if ["psg", "noise"].iter().any(|p| tail.starts_with(p)
+            && tail.as_bytes().get(p.len()).copied() == Some(b'_')) {
+            return Some(VGM_SLOT_PSG);
+            }
+            let num = |prefix: &str, max: usize| -> Option<usize> {
+                let n: usize = tail.strip_prefix(prefix)?.parse().ok()?;
+                if (1..=max).contains(&n) { Some(n - 1) } else { None }
+            };
+        if tail == "dac" {
+            Some(VGM_SLOT_DAC)
+        } else if tail == "noise" {
+            Some(VGM_SLOT_NOISE)
+        } else if tail.starts_with("fm") {
+            Some(num("fm", 6).map_or(VGM_SLOT_YM, |i| VGM_SLOT_FM0 + i))
+        } else if tail.starts_with("psg") {
+            Some(num("psg", 3).map_or(VGM_SLOT_PSG, |i| VGM_SLOT_PSG0 + i))
+        } else if lower.contains("vgm") {
+            Some(VGM_SLOT_YM) // bare `vgm_embedded` placeholder part
+        } else {
+            None
+        }
 }
 
 struct Scope {

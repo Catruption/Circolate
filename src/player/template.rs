@@ -34,16 +34,27 @@ pub(crate) struct VstNoteProto {
     pub(crate) pitch_midi: u8,
     pub(crate) velocity: u8,
     pub(crate) iid: u16,
-    /// Per-note fine pitch offset in cents (from the `¢` field).
-    /// VST pitch bend is channel-wide in MIDI, so an engine that wants
-    /// this applied per-voice has to do so via plugin-specific means;
-    /// the value is carried here so it's at least available.
     pub(crate) fine_pitch_cents: f64,
 }
 
 pub(crate) struct PartTemplate {
     pub(crate) voices: Vec<TVoice>,
     pub(crate) vst_notes: Vec<VstNoteProto>,
+}
+
+/// Build the composite SF2 lookup key.  Bank 0 is written as `path#preset`;
+/// nonzero bank as `path#bank:preset`.  Non-SF2 paths pass through unchanged.
+fn sf2_key(path: &str, preset: Option<i16>, bank: Option<i16>) -> String {
+    if !path.ends_with(".sf2") {
+        return path.to_string();
+    }
+    let p = preset.unwrap_or(0);
+    let b = bank.unwrap_or(0);
+    if b == 0 {
+        format!("{}#{}", path, p)
+    } else {
+        format!("{}#{}:{}", path, b, p)
+    }
 }
 
 pub(crate) fn build_template(
@@ -68,6 +79,16 @@ pub(crate) fn build_template(
                 .as_deref()
                 .unwrap_or(&part.sample_path);
 
+            // Composite SF2 key.  Priority: per-event preset override >
+            // part-level preset > legacy path-as-key.
+            let sf2_key_str: String = if let Some(_) = ev.preset {
+                sf2_key(lookup_path, ev.preset, ev.bank)
+            } else if part.sample_path.ends_with(".sf2") {
+                sf2_key(&part.sample_path, part.preset, part.bank)
+            } else {
+                lookup_path.to_string()
+            };
+
             let mut sid = default_sid;
             if let Some(p) = &ev.sample_override {
                 sid = path_to_id.get(p).copied().or(default_sid);
@@ -75,8 +96,6 @@ pub(crate) fn build_template(
 
             let dur_beats = ev.dur_beats.filter(|d| *d != 0.0).unwrap_or(1.0);
 
-            // Per-note fine pitch offset, in cents.  Zero when the
-            // event carries no `¢` field.
             let fp_cents = ev.fine_pitch.unwrap_or(0) as f64;
             let fp_ratio = 2f64.powf(fp_cents / 1200.0);
 
@@ -144,14 +163,8 @@ pub(crate) fn build_template(
                 continue;
             }
 
-            // Path 3: SF2 instrument sidecar.
-            //
-            // When a native Sf2Engine spec exists, route notes through
-            // it as MIDI (the engine is installed under `spec.iid` and
-            // answers MIDI note-on/off on that channel).  This is now
-            // the primary path; the internal renderer below is a
-            // fallback for older halotexts that predate the engine.
-            if let Some(spec) = sf2_engine_specs.get(lookup_path) {
+            // Path 3: SF2 engine spec — composite key.
+            if let Some(spec) = sf2_engine_specs.get(&sf2_key_str) {
                 let pitch = ev.pitch_midi.unwrap_or(60).clamp(0, 127) as u8;
                 let vol_pct = ev.vol.unwrap_or(100.0).clamp(0.0, 100.0);
                 let vel = (vol_pct * 127.0 / 100.0).round().clamp(1.0, 127.0) as u8;
@@ -166,8 +179,8 @@ pub(crate) fn build_template(
                 continue;
             }
 
-            // Fallback: internal renderer.
-            if let Some(inst) = sf2_instruments.get(lookup_path) {
+            // Fallback: internal renderer — composite key.
+            if let Some(inst) = sf2_instruments.get(&sf2_key_str) {
                 let key = ev.pitch_midi.unwrap_or(60).clamp(0, 127) as u8;
                 let vel_pct = ev.vol.unwrap_or(100.0).clamp(0.0, 100.0);
                 let vel = (vel_pct * 127.0 / 100.0).round().clamp(0.0, 127.0) as u8;

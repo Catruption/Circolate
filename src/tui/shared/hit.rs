@@ -58,7 +58,7 @@ pub enum HitAction {
     /// position across the view's inner width, already normalised.
     Waveform { path: String, line: usize, fraction: f64 },
     /// A clickable segment of the status notch was clicked.  Covers
-    /// both `?` (help) and `⇅` (settings).
+    /// `?` (help), `⇅` (settings), `Σ` (analysis), and `⏱` (perf).
     Notch { tag: NotchTag },
     /// The `@` / `↴` chain marker was clicked.  Left toggles expanded,
     /// right toggles disabled (visual-only for now).
@@ -332,6 +332,7 @@ pub fn dispatch(
                     if state.player.show_help {
                         state.player.show_config = false;
                         state.player.show_analysis = false;
+                        state.player.show_perf = false;
                     }
                 }
                 NotchTag::Settings => {
@@ -342,6 +343,7 @@ pub fn dispatch(
                         state.player.show_config = true;
                         state.player.show_help = false;
                         state.player.show_analysis = false;
+                        state.player.show_perf = false;
                     }
                 }
                 NotchTag::Analysis => {
@@ -351,6 +353,15 @@ pub fn dispatch(
                         state.player.show_analysis = true;
                         state.player.show_help = false;
                         state.player.show_config = false;
+                        state.player.show_perf = false;
+                    }
+                }
+                NotchTag::Perf => {
+                    state.player.show_perf = !state.player.show_perf;
+                    if state.player.show_perf {
+                        state.player.show_help = false;
+                        state.player.show_config = false;
+                        state.player.show_analysis = false;
                     }
                 }
             }

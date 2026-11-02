@@ -4,6 +4,7 @@ pub mod help;
 pub mod logs;
 pub mod menu;
 pub mod notch;
+pub mod perf;
 pub mod queue;
 pub mod spiral;
 pub mod lyrics;

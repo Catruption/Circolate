@@ -58,11 +58,7 @@ pub(crate) struct Project {
     pub(crate) vgm_instruments: HashMap<String, Arc<VgmInstrument>>,
     pub(crate) vgm_dac: Option<DacTrack>,
     pub(crate) multi_sample_instruments: HashMap<String, Arc<MultiSampleInstrument>>,
-    /// `.patch` files resolved from `banks/...` auxiliary paths. Keyed by
-    /// source path so `part.sample_path` lookups work uniformly.
     pub(crate) patch_instruments: HashMap<String, Patch>,
-    /// `iid` allocated per patch instrument, so `Engine::chip_players`
-    /// can key by the same value that `loader` emits in `ChipNote`.
     pub(crate) patch_iids: HashMap<String, u16>,
     pub(crate) lines: Vec<LineInfo>,
     pub(crate) order: Vec<usize>,
@@ -82,8 +78,6 @@ pub(crate) struct Project {
     pub(crate) lyrics: Vec<LyricLine>,
     pub(crate) chains: BTreeMap<u8, ProjectInsertChain>,
     pub(crate) channel_to_insert: BTreeMap<u16, u8>,
-    /// Lazy derived note rows are owned by the immutable project, so tracker
-    /// redraws can reuse them without cloning them into view state.
     note_rows_cache: OnceLock<Mutex<HashMap<String, Arc<Vec<super::notes::NoteRow>>>>>,
 }
 
@@ -158,6 +152,10 @@ impl Project {
         self.samples.get(id).cloned()
     }
 
+    /// Preview sample for the waveform renderer.  Checks the WAV map
+    /// first, then the SF2 map.  SF2 lookups use the composite key from
+    /// `HalotextPart::sf2_key()` so flattened refs like
+    /// `"samples/X.sf2"(6)` resolve to the preset-6 Sf2Instrument.
     pub(crate) fn preview_sample_for_part(&self, part_name: &str) -> Option<Arc<Sample>> {
         let part = self.parts.get(part_name)?;
         if let Some(id) = self.path_to_id.get(&part.sample_path) {
@@ -165,7 +163,7 @@ impl Project {
                 return Some(s.clone());
             }
         }
-        if let Some(inst) = self.sf2_instruments.get(&part.sample_path) {
+        if let Some(inst) = self.sf2_instruments.get(&part.sf2_key()) {
             let sid = inst.first_zone_sample_id()?;
             return self.samples.get(&sid).cloned();
         }
@@ -177,7 +175,7 @@ impl Project {
         if let Some(inst) = self.vst_instruments.get(&part.sample_path) {
             return Some(inst.iid);
         }
-        if let Some(spec) = self.sf2_engine_specs.get(&part.sample_path) {
+        if let Some(spec) = self.sf2_engine_specs.get(&part.sf2_key()) {
             return Some(spec.iid);
         }
         if let Some(iid) = self.patch_iids.get(&part.sample_path) {
@@ -186,6 +184,10 @@ impl Project {
         None
     }
 
+    /// Look up the insert chain for a part.  Accepts either a plain
+    /// path (WAV/VST/patch) or a bare SF2 path like `"samples/X.sf2"`.
+    /// For SF2 parts, all presets from one sf2 file typically route to
+    /// the same bus, so the first matching spec's iid is used.
     pub(crate) fn chain_for_part(&self, part_path: &str) -> Option<&ProjectInsertChain> {
         let iid = if let Some(inst) = self.vst_instruments.get(part_path) {
             inst.iid
@@ -195,6 +197,13 @@ impl Project {
             vgm.iid
         } else if let Some(pid) = self.patch_iids.get(part_path) {
             *pid
+        } else if part_path.ends_with(".sf2") {
+            // Composite-key fallback for flattened SF2 refs
+            let prefix = format!("{}#", part_path);
+            self.sf2_engine_specs
+                .iter()
+                .find(|(k, _)| k.starts_with(&prefix))
+                .map(|(_, spec)| spec.iid)?
         } else {
             return None;
         };
@@ -235,10 +244,17 @@ impl Project {
         self.parts.get(name).map(|p| p.sample_path.as_str())
     }
 
+    /// Whether this part source has a volume channel we can drive.
+    /// Accepts both legacy `.instrument` refs and flattened `.sf2(preset)`
+    /// refs — for the latter, any composite `path#preset` entry counts.
     pub(crate) fn part_supports_volume(&self, part_path: &str) -> bool {
         if self.path_to_id.get(part_path).map(|id| self.samples.contains_key(id)).unwrap_or(false) { return true; }
         if self.vst_instruments.contains_key(part_path) { return true; }
         if self.sf2_engine_specs.contains_key(part_path) { return true; }
+        if part_path.ends_with(".sf2") {
+            let prefix = format!("{}#", part_path);
+            if self.sf2_engine_specs.keys().any(|k| k.starts_with(&prefix)) { return true; }
+        }
         if self.vgm_instruments.contains_key(part_path) { return true; }
         if self.patch_instruments.contains_key(part_path) { return true; }
         false

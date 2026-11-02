@@ -186,6 +186,10 @@ pub fn draw(
             widgets::analysis::draw(f, area, &theme, li, &report);
         }
     }
+
+    if state.player.show_perf {
+        widgets::perf::draw(f, area, &theme, &state.perf_snapshot);
+    }
 }
 
 fn draw_header(
@@ -230,8 +234,14 @@ fn build_notch_segments(state: &RenderState) -> Vec<widgets::notch::Segment> {
     use crate::tui::state::NotchTag;
     use crate::tui::widgets::notch::Segment;
     vec![
-        Segment { text: state.settings.layout.help_glyph.clone(), tag: Some(NotchTag::Help), emphasized: true, color: None },
+        Segment {
+            text: state.settings.layout.help_glyph.clone(),
+            tag: Some(NotchTag::Help),
+            emphasized: true,
+            color: Some(Color::LightBlue),
+        },
         Segment { text: "⇅".into(), tag: Some(NotchTag::Settings), emphasized: false, color: Some(Color::Cyan) },
         Segment { text: "Σ".into(), tag: Some(NotchTag::Analysis), emphasized: false, color: Some(Color::Magenta) },
+        Segment { text: "⏱".into(), tag: Some(NotchTag::Perf),     emphasized: false, color: Some(Color::Yellow) },
     ]
 }

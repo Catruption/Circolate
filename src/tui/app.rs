@@ -182,10 +182,7 @@ fn event_loop(
         let frame_started = std::time::Instant::now();
         let draw_started = std::time::Instant::now();
         term.draw(|f| views::draw(f, tp, project, sample_rate, state))?;
-        let draw_ns = draw_started.elapsed().as_nanos() as u64;
-        state.ui_draw_ns = state.ui_draw_ns.saturating_add(draw_ns);
-        state.ui_draw_frames = state.ui_draw_frames.saturating_add(1);
-        state.ui_draw_worst_ns = state.ui_draw_worst_ns.max(draw_ns);
+        crate::player::perf::record_frame(draw_started.elapsed().as_nanos() as u64);
         loop_tick(tp, project, state);
 
         // ── HANDLE SYSTEM MEDIA CONTROLS ──
@@ -234,18 +231,15 @@ fn event_loop(
             crate::log_event!(
                 "player.perf",
                 load: format!("{:.3}", snap.load),
-                              worst: format!("{:.3}", snap.worst),
-                              overruns: snap.overruns,
-                              voices: format!("{:.3}", snap.voices),
-                              vst: format!("{:.3}", snap.vst),
-                              shim: format!("{:.3}", snap.shim),
-                              fx: format!("{:.3}", snap.fx),
-                              ui_draw_ms: format!("{:.3}", state.ui_draw_ns as f64 / state.ui_draw_frames.max(1) as f64 / 1e6),
-                              ui_draw_worst_ms: format!("{:.3}", state.ui_draw_worst_ns as f64 / 1e6),
+                worst: format!("{:.3}", snap.worst),
+                overruns: snap.overruns,
+                voices: format!("{:.3}", snap.voices),
+                vst: format!("{:.3}", snap.vst),
+                shim: format!("{:.3}", snap.shim),
+                fx: format!("{:.3}", snap.fx),
+                ui_draw_ms: format!("{:.3}", snap.ui_avg_ms),
+                ui_draw_worst_ms: format!("{:.3}", snap.ui_worst_ms),
             );
-            state.ui_draw_ns = 0;
-            state.ui_draw_frames = 0;
-            state.ui_draw_worst_ns = 0;
             state.perf_snapshot = Some(snap);
             state.perf_last_poll = perf_now;
         }
@@ -323,6 +317,7 @@ fn event_loop(
                                 state.player.show_analysis = true;
                                 state.player.show_help = false;
                                 state.player.show_config = false;
+                                state.player.show_perf = false;
                                 continue;
                             }
                     }
@@ -417,6 +412,7 @@ fn event_loop(
                     let typing = state.queue.focused
                     && !state.player.show_help
                     && !state.player.show_config
+                    && !state.player.show_perf
                     && !is_ctrl_c;
 
                     if !typing
@@ -442,7 +438,13 @@ fn event_loop(
                                 }
                             } else if typing {
                                 handle_queue_key(k.code, k.modifiers, state);
-                            } else if state.player.show_help
+                            } else if state.player.show_perf
+                                && (k.code == KeyCode::Esc
+                                || k.code == KeyCode::Char('q')
+                                || is_ctrl_c)
+                                {
+                                    state.player.show_perf = false;
+                                } else if state.player.show_help
                                 && (k.code == KeyCode::Esc
                                 || k.code == KeyCode::Char('q')
                                 || is_ctrl_c)
@@ -547,7 +549,20 @@ fn handle_key(
             tp.speed.store(0, Ordering::Release);
             state.player.last_loop_check_measure = None;
         }
-        KeyCode::Char('?') => state.player.show_help = !state.player.show_help,
+        KeyCode::Char('?') => {
+            state.player.show_help = !state.player.show_help;
+            if state.player.show_help {
+                state.player.show_perf = false;
+            }
+        }
+        KeyCode::Char('P') => {
+            state.player.show_perf = !state.player.show_perf;
+            if state.player.show_perf {
+                state.player.show_help = false;
+                state.player.show_config = false;
+                state.player.show_analysis = false;
+            }
+        }
         KeyCode::Char('L') => {
             state.player.loop_enabled = !state.player.loop_enabled;
             state.player.last_loop_check_measure = None;
