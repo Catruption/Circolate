@@ -187,7 +187,7 @@ pub(crate) fn render_offline(
         engine.ingest(batch.samples);
         engine.ingest_vst(batch.vsts);
         engine.ingest_chip(batch.chips);
-        engine.render(&mut l[i..i + n], &mut r[i..i + n], 1);
+        engine.render(&mut l[i..i + n], &mut r[i..i + n], 1, project.stereo_width);
         i += n;
     }
     let cache = Arc::try_unwrap(loader.cache)

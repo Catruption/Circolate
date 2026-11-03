@@ -82,6 +82,9 @@ pub fn watch_for_changes(
         last_sig = cur;
 
         if let Ok((project, cache)) = player::load_project(&path, rate, use_cache, true) {
+            // NEW: Sync the new project's width to the transport
+            tp.stereo_width.store(project.stereo_width.to_bits(), Ordering::Release);
+
             if let Ok(mut g) = slot.pending.lock() {
                 *g = Some((project, Arc::new(Mutex::new(cache))));
             }

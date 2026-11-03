@@ -257,6 +257,11 @@ fn parse_config(body: &str) -> Config {
                 }
             }
             "PanningLaw" => cfg.panning_law = value.trim().to_lowercase(),
+            "StereoWidth" => { // <--- NEW
+                if let Some(v) = parse_f(value) {
+                    cfg.stereo_width = v as f32;
+                }
+            }
             _ => {}
         }
     }

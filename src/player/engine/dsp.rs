@@ -243,3 +243,20 @@ fn env_sustain_level(state: &EnvState, t_sec: f64) -> f32 {
     }
     state.sustain
 }
+
+pub(super) fn widen_stereo(l: &mut [f32], r: &mut [f32], width: f32) {
+    // Fail-safe: if width is 1.0 (normal), or 0.0 (missing setting), do nothing.
+    if (width - 1.0).abs() < 0.001 || width <= 0.0 {
+        return;
+    }
+
+    // Prevent clipping by scaling volume down as width goes up
+    let comp = if width > 1.0 { 1.0 / width } else { 1.0 };
+
+    for i in 0..l.len() {
+        let mid = (l[i] + r[i]) * 0.5;
+        let side = (l[i] - r[i]) * 0.5 * width;
+        l[i] = (mid + side) * comp;
+        r[i] = (mid - side) * comp;
+    }
+}

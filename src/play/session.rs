@@ -6,7 +6,7 @@ use anyhow::{anyhow, bail, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ratatui::Terminal;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -118,6 +118,7 @@ pub fn play_one(
         let initial_speed: i64 = if project.voice_count > 0 { 1 } else { 0 };
 
         let transport = Arc::new(Transport {
+        stereo_width: AtomicU32::new(project.stereo_width.to_bits()), // <--- NEW
             speed: AtomicI64::new(initial_speed),
                                  seek_to: AtomicI64::new(start),
                                  position: AtomicI64::new(start),
@@ -262,7 +263,8 @@ pub fn play_one(
                     let rem = (total - engine.pos).max(0) as usize;
                     if rem < frames {
                         if rem > 0 {
-                            engine.render(&mut l[..rem], &mut r[..rem], speed);
+                            let width = f32::from_bits(tp.stereo_width.load(Ordering::Relaxed));
+                            engine.render(&mut l[head..], &mut r[head..], speed, width);
                         }
                         if let Some(m) = pending_wrap.take() {
                             if let Msg::Seek { epoch, .. } = &m {
@@ -274,7 +276,8 @@ pub fn play_one(
                         head = rem;
                     }
                 }
-                engine.render(&mut l[head..], &mut r[head..], speed);
+                let width = f32::from_bits(tp.stereo_width.load(Ordering::Relaxed));
+                engine.render(&mut l[head..], &mut r[head..], speed, width);
 
                 if engine.pos <= 0 && speed < 0 {
                     tp.speed.store(0, Ordering::Release);

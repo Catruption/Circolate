@@ -721,6 +721,7 @@ pub(crate) fn load_project_from_source(
         lines, order, tempo, rows_per_measure,
         render_end_sec, total_samples, song_volume: cfg.song_volume / 100.0,
         linear_pan: cfg.panning_law == "linear", sample_rate, title,
+        stereo_width: cfg.stereo_width, // <--- NEW
         initial_bpm: cfg.bpm, time_signature: cfg.time_signature,
         voice_count: total_voices, source_dir, cover_path, fidelity, requires,
         shims: parsed.shims, lyrics, chains, channel_to_insert,

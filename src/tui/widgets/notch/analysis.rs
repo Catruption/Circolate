@@ -1,3 +1,5 @@
+//! Modal analysis overlay.
+
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -11,7 +13,7 @@ use crate::tui::theme::{Theme, Token};
 
 const EXPLANATION_SLOTS: usize = 4;
 
-pub fn draw(f: &mut Frame<'_>, area: Rect, theme: &Theme, line_idx: usize, report: &AnalysisReport) {
+pub fn draw(f: &mut Frame<'_>, area: Rect, theme: &Theme, line_idx: usize, report: &AnalysisReport, accent: Color) {
     let w = (area.width * 85 / 100).min(100).min(area.width.saturating_sub(4));
     let h = (area.height * 80 / 100).min(40).min(area.height.saturating_sub(4));
 
@@ -26,10 +28,12 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, theme: &Theme, line_idx: usize, repor
     f.render_widget(Clear, rect);
 
     let help_bg = theme.color(Token::HelpBg);
-    let key_style = Style::default().fg(Color::Magenta).bg(help_bg).add_modifier(Modifier::BOLD);
+
+    // Use the custom accent color for the chrome and headers
+    let key_style = Style::default().fg(accent).bg(help_bg).add_modifier(Modifier::BOLD);
     let desc_style = Style::default().fg(theme.color(Token::HelpFg)).bg(help_bg);
     let dim_style = Style::default().fg(theme.color(Token::HelpDim)).bg(help_bg);
-    let header_style = Style::default().fg(Color::Magenta).bg(help_bg).add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    let header_style = Style::default().fg(accent).bg(help_bg).add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
 
     let mut lines: Vec<Line> = Vec::new();
 
@@ -125,7 +129,7 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, theme: &Theme, line_idx: usize, repor
     let block = Block::default()
     .borders(Borders::ALL)
     .border_set(theme.border_set())
-    .border_style(Style::default().fg(Color::Magenta))
+    .border_style(Style::default().fg(accent))
     .title(format!(" Analysis: Line {} ", line_idx + 1))
     .style(Style::default().bg(help_bg));
 

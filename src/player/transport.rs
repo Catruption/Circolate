@@ -1,6 +1,7 @@
 //! Atomics shared between the audio callback and the UI.
 
-use std::sync::atomic::{AtomicBool, AtomicI64};
+// Add AtomicU32 to the list
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32};
 
 /// Playback speed, in multiples of the base rate.  0 is stopped,
 /// positive is forward, negative is reverse.  The UI sets this; the
@@ -25,4 +26,5 @@ pub(crate) struct Transport {
     /// Incremented by the audio callback each time it wraps the song
     /// back to 0:00 itself.  The TUI watches it to count the loop down.
     pub(crate) loop_wraps: AtomicI64,
+    pub stereo_width: AtomicU32, // Stored as f32 bits
 }

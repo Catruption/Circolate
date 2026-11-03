@@ -14,6 +14,18 @@
     "spiral_aspect_x": 2,
     "spiral_max_h": 15
   },
+  "notch": {
+    "analysis_color": "#ffffff",
+    "analysis_icon": "Σ",
+    "help_color": "#00ffff",
+    "help_icon": "?",
+    "mixer_color": "#ffff00",
+    "mixer_icon": "🕪",
+    "perf_color": "#ff8800",
+    "perf_icon": "⏱",
+    "settings_color": "#ff00ff",
+    "settings_icon": "⇅"
+  },
   "synesthesia": {
     "enabled": true,
     "hue_step": 30.0,
@@ -23,12 +35,10 @@
   },
   "theme": {
     "border": "thick",
-    "overrides": {
-      "block-instance": "#8ab4d2"
-    },
-    "preset": "default"
+    "overrides": {},
+    "preset": null
   },
   "view": {
-    "mode": "auto"
+    "mode": null
   }
 }

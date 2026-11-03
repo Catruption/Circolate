@@ -71,3 +71,44 @@ One line per decision, plain English. Update as decisions change.
 - "Drop X" = X doesn't ship. Not migrated to a new form, just gone.
 - `instruments/*.instrument`, `inserts/*.instrument`, `samples.json`, `requires.json`: dropped after their replacements ship.
 - `fidelity.json`: dropped after halotext carries its data.
+
+## Editor Integrations & UX (The LSP Blueprint)
+
+*Status: Planned. The parser is stable, but tooling is needed to make editing pleasant.*
+
+### Architecture
+- **One Server, Two Clients:** We use a Language Server Protocol (LSP) written in Rust (reusing `spec.rs` and `formats::halotext`). Kate and VS Code get thin plugins (~300 lines each) that just map keystrokes to LSP `workspace/executeCommand` calls.
+- **Scope:** The LSP strictly scopes structural queries using the `[ ]` brackets. Commands like "select all C5s" default to the current `[ ]` part body.
+
+### Glyph Input (The Leader Key)
+Since Halotext uses non-standard Unicode glyphs (`§, ƒ, ¶, ₨, ¥, ₥, ¢, α, ♪, ♫`), typing them requires a plugin solution.
+- **Leader Mode:** `Ctrl+\` (configurable) opens a one-shot glyph input mode.
+- **Behavior:** The status bar flashes "GLYPH". The next keypress maps to a glyph (`S` → `§`, `F` → `ƒ`). Unmapped keys cancel the mode. `Esc` cancels. 
+- **Discovery:** `Ctrl+Space` opens a standard completion popup listing all fields and their glyphs.
+- **Scope:** Only active in `.halo.txt` / `.halotext` files.
+
+### Keybindings & Operations (LSP Custom Commands)
+These apply to either the text selection or multi-cursors. 
+- **Note Edits:** `Alt+Up/Down` (transpose semitone), `Alt+Shift+Up/Down` (transpose octave).
+- **Time Edits:** `Alt+Left/Right` (nudge subdivision), `Alt+./,` (extend/shrink duration).
+- **Mix Edits:** `Alt+]/[` (volume ±5%), `Alt+; / '` (pan).
+- **Duplication:** `Ctrl+D` (duplicate note in place), `Ctrl+Shift+D` (duplicate after).
+- **Macro/Refactor:** `Ctrl+Shift+M` (Extract selection to a new `ƒmotif` definition and replace selection with a call).
+- **Formatting:** `Ctrl+Shift+I` (Format-on-save: aligns commas, normalizes whitespace, orders fields. Manual trigger, not automatic).
+
+### Visualizations & Audio Feedback
+- **Gutter Numbers:** The editor must override standard line numbers. Inside `[ ]` blocks (BlockList / part bodies), the gutter shows the **measure number**, not the line number. 
+- **Absolute Positioning:** Hovering a line inside a part body shows a tooltip: "Part measure 3. Plays at song measures: 4, 12, 36." (Via LSP Hover).
+- **The Playhead:** The Circolate player broadcasts `active_notes` via `/tmp/circolate.sock`. The editor highlights the active lines in cyan.
+- **Terminal 2-for-1:** Use Kate's built-in terminal panel to run `circolate play`. The playhead runs upward via socket, the terminal handles the live logs.
+- **Scroll-on-Value (Kate Only):** Mouse wheel over `%78.1` changes it. (VS Code extensions cannot intercept native mouse events; VS Code uses `Alt+]/[` exclusively).
+
+### Known Limitations
+- **VS Code Mouse:** Extensions cannot intercept mouse wheel or click-drag in the Monaco editor. Features like "Alt+Click to select field" and "Scroll wheel to change value" are **Kate-exclusive**.
+- **Multi-Cursor:** The LSP will iterate over all active cursors provided by the editor. If Kate's multi-cursor API doesn't expose column positions cleanly, scattered note edits may be limited to VS Code.
+- **Current Playhead:** The existing `trackscript_playhead.py` uses PyKDE4 and must be ported to PyQt5/PyQt6 before it works on modern Kate.
+
+### What not to do
+- **No Piano Roll overlay:** Do not build a graphical grid. The text *is* the grid. 
+- **No Parallel Model:** The plugin must never maintain a hidden list of notes. It reads text, modifies text, writes text. Undo/Redo must be native text undo.
+- **No Drag and Drop:** There is no spatial representation of time.

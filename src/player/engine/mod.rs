@@ -257,8 +257,6 @@ impl Engine {
     // ─────────────── chip gain ───────────────
 
     fn chip_gain(&self, iid: u16) -> f32 {
-        // Chip players apply per-part mute/solo and faders to their isolated
-        // hardware voices. This gain is the master/song level only.
         if iid == 100 || iid == 101 {
             return self.song_volume as f32;
         }
@@ -299,17 +297,12 @@ impl Engine {
             if n.end <= self.pos {
                 continue;
             }
-            // Chip parts (iids 100/101) don't participate in the mixer's mute
-            // registry — those paths are chip patch files, not sample/VST paths.
-            // Skip the check for them so notes actually reach `render_chips`.
             if n.iid != 100 && n.iid != 101 {
                 if !crate::mixer::mute::is_note_active(&n.part_path, n.line as usize, n.source_row as i64) {
                     continue;
                 }
             }
             if n.start < self.pos {
-                // Note was already sounding when we entered this block:
-                // begin it now so the tail is audible.
                 n.start = self.pos;
             }
             let key = (n.start, n.line, n.seq);
@@ -323,14 +316,10 @@ impl Engine {
                 self.chip_pending.insert(idx, n);
             }
         }
-
     }
 
     // ─────────────── chip render ───────────────
 
-    /// Dispatch due note-ons and note-offs into chip players, then render
-    /// each player's block. Block-boundary dispatch (not sample-accurate);
-    /// upgrade path is to pass absolute sample time into the player.
     fn render_chips(&mut self, out_l: &mut [f32], out_r: &mut [f32], block_start: i64) {
         if self.chip_players.is_empty() {
             return;
@@ -375,7 +364,6 @@ impl Engine {
                 player.render(out_l, out_r, block_start, gain);
             }
         }
-
     }
 
     // ─────────────── sample voices ───────────────
@@ -466,10 +454,6 @@ impl Engine {
         self.vst_log.clear();
         self.vst_synced = true;
         self.vst_hist_head = i64::MIN;
-        // Chip state: reset voices, drop pending/active notes, and reset
-        // the chip players to a silent state. Seeking is a full re-entry;
-        // any note that would have been mid-flight is restarted by the
-        // loader's seek batch.
         self.chip_pending.clear();
         self.chip_active.clear();
         self.chip_log.clear();
@@ -506,7 +490,7 @@ impl Engine {
         self.active.len() + self.chip_active.len()
     }
 
-    pub(crate) fn render(&mut self, out_l: &mut [f32], out_r: &mut [f32], speed: i64) {
+    pub(crate) fn render(&mut self, out_l: &mut [f32], out_r: &mut [f32], speed: i64, stereo_width: f32) {
         vst::enable_ftz_daz();
         vst::set_realtime_priority();
 
@@ -565,7 +549,6 @@ impl Engine {
         perf::lap(&mut lap_t, &PERF.vst_ns);
 
         // 3. Chip players (replaces the old VGM path).
-        //    Same speed==1 constraint: chip players don't time-stretch.
         if !self.chip_players.is_empty() && speed == 1 {
             self.render_chips(out_l, out_r, block_start);
         }
@@ -593,6 +576,13 @@ impl Engine {
 
         sanitize(out_l);
         sanitize(out_r);
+
+        // 6. Stereo Widening (Fail-safe clamped to 2.0 to prevent clipping)
+        let safe_width = stereo_width.clamp(0.0, 2.0);
+        if (safe_width - 1.0).abs() > 0.001 && safe_width > 0.0 {
+            dsp::widen_stereo(out_l, out_r, safe_width);
+        }
+
         perf::lap(&mut lap_t, &PERF.fx_ns);
 
         if speed != 1 && speed != 0 {

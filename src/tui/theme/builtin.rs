@@ -52,6 +52,13 @@ pub fn default_colors() -> HashMap<Token, Color> {
     m.insert(QueueCursorFg, Black);
     m.insert(QueueCursorBg, White);
 
+    // Notch defaults
+    m.insert(NotchHelp, LightBlue);
+    m.insert(NotchSettings, Cyan);
+    m.insert(NotchAnalysis, Magenta);
+    m.insert(NotchPerf, Yellow);
+    m.insert(NotchMixer, Green);
+
     m
 }
 
@@ -87,6 +94,13 @@ pub fn apply_preset(name: &str, base: &mut HashMap<Token, Color>) -> Result<(), 
             base.insert(QueueBg, Rgb(29, 32, 33));
             base.insert(QueuePlaying, Rgb(184, 187, 38));
             base.insert(QueueCounter, Rgb(250, 189, 47));
+            
+            // Notch
+            base.insert(NotchHelp, Rgb(250, 189, 47));
+            base.insert(NotchSettings, Rgb(131, 165, 152));
+            base.insert(NotchAnalysis, Rgb(211, 134, 155));
+            base.insert(NotchPerf, Rgb(215, 153, 33));
+            base.insert(NotchMixer, Rgb(142, 192, 124));
             Ok(())
         }
         "synthwave" => {
@@ -107,6 +121,13 @@ pub fn apply_preset(name: &str, base: &mut HashMap<Token, Color>) -> Result<(), 
             base.insert(QueueBg, Rgb(15, 8, 30));
             base.insert(QueuePlaying, Rgb(0, 255, 255));
             base.insert(QueueCounter, Rgb(255, 110, 199));
+
+            // Notch
+            base.insert(NotchHelp, Rgb(0, 255, 255));
+            base.insert(NotchSettings, Rgb(255, 110, 199));
+            base.insert(NotchAnalysis, Rgb(180, 130, 255));
+            base.insert(NotchPerf, Rgb(255, 255, 0));
+            base.insert(NotchMixer, Rgb(0, 255, 255));
             Ok(())
         }
         other => Err(format!("unknown preset: {other}")),

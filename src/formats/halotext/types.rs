@@ -188,6 +188,7 @@ pub struct Config {
     pub time_signature: (u32, u32),
     pub song_volume: f64,
     pub panning_law: String,
+    pub stereo_width: f32, // <--- NEW
     pub raw: HashMap<String, String>,
 }
 
@@ -199,6 +200,7 @@ impl Default for Config {
             time_signature: (4, 4),
             song_volume: 100.0,
             panning_law: "equal_power".into(),
+            stereo_width: 1.0, // <--- NEW
             raw: HashMap::new(),
         }
     }

@@ -57,7 +57,7 @@ pub fn draw(
         let header = ratatui::widgets::Paragraph::new(msg.as_str())
         .block(state.settings.theme.block().title(" Loading "));
         f.render_widget(header, chunks[0]);
-        crate::tui::widgets::logs::draw(f, chunks[1], state);
+        widgets::notch::logs::draw(f, chunks[1], state);
         return;
     }
     let area = f.area();
@@ -81,7 +81,6 @@ pub fn draw(
 
     draw_header(f, chunks[0], project, tp, sample_rate, state.loading.as_deref(), &theme);
 
-    // Motion markers are static for a line; compute them once when entering it.
     let pos_now = tp.position.load(Ordering::Relaxed).max(0);
     if let Some(li_now) = project.current_line(pos_now) {
         let marker_key = (li_now, crate::mixer::mute::generation());
@@ -109,7 +108,7 @@ pub fn draw(
     }
 
     widgets::cover::paint_background(f.buffer_mut(), state.cover.as_ref());
-    widgets::lyrics::draw(f, chunks[1], tp, project);
+    widgets::notch::lyrics::draw(f, chunks[1], tp, project);
 
     let spd = tp.speed.load(Ordering::Relaxed);
     state.queue.direction = match spd.signum() { 1 => '▶', -1 => '◀', _ => '■' };
@@ -171,24 +170,38 @@ pub fn draw(
         _ => state.spiral = None,
     }
 
+    // --- POPUPS ---
+    let n = &state.settings.notch;
+    let c = |s: &str, def: Color| crate::tui::theme::parse_color(s).unwrap_or(def);
+
+    let help_accent = c(&n.help_color, Color::LightBlue);
+    let settings_accent = c(&n.settings_color, Color::Cyan);
+    let analysis_accent = c(&n.analysis_color, Color::Magenta);
+    let perf_accent = c(&n.perf_color, Color::Yellow);
+    let mixer_accent = c(&n.mixer_color, Color::Green);
+
     if state.player.show_help {
-        widgets::help::draw(f, area, &theme);
+        widgets::notch::help::draw(f, area, &theme, help_accent);
     }
 
     if state.player.show_config {
-        widgets::config::draw(f, area, &state.config_ui, &state.settings);
+        widgets::notch::config::draw(f, area, &state.config_ui, &state.settings, settings_accent);
     }
 
     if state.player.show_analysis {
         let pos = tp.position.load(Ordering::Relaxed).max(0);
         if let Some(li) = project.current_line(pos) {
             let report = crate::player::analysis::analyze(project, tp, li);
-            widgets::analysis::draw(f, area, &theme, li, &report);
+            widgets::notch::analysis::draw(f, area, &theme, li, &report, analysis_accent);
         }
     }
 
     if state.player.show_perf {
-        widgets::perf::draw(f, area, &theme, &state.perf_snapshot);
+        widgets::notch::perf::draw(f, area, &theme, &state.perf_snapshot, perf_accent);
+    }
+
+    if state.player.show_mixer {
+        widgets::notch::mixer::draw(f, area, &theme, tp, mixer_accent);
     }
 }
 
@@ -233,15 +246,22 @@ fn refresh_cover(state: &mut RenderState, project: &Project, area: Rect) {
 fn build_notch_segments(state: &RenderState) -> Vec<widgets::notch::Segment> {
     use crate::tui::state::NotchTag;
     use crate::tui::widgets::notch::Segment;
+    use crate::tui::theme::parse_color;
+    use ratatui::style::Color;
+
+    let n = &state.settings.notch;
+    let c = |s: &str, def: Color| parse_color(s).unwrap_or(def);
+
     vec![
         Segment {
-            text: state.settings.layout.help_glyph.clone(),
+            text: n.help_icon.clone(),
             tag: Some(NotchTag::Help),
             emphasized: true,
-            color: Some(Color::LightBlue),
+            color: Some(c(&n.help_color, Color::LightBlue)),
         },
-        Segment { text: "⇅".into(), tag: Some(NotchTag::Settings), emphasized: false, color: Some(Color::Cyan) },
-        Segment { text: "Σ".into(), tag: Some(NotchTag::Analysis), emphasized: false, color: Some(Color::Magenta) },
-        Segment { text: "⏱".into(), tag: Some(NotchTag::Perf),     emphasized: false, color: Some(Color::Yellow) },
+        Segment { text: n.settings_icon.clone(), tag: Some(NotchTag::Settings), emphasized: false, color: Some(c(&n.settings_color, Color::Cyan)) },
+        Segment { text: n.analysis_icon.clone(), tag: Some(NotchTag::Analysis), emphasized: false, color: Some(c(&n.analysis_color, Color::Magenta)) },
+        Segment { text: n.perf_icon.clone(),     tag: Some(NotchTag::Perf),     emphasized: false, color: Some(c(&n.perf_color, Color::Yellow)) },
+        Segment { text: n.mixer_icon.clone(),    tag: Some(NotchTag::Mixer),    emphasized: false, color: Some(c(&n.mixer_color, Color::Green)) },
     ]
 }

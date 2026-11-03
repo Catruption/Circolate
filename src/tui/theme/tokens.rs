@@ -51,13 +51,17 @@ pub enum Token {
     QueueCounterDim,
     QueueCursorFg,
     QueueCursorBg,
+
+    // Notch (Now handled via NotchConfig, but kept in enum to avoid match errors)
+    NotchHelp,
+    NotchSettings,
+    NotchAnalysis,
+    NotchPerf,
+    NotchMixer,
 }
 
 impl Token {
     /// Every token, in the order used by `builtin::default_colors`.
-    /// Adding a token requires adding it here and to that map; the
-    /// compiler will catch one, `Theme::from_parts` will catch the
-    /// other at startup.
     pub const ALL: &'static [Token] = &[
         Token::Border,
         Token::Playhead,

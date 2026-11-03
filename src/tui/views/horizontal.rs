@@ -52,7 +52,7 @@ pub fn draw(
     let outer = theme.block().title(title);
 
     let Some(li) = current else {
-        crate::tui::widgets::menu::draw(f, area, state);
+        crate::tui::widgets::notch::menu::draw(f, area, state);
         state.tracker_hit = None;
         return;
     };

@@ -1,11 +1,13 @@
-//! Status notch: a bracketed strip on the tracker panel's bottom-left
-//! corner, replacing the `╚` with `[seg seg ...]` and leaving the rest
-//! of the bottom border as `═`.  Segments can be clickable (help) or
-//! plain status text (blocklist position, tempo, …).
-//!
-//! Call this *after* the tracker view has drawn its outer block and
-//! *after* the queue box has claimed the bottom-right, so the notch
-//! knows how much room it has.
+//! Status notch and its associated popups.
+
+pub mod help;
+pub mod config;
+pub mod analysis;
+pub mod perf;
+pub mod menu;
+pub mod logs;
+pub mod lyrics;
+pub mod mixer; // <--- ADD THIS
 
 use ratatui::{
     buffer::Buffer,
@@ -39,9 +41,9 @@ pub fn render(
     }
 
     let content_w: usize = segments
-    .iter()
-    .map(|s| s.text.chars().count())
-    .sum::<usize>()
+        .iter()
+        .map(|s| s.text.chars().count())
+        .sum::<usize>()
     + segments.len().saturating_sub(1);
     let notch_w = content_w + 2;
 

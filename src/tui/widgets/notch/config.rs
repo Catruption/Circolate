@@ -190,7 +190,13 @@ const PALETTE: [[Color; 8]; 5] = [
 
 // ── draw ──────────────────────────────────────────────────────────────
 
-pub fn draw(f: &mut Frame<'_>, area: Rect, ui: &ConfigUi, settings: &Settings) {
+pub fn draw(
+    f: &mut Frame<'_>,
+    area: Rect,
+    ui: &ConfigUi,
+    settings: &Settings,
+    accent: Color,
+) {
     let w = 76u16.min(area.width.saturating_sub(4));
     let h = 30u16.min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
@@ -204,13 +210,19 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, ui: &ConfigUi, settings: &Settings) {
     f.render_widget(Clear, rect);
 
     match ui.mode {
-        Mode::List => draw_list(f, rect, ui, settings),
-        Mode::Colors => draw_colors(f, rect, ui, settings),
-        Mode::Picker => draw_picker(f, rect, ui, settings),
+        Mode::List => draw_list(f, rect, ui, settings, accent),
+        Mode::Colors => draw_colors(f, rect, ui, settings, accent),
+        Mode::Picker => draw_picker(f, rect, ui, settings, accent),
     }
 }
 
-fn draw_list(f: &mut Frame<'_>, rect: Rect, ui: &ConfigUi, settings: &Settings) {
+fn draw_list(
+    f: &mut Frame<'_>,
+    rect: Rect,
+    ui: &ConfigUi,
+    settings: &Settings,
+    accent: Color,
+) {
     let theme = &settings.theme;
     let bg = theme.color(Token::HelpBg);
 
@@ -222,7 +234,7 @@ fn draw_list(f: &mut Frame<'_>, rect: Rect, ui: &ConfigUi, settings: &Settings) 
     let block = Block::default()
     .borders(Borders::ALL)
     .border_set(theme.border_set())
-    .border_style(Style::default().fg(Color::Cyan)) // Tied to the ⇅ icon
+    .border_style(Style::default().fg(accent))
     .title(title)
     .style(Style::default().bg(bg));
 
@@ -230,13 +242,13 @@ fn draw_list(f: &mut Frame<'_>, rect: Rect, ui: &ConfigUi, settings: &Settings) 
     f.render_widget(block, rect);
 
     let key_style = Style::default()
-    .fg(Color::Cyan)
+    .fg(accent)
     .bg(bg)
     .add_modifier(Modifier::BOLD);
     let val_style = Style::default().fg(theme.color(Token::HelpFg)).bg(bg);
     let cursor_style = Style::default()
     .fg(bg)
-    .bg(Color::Cyan)
+    .bg(accent)
     .add_modifier(Modifier::BOLD);
     let header_style = Style::default()
     .fg(theme.color(Token::HelpDim))
@@ -368,14 +380,20 @@ fn render_row(
     ])
 }
 
-fn draw_colors(f: &mut Frame<'_>, rect: Rect, ui: &ConfigUi, settings: &Settings) {
+fn draw_colors(
+    f: &mut Frame<'_>,
+    rect: Rect,
+    ui: &ConfigUi,
+    settings: &Settings,
+    accent: Color,
+) {
     let theme = &settings.theme;
     let bg = theme.color(Token::HelpBg);
 
     let block = Block::default()
     .borders(Borders::ALL)
     .border_set(theme.border_set())
-    .border_style(Style::default().fg(Color::Cyan))
+    .border_style(Style::default().fg(accent))
     .title(" Colors ")
     .style(Style::default().bg(bg));
 
@@ -383,13 +401,13 @@ fn draw_colors(f: &mut Frame<'_>, rect: Rect, ui: &ConfigUi, settings: &Settings
     f.render_widget(block, rect);
 
     let key_style = Style::default()
-    .fg(Color::Cyan)
+    .fg(accent)
     .bg(bg)
     .add_modifier(Modifier::BOLD);
     let val_style = Style::default().fg(theme.color(Token::HelpFg)).bg(bg);
     let cursor_style = Style::default()
     .fg(bg)
-    .bg(Color::Cyan)
+    .bg(accent)
     .add_modifier(Modifier::BOLD);
     let dim_style = Style::default().fg(theme.color(Token::HelpDim)).bg(bg);
 
@@ -436,7 +454,13 @@ fn draw_colors(f: &mut Frame<'_>, rect: Rect, ui: &ConfigUi, settings: &Settings
     );
 }
 
-fn draw_picker(f: &mut Frame<'_>, rect: Rect, ui: &ConfigUi, settings: &Settings) {
+fn draw_picker(
+    f: &mut Frame<'_>,
+    rect: Rect,
+    ui: &ConfigUi,
+    settings: &Settings,
+    accent: Color,
+) {
     let theme = &settings.theme;
     let bg = theme.color(Token::HelpBg);
 
@@ -447,7 +471,7 @@ fn draw_picker(f: &mut Frame<'_>, rect: Rect, ui: &ConfigUi, settings: &Settings
     let block = Block::default()
     .borders(Borders::ALL)
     .border_set(theme.border_set())
-    .border_style(Style::default().fg(Color::Cyan))
+    .border_style(Style::default().fg(accent))
     .title(format!(" Pick: {} ", token_name(token)))
     .style(Style::default().bg(bg));
 
@@ -457,7 +481,7 @@ fn draw_picker(f: &mut Frame<'_>, rect: Rect, ui: &ConfigUi, settings: &Settings
     let val_style = Style::default().fg(theme.color(Token::HelpFg)).bg(bg);
     let dim_style = Style::default().fg(theme.color(Token::HelpDim)).bg(bg);
     let key_style = Style::default()
-    .fg(Color::Cyan)
+    .fg(accent)
     .bg(bg)
     .add_modifier(Modifier::BOLD);
 
@@ -837,6 +861,18 @@ fn save_settings(settings: &Settings) -> Result<()> {
             "saturation_from_volume": settings.synesthesia.saturation_from_volume,
             "saturation_scale": settings.synesthesia.saturation_scale,
             "value": settings.synesthesia.value,
+        },
+        "notch": {
+            "help_icon": settings.notch.help_icon,
+            "settings_icon": settings.notch.settings_icon,
+            "analysis_icon": settings.notch.analysis_icon,
+            "perf_icon": settings.notch.perf_icon,
+            "mixer_icon": settings.notch.mixer_icon,
+            "help_color": settings.notch.help_color,
+            "settings_color": settings.notch.settings_color,
+            "analysis_color": settings.notch.analysis_color,
+            "perf_color": settings.notch.perf_color,
+            "mixer_color": settings.notch.mixer_color,
         },
     });
 

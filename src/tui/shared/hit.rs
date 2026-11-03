@@ -335,6 +335,15 @@ pub fn dispatch(
                         state.player.show_perf = false;
                     }
                 }
+                // Inside `dispatch`:
+                NotchTag::Mixer => {
+                    state.player.show_mixer = !state.player.show_mixer;
+                    if state.player.show_mixer {
+                        state.player.show_help = false;
+                        state.player.show_config = false;
+                        state.player.show_analysis = false;
+                    }
+                }
                 NotchTag::Settings => {
                     if state.player.show_config {
                         state.player.show_config = false;

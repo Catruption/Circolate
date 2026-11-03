@@ -4,7 +4,9 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use serde::Deserialize;
+use ratatui::style::Color;
 
+use crate::paths;
 use crate::tui::theme::{builtin, parse_color, BorderStyle, Theme, Token};
 
 #[derive(Debug, Default, Deserialize)]
@@ -22,6 +24,8 @@ pub struct Config {
     pub labels: LabelsConfig,
     #[serde(default)]
     pub synesthesia: SynesthesiaConfig,
+    #[serde(default)]
+    pub notch: NotchConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -132,12 +136,60 @@ impl Default for SynesthesiaConfig {
 fn d_hue_step() -> f64 { 30.0 }
 fn d_one() -> f64 { 1.0 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotchConfig {
+    #[serde(default = "d_help_icon")]     pub help_icon: String,
+    #[serde(default = "d_settings_icon")] pub settings_icon: String,
+    #[serde(default = "d_analysis_icon")] pub analysis_icon: String,
+    #[serde(default = "d_perf_icon")]     pub perf_icon: String,
+    #[serde(default = "d_mixer_icon")]    pub mixer_icon: String,
+
+    #[serde(default = "d_help_color")]     pub help_color: String,
+    #[serde(default = "d_settings_color")] pub settings_color: String,
+    #[serde(default = "d_analysis_color")] pub analysis_color: String,
+    #[serde(default = "d_perf_color")]     pub perf_color: String,
+    #[serde(default = "d_mixer_color")]    pub mixer_color: String,
+}
+
+impl Default for NotchConfig {
+    fn default() -> Self {
+        Self {
+            help_icon: d_help_icon(),
+            settings_icon: d_settings_icon(),
+            analysis_icon: d_analysis_icon(),
+            perf_icon: d_perf_icon(),
+            mixer_icon: d_mixer_icon(),
+
+            help_color: d_help_color(),
+            settings_color: d_settings_color(),
+            analysis_color: d_analysis_color(),
+            perf_color: d_perf_color(),
+            mixer_color: d_mixer_color(),
+        }
+    }
+}
+
+fn d_help_icon() -> String { "?".into() }
+fn d_settings_icon() -> String { "⇅".into() }
+fn d_analysis_icon() -> String { "Σ".into() }
+fn d_perf_icon() -> String { "⏱".into() }
+fn d_mixer_icon() -> String { "🎛".into() }
+
+fn d_help_color() -> String { "lightblue".into() }
+fn d_settings_color() -> String { "cyan".into() }
+fn d_analysis_color() -> String { "magenta".into() }
+fn d_perf_color() -> String { "yellow".into() }
+fn d_mixer_color() -> String { "green".into() }
+
+
 #[derive(Clone)]
 pub struct Settings {
     pub theme: Theme,
     pub layout: LayoutConfig,
     pub labels: LabelsConfig,
     pub synesthesia: SynesthesiaConfig,
+    pub notch: NotchConfig,
     pub view_mode: Option<String>,
 }
 
@@ -175,6 +227,7 @@ impl Config {
         self.layout = other.layout;
         self.labels = other.labels;
         self.synesthesia = other.synesthesia;
+        self.notch = other.notch;
     }
 
     pub fn resolve(self) -> Settings {
@@ -183,6 +236,7 @@ impl Config {
             layout: normalize_layout(self.layout),
             labels: self.labels,
             synesthesia: self.synesthesia,
+            notch: self.notch,
             view_mode: self.view.mode,
         }
     }
@@ -270,4 +324,119 @@ fn token_from_name(s: &str) -> Option<Token> {
          "queue-cursor-bg" => Token::QueueCursorBg,
          _ => return None,
     })
+}
+
+fn border_name(b: BorderStyle) -> &'static str {
+    match b {
+        BorderStyle::Plain => "plain",
+        BorderStyle::Double => "double",
+        BorderStyle::Mixed => "mixed",
+        BorderStyle::Rounded => "rounded",
+        BorderStyle::Thick => "thick",
+    }
+}
+
+fn token_name(t: Token) -> String {
+    serde_json::to_value(t)
+    .ok()
+    .and_then(|v| v.as_str().map(String::from))
+    .unwrap_or_else(|| format!("{:?}", t))
+}
+
+fn fmt_color(c: Color) -> String {
+    match c {
+        Color::Rgb(r, g, b) => format!("#{:02x}{:02x}{:02x}", r, g, b),
+        Color::Black => "black".into(),
+        Color::Red => "red".into(),
+        Color::Green => "green".into(),
+        Color::Yellow => "yellow".into(),
+        Color::Blue => "blue".into(),
+        Color::Magenta => "magenta".into(),
+        Color::Cyan => "cyan".into(),
+        Color::Gray => "gray".into(),
+        Color::DarkGray => "darkgray".into(),
+        Color::White => "white".into(),
+        Color::Reset => "reset".into(),
+        other => format!("{:?}", other),
+    }
+}
+
+pub(crate) fn reload_config() -> anyhow::Result<Settings> {
+    Ok(Config::load_layered(None).resolve())
+}
+
+pub(crate) fn save_settings(settings: &Settings) -> anyhow::Result<()> {
+    let path = paths::user_config().join("player_settings.json");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Preserve any existing preset name; this UI doesn't edit it.
+    let preset = std::fs::read_to_string(&path)
+    .ok()
+    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+    .and_then(|v| v.get("theme").and_then(|t| t.get("preset")).cloned())
+    .unwrap_or(serde_json::Value::Null);
+
+    let mut base = builtin::default_colors();
+    if let Some(name) = preset.as_str() {
+        let _ = builtin::apply_preset(name, &mut base);
+    }
+
+    let mut overrides = serde_json::Map::new();
+    for &t in Token::ALL {
+        let cur = settings.theme.color(t);
+        let def = base.get(&t).copied().unwrap_or(Color::Reset);
+        if cur != def {
+            overrides.insert(token_name(t), serde_json::json!(fmt_color(cur)));
+        }
+    }
+
+    let json_root = serde_json::json!({
+        "theme": {
+            "preset": preset,
+            "border": border_name(settings.theme.border),
+                                      "overrides": overrides,
+        },
+        "view": {
+            "mode": settings.view_mode,
+        },
+        "layout": {
+            "cover_dim": settings.layout.cover_dim,
+            "spiral_aspect_x": settings.layout.spiral_aspect_x,
+            "spiral_max_h": settings.layout.spiral_max_h,
+            "min_col_w": settings.layout.min_col_w,
+            "max_col_w": settings.layout.max_col_w,
+            "lookback_lines": settings.layout.lookback_lines,
+            "playhead_marker": settings.layout.playhead_marker,
+            "help_glyph": settings.layout.help_glyph,
+        },
+        "labels": {
+            "accent_number": settings.labels.accent_number,
+            "accent_fn": settings.labels.accent_fn,
+            "accent_instance": settings.labels.accent_instance,
+        },
+        "synesthesia": {
+            "enabled": settings.synesthesia.enabled,
+            "hue_step": settings.synesthesia.hue_step,
+            "saturation_from_volume": settings.synesthesia.saturation_from_volume,
+            "saturation_scale": settings.synesthesia.saturation_scale,
+            "value": settings.synesthesia.value,
+        },
+        "notch": {
+            "help_icon": settings.notch.help_icon,
+            "settings_icon": settings.notch.settings_icon,
+            "analysis_icon": settings.notch.analysis_icon,
+            "perf_icon": settings.notch.perf_icon,
+            "mixer_icon": settings.notch.mixer_icon,
+            "help_color": settings.notch.help_color,
+            "settings_color": settings.notch.settings_color,
+            "analysis_color": settings.notch.analysis_color,
+            "perf_color": settings.notch.perf_color,
+            "mixer_color": settings.notch.mixer_color,
+        },
+    });
+
+    std::fs::write(&path, serde_json::to_string_pretty(&json_root)?)?;
+    Ok(())
 }

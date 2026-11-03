@@ -68,6 +68,7 @@ pub(crate) struct Project {
     pub(crate) total_samples: i64,
     pub(crate) song_volume: f64,
     pub(crate) linear_pan: bool,
+    pub(crate) stereo_width: f32, // <--- NEW
     pub(crate) sample_rate: u32,
     pub(crate) title: String,
     pub(crate) initial_bpm: f64,
@@ -109,6 +110,7 @@ impl Project {
             total_samples: 0,
             song_volume: 1.0,
             linear_pan: false,
+            stereo_width: 1.0, // <--- NEW
             sample_rate,
             title: "(no song)".into(),
             initial_bpm: 120.0,

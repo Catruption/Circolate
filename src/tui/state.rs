@@ -6,7 +6,7 @@ use ratatui::layout::Rect;
 use ratatui::crossterm::event::KeyCode;
 
 use crate::tui::config::Settings;
-use crate::tui::widgets::config::ConfigUi;
+use crate::tui::widgets::notch::config::ConfigUi;
 use crate::tui::widgets::cover::Cover;
 use crate::tui::spiral::SpiralLayout;
 use crate::tui::layout::QueueLayout;
@@ -65,6 +65,7 @@ pub struct PlayerState {
     pub last_left_click: Option<(Instant, u16, u16)>,
     pub last_reload_count: i64,
     pub reload_flash_until: Option<Instant>,
+    pub show_mixer: bool, // <--- NEW
 }
 
 #[derive(Debug, Clone, Default)]
@@ -262,6 +263,7 @@ pub enum NotchTag {
     Settings,
     Analysis,
     Perf,
+    Mixer, // <--- NEW
 }
 
 #[derive(Debug, Clone)]

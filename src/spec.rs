@@ -559,6 +559,8 @@ pub struct ConfigKey {
 }
 
 pub const CONFIG_KEYS: &[ConfigKey] = &[
+    ConfigKey { key: "PanningLaw", ty: "linear | equal_power", default: "equal_power", doc: "How pan maps to left/right gain.", parsed: true },
+ConfigKey { key: "StereoWidth", ty: "number", default: "1.0", doc: "Mid/Side stereo widening. 1.0 is normal, 1.5 is wide, 2.0 is very wide.", parsed: true }, // <--- NEW
     ConfigKey { key: "HalotextVersion", ty: "number", default: "-", doc: "Format version the file was written for.", parsed: false },
 ConfigKey { key: "BeatsPerMinute", ty: "number", default: "120", doc: "Starting tempo. Time-varying tempo is the `ƒTempo` shim.", parsed: true },
 ConfigKey { key: "TimeSignature", ty: "a/b", default: "4/4", doc: "Time signature.", parsed: true },

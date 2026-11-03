@@ -50,13 +50,12 @@ macro_rules! tui_dbg {
 
 // ── terminal lifecycle ─────────────────────────────────────────────────
 
-// FIXED: Use /dev/tty directly so we can silence fd 1 (stdout) without breaking the TUI.
+// Use /dev/tty directly so we can silence fd 1 (stdout) without breaking the TUI.
 pub type TuiBackend = CrosstermBackend<std::fs::File>;
 
 pub fn setup() -> Result<Terminal<TuiBackend>> {
     enable_raw_mode()?;
 
-    // Open the terminal directly, bypassing fd 1
     let out = std::fs::OpenOptions::new()
     .read(true)
     .write(true)
@@ -141,6 +140,7 @@ pub fn show_loading(
                       reload_count: std::sync::atomic::AtomicI64::new(0),
                       loop_next: std::sync::atomic::AtomicBool::new(false),
                       loop_wraps: std::sync::atomic::AtomicI64::new(0),
+                      stereo_width: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), // Added
     });
     let project = Arc::new(Project::empty(44100));
     let mut state = RenderState::new(queue.clone(), settings.clone());
@@ -231,14 +231,14 @@ fn event_loop(
             crate::log_event!(
                 "player.perf",
                 load: format!("{:.3}", snap.load),
-                worst: format!("{:.3}", snap.worst),
-                overruns: snap.overruns,
-                voices: format!("{:.3}", snap.voices),
-                vst: format!("{:.3}", snap.vst),
-                shim: format!("{:.3}", snap.shim),
-                fx: format!("{:.3}", snap.fx),
-                ui_draw_ms: format!("{:.3}", snap.ui_avg_ms),
-                ui_draw_worst_ms: format!("{:.3}", snap.ui_worst_ms),
+                              worst: format!("{:.3}", snap.worst),
+                              overruns: snap.overruns,
+                              voices: format!("{:.3}", snap.voices),
+                              vst: format!("{:.3}", snap.vst),
+                              shim: format!("{:.3}", snap.shim),
+                              fx: format!("{:.3}", snap.fx),
+                              ui_draw_ms: format!("{:.3}", snap.ui_avg_ms),
+                              ui_draw_worst_ms: format!("{:.3}", snap.ui_worst_ms),
             );
             state.perf_snapshot = Some(snap);
             state.perf_last_poll = perf_now;
@@ -285,184 +285,197 @@ fn event_loop(
             }
         }
 
-        // TICK_MS is a frame period, not an extra delay after rendering.
-        // Poll only for the remaining frame budget; otherwise a 50 ms draw
-        // accidentally turns the nominal 20 FPS loop into 10 FPS.
         if event::poll(tick.saturating_sub(frame_started.elapsed()))? {
-            // Drain already-queued input before the next render. One event per
-            // frame lets key-repeat/mouse bursts build an unbounded UI backlog.
             for event_idx in 0..64 {
                 if event_idx > 0 && !event::poll(Duration::ZERO)? {
                     break;
                 }
                 match event::read()? {
-                Event::Key(k) => {
-                    let is_ctrl_c = k.code == KeyCode::Char('c')
-                    && k.modifiers.contains(KeyModifiers::CONTROL);
+                    Event::Key(k) => {
+                        let is_ctrl_c = k.code == KeyCode::Char('c')
+                        && k.modifiers.contains(KeyModifiers::CONTROL);
 
-                    // ── ANALYSIS MODAL ──
-                    if k.kind != KeyEventKind::Release {
-                        if state.player.show_analysis {
-                            if k.code == KeyCode::Esc
-                                || k.code == KeyCode::Char('A')
-                                || k.code == KeyCode::Char('a')
-                                || k.code == KeyCode::Char('q')
+                        // ── ANALYSIS MODAL ──
+                        if k.kind != KeyEventKind::Release {
+                            if state.player.show_analysis {
+                                if k.code == KeyCode::Esc
+                                    || k.code == KeyCode::Char('A')
+                                    || k.code == KeyCode::Char('a')
+                                    || k.code == KeyCode::Char('q')
+                                    {
+                                        state.player.show_analysis = false;
+                                        continue;
+                                    }
+                            } else if (k.code == KeyCode::Char('A') || k.code == KeyCode::Char('a'))
+                                && !state.queue.focused
                                 {
-                                    state.player.show_analysis = false;
+                                    state.player.show_analysis = true;
+                                    state.player.show_help = false;
+                                    state.player.show_config = false;
+                                    state.player.show_perf = false;
                                     continue;
                                 }
-                        } else if (k.code == KeyCode::Char('A') || k.code == KeyCode::Char('a'))
-                            && !state.queue.focused
-                            {
-                                state.player.show_analysis = true;
-                                state.player.show_help = false;
-                                state.player.show_config = false;
-                                state.player.show_perf = false;
-                                continue;
-                            }
-                    }
-                    // ────────────────────
+                        }
+                        // ────────────────────
 
-                    if project.voice_count == 0 {
-                        if state.queue.focused
-                            && state.menu.edit_mode.is_none()
-                            && k.kind != KeyEventKind::Release
-                            {
-                                handle_queue_key(k.code, k.modifiers, state);
-                                continue;
-                            }
+                        if project.voice_count == 0 {
+                            if state.queue.focused
+                                && state.menu.edit_mode.is_none()
+                                && k.kind != KeyEventKind::Release
+                                {
+                                    handle_queue_key(k.code, k.modifiers, state);
+                                    continue;
+                                }
 
-                            if k.kind == KeyEventKind::Press {
-                                if let Some(edit_idx) = state.menu.edit_mode {
-                                    match k.code {
-                                        KeyCode::Esc => state.menu.edit_mode = None,
-                                        KeyCode::Enter => state.menu.edit_mode = None,
-                                        KeyCode::Char(c) => state.menu.directories[edit_idx].push(c),
-                                        KeyCode::Backspace => { state.menu.directories[edit_idx].pop(); },
-                                        _ => {}
-                                    }
-                                } else {
-                                    match k.code {
-                                        KeyCode::Char('q') => return Ok(LoopOutcome::Quit),
-                                        KeyCode::Up => {
-                                            if state.menu.selected_index > 0 { state.menu.selected_index -= 1; }
+                                if k.kind == KeyEventKind::Press {
+                                    if let Some(edit_idx) = state.menu.edit_mode {
+                                        match k.code {
+                                            KeyCode::Esc => state.menu.edit_mode = None,
+                                            KeyCode::Enter => state.menu.edit_mode = None,
+                                            KeyCode::Char(c) => state.menu.directories[edit_idx].push(c),
+                                            KeyCode::Backspace => { state.menu.directories[edit_idx].pop(); },
+                                            _ => {}
                                         }
-                                        KeyCode::Down => {
-                                            if state.menu.selected_index < 3 { state.menu.selected_index += 1; }
-                                        }
-                                        KeyCode::Enter => {
-                                            match state.menu.selected_index {
-                                                0 => {
-                                                    if let Some(p) = crate::pick::pick_file(
-                                                        &crate::paths::user_halotexts(),
-                                                                                            crate::pick::FILTER_HALOTEXT,
-                                                                                            "Open Halotext",
-                                                    ) {
-                                                        return Ok(LoopOutcome::Next(p.to_string_lossy().into_owned()));
-                                                    }
-                                                }
-                                                1 => {
-                                                    if let Some(p) = crate::pick::pick_file(
-                                                        &crate::paths::user_halotexts(),
-                                                                                            crate::pick::FILTER_HALOTEXT,
-                                                                                            "Dump Halotext",
-                                                    ) {
-                                                        let path_str = p.to_string_lossy().into_owned();
-                                                        crate::log_event!("tui.menu.dump_started", path: path_str.clone());
-                                                        std::thread::spawn(move || {
-                                                            let result = crate::dump::run(&[path_str.clone()]);
-                                                            match result {
-                                                                Ok(_) => crate::log_event!("tui.menu.dump_ok", path: path_str),
-                                                                           Err(e) => crate::log_event!("tui.menu.dump_failed", err: format!("{:#}", e)),
-                                                            }
-                                                        });
-                                                    }
-                                                }
-                                                2 => {
-                                                    if let Some(p) = crate::pick::pick_file(
-                                                        &crate::paths::export_dir(),
-                                                                                            crate::pick::FILTER_SOURCE,
-                                                                                            "Export Source",
-                                                    ) {
-                                                        let path_str = p.to_string_lossy().into_owned();
-                                                        crate::log_event!("tui.menu.export_started", path: path_str.clone());
-                                                        std::thread::spawn(move || {
-                                                            let result = crate::export::run(&[path_str.clone()]);
-                                                            match result {
-                                                                Ok(_) => crate::log_event!("tui.menu.export_ok", path: path_str),
-                                                                           Err(e) => crate::log_event!("tui.menu.export_failed", err: format!("{:#}", e)),
-                                                            }
-                                                        });
-                                                    }
-                                                }
-                                                3 => {
-                                                    state.menu.edit_mode = Some(0);
-                                                    state.queue.focused = false;
-                                                }
-                                                _ => {}
+                                    } else {
+                                        match k.code {
+                                            KeyCode::Char('q') => return Ok(LoopOutcome::Quit),
+                                            KeyCode::Up => {
+                                                if state.menu.selected_index > 0 { state.menu.selected_index -= 1; }
                                             }
+                                            KeyCode::Down => {
+                                                if state.menu.selected_index < 3 { state.menu.selected_index += 1; }
+                                            }
+                                            KeyCode::Enter => {
+                                                match state.menu.selected_index {
+                                                    0 => {
+                                                        if let Some(p) = crate::pick::pick_file(
+                                                            &crate::paths::user_halotexts(),
+                                                                                                crate::pick::FILTER_HALOTEXT,
+                                                                                                "Open Halotext",
+                                                        ) {
+                                                            return Ok(LoopOutcome::Next(p.to_string_lossy().into_owned()));
+                                                        }
+                                                    }
+                                                    1 => {
+                                                        if let Some(p) = crate::pick::pick_file(
+                                                            &crate::paths::user_halotexts(),
+                                                                                                crate::pick::FILTER_HALOTEXT,
+                                                                                                "Dump Halotext",
+                                                        ) {
+                                                            let path_str = p.to_string_lossy().into_owned();
+                                                            crate::log_event!("tui.menu.dump_started", path: path_str.clone());
+                                                            std::thread::spawn(move || {
+                                                                let result = crate::dump::run(&[path_str.clone()]);
+                                                                match result {
+                                                                    Ok(_) => crate::log_event!("tui.menu.dump_ok", path: path_str),
+                                                                               Err(e) => crate::log_event!("tui.menu.dump_failed", err: format!("{:#}", e)),
+                                                                }
+                                                            });
+                                                        }
+                                                    }
+                                                    2 => {
+                                                        if let Some(p) = crate::pick::pick_file(
+                                                            &crate::paths::export_dir(),
+                                                                                                crate::pick::FILTER_SOURCE,
+                                                                                                "Export Source",
+                                                        ) {
+                                                            let path_str = p.to_string_lossy().into_owned();
+                                                            crate::log_event!("tui.menu.export_started", path: path_str.clone());
+                                                            std::thread::spawn(move || {
+                                                                let result = crate::export::run(&[path_str.clone()]);
+                                                                match result {
+                                                                    Ok(_) => crate::log_event!("tui.menu.export_ok", path: path_str),
+                                                                               Err(e) => crate::log_event!("tui.menu.export_failed", err: format!("{:#}", e)),
+                                                                }
+                                                            });
+                                                        }
+                                                    }
+                                                    3 => {
+                                                        state.menu.edit_mode = Some(0);
+                                                        state.queue.focused = false;
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                continue;
+                        }
+
+                        let typing = state.queue.focused
+                        && !state.player.show_help
+                        && !state.player.show_config
+                        && !state.player.show_mixer
+                        && !state.player.show_perf
+                        && !is_ctrl_c;
+
+                        if !typing
+                            && !state.player.show_mixer
+                            && !state.player.show_config
+                            && k.kind == KeyEventKind::Press
+                            && matches!(k.code, KeyCode::Left | KeyCode::Right)
+                            {
+                                handle_direction(k.code, state, tp);
+                            }
+
+                            if k.kind != KeyEventKind::Release {
+                                if state.player.show_config {
+                                    let action = crate::tui::widgets::notch::config::handle_key(
+                                        k.code,
+                                        k.modifiers,
+                                        &mut state.config_ui,
+                                        &mut state.settings,
+                                    );
+                                    if matches!(
+                                        action,
+                                        crate::tui::widgets::notch::config::Action::Close
+                                    ) {
+                                        state.player.show_config = false;
+                                    }
+                                } else if state.player.show_mixer {
+                                    match k.code {
+                                        KeyCode::Esc | KeyCode::Char('q') => state.player.show_mixer = false,
+                                        KeyCode::Left => {
+                                            let cur = f32::from_bits(tp.stereo_width.load(Ordering::Relaxed));
+                                            let next = (cur - 0.05).max(0.0);
+                                            tp.stereo_width.store(next.to_bits(), Ordering::Release);
+                                        }
+                                        KeyCode::Right => {
+                                            let cur = f32::from_bits(tp.stereo_width.load(Ordering::Relaxed));
+                                            let next = (cur + 0.05).min(3.0);
+                                            tp.stereo_width.store(next.to_bits(), Ordering::Release);
                                         }
                                         _ => {}
                                     }
-                                }
+                                } else if typing {
+                                    handle_queue_key(k.code, k.modifiers, state);
+                                } else if state.player.show_perf
+                                    && (k.code == KeyCode::Esc
+                                    || k.code == KeyCode::Char('q')
+                                    || is_ctrl_c)
+                                    {
+                                        state.player.show_perf = false;
+                                    } else if state.player.show_help
+                                        && (k.code == KeyCode::Esc
+                                        || k.code == KeyCode::Char('q')
+                                        || is_ctrl_c)
+                                        {
+                                            state.player.show_help = false;
+                                        } else if is_ctrl_c {
+                                            return Ok(LoopOutcome::Quit);
+                                        } else if k.code == KeyCode::Char('q') || k.code == KeyCode::Esc {
+                                            return Ok(LoopOutcome::Home);
+                                        } else {
+                                            handle_key(k.code, k.modifiers, tp, project, state);
+                                        }
                             }
-                            continue;
                     }
-
-                    let typing = state.queue.focused
-                    && !state.player.show_help
-                    && !state.player.show_config
-                    && !state.player.show_perf
-                    && !is_ctrl_c;
-
-                    if !typing
-                        && k.kind == KeyEventKind::Press
-                        && matches!(k.code, KeyCode::Left | KeyCode::Right)
-                        {
-                            handle_direction(k.code, state, tp);
-                        }
-
-                        if k.kind != KeyEventKind::Release {
-                            if state.player.show_config {
-                                let action = crate::tui::widgets::config::handle_key(
-                                    k.code,
-                                    k.modifiers,
-                                    &mut state.config_ui,
-                                    &mut state.settings,
-                                );
-                                if matches!(
-                                    action,
-                                    crate::tui::widgets::config::Action::Close
-                                ) {
-                                    state.player.show_config = false;
-                                }
-                            } else if typing {
-                                handle_queue_key(k.code, k.modifiers, state);
-                            } else if state.player.show_perf
-                                && (k.code == KeyCode::Esc
-                                || k.code == KeyCode::Char('q')
-                                || is_ctrl_c)
-                                {
-                                    state.player.show_perf = false;
-                                } else if state.player.show_help
-                                && (k.code == KeyCode::Esc
-                                || k.code == KeyCode::Char('q')
-                                || is_ctrl_c)
-                                {
-                                    state.player.show_help = false;
-                                } else if is_ctrl_c {
-                                    return Ok(LoopOutcome::Quit);
-                                } else if k.code == KeyCode::Char('q') || k.code == KeyCode::Esc {
-                                    return Ok(LoopOutcome::Home);
-                                } else {
-                                    handle_key(k.code, k.modifiers, tp, project, state);
-                                }
-                        }
-                }
-                Event::Mouse(m) => handle_mouse(m, tp, project, state),
-                other => {
-                    tui_dbg!("[event] {:?}", other);
-                }
+                    Event::Mouse(m) => handle_mouse(m, tp, project, state),
+                    other => {
+                        tui_dbg!("[event] {:?}", other);
+                    }
                 }
             }
         }
@@ -561,6 +574,15 @@ fn handle_key(
                 state.player.show_help = false;
                 state.player.show_config = false;
                 state.player.show_analysis = false;
+            }
+        }
+        KeyCode::Char('x') => {
+            state.player.show_mixer = !state.player.show_mixer;
+            if state.player.show_mixer {
+                state.player.show_help = false;
+                state.player.show_config = false;
+                state.player.show_analysis = false;
+                state.player.show_perf = false;
             }
         }
         KeyCode::Char('L') => {
@@ -687,7 +709,6 @@ fn handle_mouse(m: MouseEvent, tp: &Arc<Transport>, p: &Project, state: &mut Ren
         _ => return,
     };
 
-    // 1. Queue first. If hit_from_queue returns Some(), we handle it and return.
     if let Some(action) = hit_from_queue(state, m) {
         if matches!(button, MouseButton::Left) {
             state.queue.focused = true;
@@ -706,7 +727,6 @@ fn handle_mouse(m: MouseEvent, tp: &Arc<Transport>, p: &Project, state: &mut Ren
             HitAction::QueueLine { row, col } => {
                 if matches!(button, MouseButton::Left) {
                     state.queue.cursor.row = row;
-                    // Clamp column to the actual text length so typing works
                     let text_len = state.queue.lines.get(row).map(|l| l.text.chars().count()).unwrap_or(0);
                     state.queue.cursor.col = col.min(text_len);
                 }
