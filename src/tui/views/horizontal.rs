@@ -83,6 +83,10 @@ pub fn draw(
 
     let mut columns: Vec<Vec<ColumnLine>> = Vec::with_capacity(visible_cols);
     let mut column_rows_hit: Vec<Vec<Option<(usize, i64)>>> = Vec::with_capacity(visible_cols);
+    // Parallel to `columns`. `Some(highlight)` marks a block-title divider to
+    // be drawn with label syntax: highlighted for the current measure, classic
+    // grey for a previous one. `None` is a note row or a plain divider (shims).
+    let mut column_hl: Vec<Vec<Option<bool>>> = Vec::with_capacity(visible_cols);
 
     for col in 0..visible_cols {
         let part = &prep.parts[col];
@@ -91,6 +95,7 @@ pub fn draw(
 
         let mut entries: Vec<ColumnLine> = Vec::with_capacity(part.notes.len() + chain_rows + 4);
         let mut entries_bl: Vec<Option<(usize, i64)>> = Vec::with_capacity(part.notes.len() + chain_rows + 4);
+        let mut entries_hl: Vec<Option<bool>> = Vec::with_capacity(part.notes.len() + chain_rows + 4);
 
         if chain_rows > 0 {
             for (ci, name) in part.shim_names.iter().enumerate() {
@@ -103,25 +108,31 @@ pub fn draw(
                 } else { text };
                 entries.push(ColumnLine::Divider { label: truncated });
                 entries_bl.push(None);
+                entries_hl.push(None);
             }
         }
 
-        let mut last_name: Option<String> = None;
+        // Block-boundary dividers. The first group has no divider: the
+        // column header row carries its title. Every later group gets one.
+        let mut last_block: Option<(String, usize)> = None;
         for (note_idx, pnote) in part.notes.iter().enumerate() {
-            let name = &pnote.dn.source_name;
-            let at_start = last_name.is_none();
-            let changed = last_name.as_deref() != Some(name.as_str());
-            let is_header = part.first_name == *name;
-            if (at_start || changed) && !is_header {
-                entries.push(ColumnLine::Divider { label: name.clone() });
+            let key = (pnote.dn.source_name.clone(), pnote.block_line);
+            let changed = last_block.as_ref().map_or(false, |prev| prev != &key);
+            if changed {
+                let label = pnote.block_title.clone();
+                entries.push(ColumnLine::Divider { label });
                 entries_bl.push(None);
+                entries_hl.push(Some(pnote.dn.value_offset <= 0.0));
             }
             entries.push(ColumnLine::Note(note_idx));
             entries_bl.push(Some((pnote.block_line, pnote.start_row)));
-            last_name = Some(name.clone());
+            entries_hl.push(None);
+            last_block = Some(key);
         }
+
         columns.push(entries);
         column_rows_hit.push(entries_bl);
+        column_hl.push(entries_hl);
     }
 
     if state.last_synth_env.len() < visible_cols {
@@ -234,8 +245,16 @@ pub fn draw(
 
     for col in 0..visible_cols {
         let part = &prep.parts[col];
-        let label_text = p.line_block_title(li, &part.first_name)
-        .unwrap_or(&part.first_name).to_string();
+
+        // The header row is the title of the first (oldest) group in the
+        // column. Previous measure: classic grey syntax. Current: highlighted.
+        let first_note = part.notes.first();
+        let header_is_previous = first_note.map_or(false, |n| n.dn.value_offset > 0.0);
+        let label_text = match first_note {
+            Some(n) => n.block_title.clone(),
+            None => p.line_block_title(li, &part.first_name)
+            .unwrap_or(&part.first_name).to_string(),
+        };
 
         let has_chain = !part.shim_names.is_empty();
         let expanded = state.expanded_chains.contains(part.path.as_str());
@@ -261,7 +280,7 @@ pub fn draw(
         let padded = format!("{:<width$}", trimmed, width = fill);
 
         let mut label_len = 0usize;
-        for span in label::split(&padded, style, &theme, &labels_cfg, part.is_playing_now) {
+        for span in label::split(&padded, style, &theme, &labels_cfg, !header_is_previous) {
             let sw = span.content.chars().count();
             if label_len + sw <= fill {
                 label_len += sw;
@@ -309,64 +328,106 @@ pub fn draw(
         x_cursor += col_w as u16 + 1;
     }
 
+    // Pre-calculate playhead character rows for each column, accounting for
+    // dividers which consume char rows but not pixel rows.
+    let mut playhead_chars = vec![None; visible_cols];
+    for col in 0..visible_cols {
+        if let Some(py) = playhead_pys[col] {
+            let mut divs = 0;
+            for r in 0..char_rows {
+                let is_divider = matches!(columns[col].get(r), Some(ColumnLine::Divider { .. }));
+                if is_divider {
+                    divs += 1;
+                    continue;
+                }
+                let py_start = (r as i32 - divs as i32) * 4;
+                if py_start >= 0 && (py_start as usize) <= py && py < (py_start as usize + 4) {
+                    playhead_chars[col] = Some(r);
+                    break;
+                }
+            }
+        }
+    }
+
     let mut lines: Vec<Line> = Vec::with_capacity(char_rows + 1);
     lines.push(Line::from(header));
+
+    let mut divs_above = vec![0usize; visible_cols];
 
     for r in 0..char_rows {
         let mut spans: Vec<Span> = Vec::new();
         for col in 0..visible_cols {
             let part = &prep.parts[col];
-            let chain_rows = if state.expanded_chains.contains(part.path.as_str()) {
-                part.shim_names.len()
-            } else { 0 };
 
             let solo_hides_col = part.is_soloed_out;
-            let playhead_char = playhead_pys[col].map(|py| py / 4 + chain_rows);
+            let col_off = part.is_muted || solo_hides_col;
+            let playhead_char = playhead_chars[col];
 
-            // Resolve and format the row once per part. The old cell loop
-            // repeated a note search, formatting, and chars().nth() per cell.
-            let (cell_text, text_style, is_note_muted) = match columns[col].get(r) {
+            let mut text_len = 0usize;
+            let mut is_divider = false;
+            let mut is_note_muted = false;
+
+            match columns[col].get(r) {
                 Some(ColumnLine::Note(note_idx)) => {
                     let pn = &part.notes[*note_idx];
-                    (Some(fmt_note(&pn.dn.note, pn.lookup_row, pn.dn.subs, pn.note_state)), Some(pn.style), pn.is_muted)
+                    is_note_muted = pn.is_muted;
+                    let full = fmt_note(&pn.dn.note, pn.lookup_row, pn.dn.subs, pn.note_state);
+                    text_len = full.chars().count().min(col_w);
+                    if text_len > 0 {
+                        let style = if col_off || is_note_muted {
+                            Style::default().fg(muted_fg).bg(muted_bg)
+                        } else if playhead_char == Some(r) {
+                            pn.style.fg(playhead_fg)
+                        } else {
+                            pn.style
+                        };
+                        let text: String = full.chars().take(text_len).collect();
+                        spans.push(Span::styled(text, style));
+                    }
                 }
-                Some(ColumnLine::Divider { label }) => (
-                    Some(label.clone()),
-                                                        Some(Style::default().fg(ratatui::style::Color::DarkGray).add_modifier(Modifier::ITALIC)),
-                                                        false,
-                ),
-                None => (None, None, false),
-            };
-            let text_len = cell_text.as_ref().map_or(0, |text| text.chars().count().min(col_w));
-            if text_len > 0 {
-                let base_style = text_style.unwrap_or_default();
-                let style = if part.is_muted || solo_hides_col || is_note_muted {
-                    Style::default().fg(muted_fg).bg(muted_bg)
-                } else if playhead_char == Some(r) {
-                    base_style.fg(playhead_fg)
-                } else {
-                    base_style
-                };
-                let text: String = cell_text.as_ref().unwrap().chars().take(text_len).collect();
-                spans.push(Span::styled(text, style));
+                Some(ColumnLine::Divider { label: divider_label }) => {
+                    is_divider = true;
+                    let text: String = divider_label.chars().take(col_w).collect();
+                    text_len = text.chars().count();
+                    if text_len > 0 {
+                        let base = label::header_style(&part.path, &HashSet::new(), None, &theme);
+                        match column_hl[col].get(r).copied().flatten() {
+                            Some(highlight) if !col_off => {
+                                spans.extend(label::split(&text, base, &theme, &labels_cfg, highlight));
+                            }
+                            _ => {
+                                let style = if col_off {
+                                    Style::default().fg(muted_fg).bg(muted_bg)
+                                } else {
+                                    base
+                                };
+                                spans.push(Span::styled(text, style));
+                            }
+                        }
+                    }
+                }
+                None => {}
             }
 
+            let py_start = (r as i32 - divs_above[col] as i32) * 4;
+            let dot_width = col_w * 2;
             for cx in text_len..col_w {
                 let mut bits: u8 = 0;
-                for ly in 0..4 {
-                    let py_signed = (r as i32 - chain_rows as i32) * 4 + ly as i32;
-                    if py_signed < 0 { continue; }
-                    let py = py_signed as usize;
-                    if py >= pixel_rows { continue; }
-                    let px0 = cx * 2;
-                    let px1 = cx * 2 + 1;
-                    let dot_width = col_w * 2;
-                    if px0 < dot_width && state.dot_matrices[col][py * dot_width + px0] { bits |= dot_bit(0, ly); }
-                    if px1 < dot_width && state.dot_matrices[col][py * dot_width + px1] { bits |= dot_bit(1, ly); }
+                if !is_divider {
+                    for ly in 0..4 {
+                        let py_signed = py_start + ly as i32;
+                        if py_signed < 0 { continue; }
+                        let py = py_signed as usize;
+                        if py >= pixel_rows { continue; }
+                        let px0 = cx * 2;
+                        let px1 = cx * 2 + 1;
+                        if px0 < dot_width && state.dot_matrices[col][py * dot_width + px0] { bits |= dot_bit(0, ly); }
+                        if px1 < dot_width && state.dot_matrices[col][py * dot_width + px1] { bits |= dot_bit(1, ly); }
+                    }
                 }
 
                 let under_playhead = playhead_char == Some(r);
-                let off = part.is_muted || solo_hides_col || is_note_muted;
+                let off = col_off || is_note_muted;
 
                 if bits != 0 {
                     let ch = braille_str(bits);
@@ -387,6 +448,10 @@ pub fn draw(
                 }
             }
             spans.push(Span::raw(" "));
+
+            if is_divider {
+                divs_above[col] += 1;
+            }
         }
         lines.push(Line::from(spans));
     }

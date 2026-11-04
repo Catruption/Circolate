@@ -73,7 +73,7 @@ pub fn note_style(
     state: NoteState,
     theme: &Theme,
     synth: &SynesthesiaConfig,
-    is_motion_highlight: bool, // NEW: X-Ray flag
+    is_motion_highlight: bool, // X-Ray flag
 ) -> Style {
     match state {
         NoteState::Playing => {

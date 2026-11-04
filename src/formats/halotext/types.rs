@@ -5,13 +5,20 @@ use std::collections::HashMap;
 
 // ── events ─────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct HalotextWaypoint {
+    pub row: f64,
+    pub pitch_midi: Option<i32>,
+    pub vol: Option<f64>,
+    pub pan: Option<f64>,
+    pub ramp_beats: Option<f64>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct HalotextEvent {
     pub op: String,
     pub row: f64,
-    /// One-based line number in the source Halotext file.
     pub source_line: usize,
-    /// Zero-based UTF-8 byte columns for editor integrations.
     pub source_byte_column: usize,
     pub source_end_byte_column: usize,
     pub pitch_midi: Option<i32>,
@@ -31,6 +38,7 @@ pub struct HalotextEvent {
     pub mod_y: Option<i16>,
     pub lyric: Option<String>,
     pub raw: String,
+    pub waypoints: Vec<HalotextWaypoint>,
 }
 
 impl HalotextEvent {
@@ -42,7 +50,6 @@ impl HalotextEvent {
 // ── parts ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
-#[allow(dead_code)]
 pub struct HalotextPart {
     pub name: String,
     pub sample_path: String,
@@ -62,17 +69,16 @@ pub struct HalotextPart {
     pub default_pan: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_dur: Option<f64>,
+    /// Default shim chain declared on the part header:
+    /// `ƒX(<...>)@<ƒEQ2(), ƒReverb2()>[ ... ]`.
+    /// Applies to every call of this part unless the call carries its own
+    /// shims (override) or `@<>` (bypass).  `line` is 0 and
+    /// `attached_call` is None on these.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub shims: Vec<ShimEvent>,
 }
 
 impl HalotextPart {
-    /// Composite SF2 lookup key.  Returns `sample_path` unchanged for
-    /// non-SF2 parts; appends `#preset` (or `#bank:preset` for nonzero
-    /// banks) for `.sf2` parts so multiple parts sharing one soundfont
-    /// but different presets resolve to distinct instruments.
-    ///
-    /// The format here must match the key construction in
-    /// `player::project::loader` (which inserts these keys) and
-    /// `player::template` (which reads them).
     pub fn sf2_key(&self) -> String {
         if !self.sample_path.ends_with(".sf2") {
             return self.sample_path.clone();
@@ -112,6 +118,25 @@ pub struct ShimWaypoint {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct Shim {
+    pub target: String,
+    pub params: Vec<ShimParam>,
+    pub waypoints: Vec<ShimWaypoint>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ShimChain(pub Vec<Shim>);
+
+impl ShimChain {
+    pub fn push(&mut self, shim: Shim) {
+        self.0.push(shim);
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ShimEvent {
     pub line: usize,
     pub row: f64,
@@ -123,7 +148,6 @@ pub struct ShimEvent {
     pub pan: f64,
     pub attached_call: Option<usize>,
     pub waypoints: Vec<ShimWaypoint>,
-    // Property-shim fields for `ƒTempo` and future `ƒGlobal*`:
     pub property: String,
     pub start_value: f64,
     pub op: String,
@@ -133,8 +157,6 @@ pub struct ShimEvent {
 }
 
 impl ShimEvent {
-    /// Effective start row of the shim's window.  For call-attached shims
-    /// the row is 0 until the BlockList cursor is resolved by the loader.
     pub fn effective_row(&self) -> f64 {
         self.row
     }
@@ -146,6 +168,9 @@ impl ShimEvent {
 pub struct BlockCall {
     pub name: String,
     pub selections: Vec<MeasureSelection>,
+    /// `@<>` on the call: explicitly no effects, ignoring the part's
+    /// declaration chain.
+    pub bypass_shims: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -165,7 +190,6 @@ pub struct CallOverrides {
 // ── notes ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
-#[allow(dead_code)]
 pub struct NoteEvent {
     pub row: f64,
     pub pitch: i32,
@@ -181,14 +205,13 @@ pub struct NoteEvent {
 // ── config ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
-#[allow(dead_code)]
 pub struct Config {
     pub bpm: f64,
     pub subdivisions: u32,
     pub time_signature: (u32, u32),
     pub song_volume: f64,
     pub panning_law: String,
-    pub stereo_width: f32, // <--- NEW
+    pub stereo_width: f32,
     pub raw: HashMap<String, String>,
 }
 
@@ -200,7 +223,7 @@ impl Default for Config {
             time_signature: (4, 4),
             song_volume: 100.0,
             panning_law: "equal_power".into(),
-            stereo_width: 1.0, // <--- NEW
+            stereo_width: 1.0,
             raw: HashMap::new(),
         }
     }
@@ -233,15 +256,56 @@ pub struct FallbackSpec {
 // ── top-level file ─────────────────────────────────────────────────────
 
 #[derive(Debug, Default, Serialize)]
-#[allow(dead_code)]
 pub struct HalotextFile {
     pub config: Config,
     pub tempo_events: Vec<(f64, f64, f64)>,
     pub block_list: Vec<Vec<BlockCall>>,
+    /// Call-level shims only (overrides, plus standalone shims).  The
+    /// part-level defaults live on `HalotextPart::shims`.
     pub shims: Vec<ShimEvent>,
     pub blocks: HashMap<String, Vec<String>>,
     pub parts: HashMap<String, HalotextPart>,
     pub notes: Vec<NoteEvent>,
     pub lyrics: Vec<LyricEvent>,
     pub fallbacks: HashMap<String, FallbackSpec>,
+}
+
+impl HalotextFile {
+    /// Call-level shims with part declaration chains resolved.
+    ///
+    /// Consumers (player, views) should use this instead of `shims`:
+    /// a call with no shims of its own inherits its part's declaration
+    /// chain, a call with its own shims keeps them, and `@<>` (bypass)
+    /// gets none.  `attached_call` is the index into `block_list[line]`.
+    pub fn effective_shims(&self) -> Vec<ShimEvent> {
+        let mut out = self.shims.clone();
+        let own: std::collections::HashSet<(usize, usize)> = self
+        .shims
+        .iter()
+        .filter_map(|s| s.attached_call.map(|c| (s.line, c)))
+        .collect();
+        for (li, line) in self.block_list.iter().enumerate() {
+            for (ci, call) in line.iter().enumerate() {
+                if call.bypass_shims || own.contains(&(li, ci)) {
+                    continue;
+                }
+                let names = self
+                .blocks
+                .get(&call.name)
+                .cloned()
+                .unwrap_or_else(|| vec![call.name.clone()]);
+                for n in names {
+                    if let Some(p) = self.parts.get(&n) {
+                        for s in &p.shims {
+                            let mut s = s.clone();
+                            s.line = li;
+                            s.attached_call = Some(ci);
+                            out.push(s);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
 }

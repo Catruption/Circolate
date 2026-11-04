@@ -14,7 +14,9 @@ use super::events::parse_source_args;
 use super::match_pair;
 use super::next_char_boundary;
 use super::parse_f;
-use super::shim::{find_shim_close, parse_shim_event, parse_shim_waypoint_into};
+use super::shim::{
+    find_shim_close, parse_shim_event_with_default, parse_shim_waypoint_into,
+};
 use super::source_rx;
 use super::split_fields;
 use super::types::{
@@ -41,14 +43,81 @@ pub(crate) fn parse_block_list(body: &str, subs: u32) -> (Vec<Vec<BlockCall>>, V
     (lines, shims)
 }
 
+/// Parse one `@<...>` group starting at `at` (which must point at the
+/// `@`), plus any trailing `&<...>` waypoints.
+///
+/// A single group may contain multiple comma-separated targets:
+///   `@<ƒEQ2(), ƒReverb2()>`           — two shims, no universal fields
+///   `@<§1/1, ~8, ƒEQ2(), ƒReverb2()>` — two shims sharing start/length
+/// Universal fields (anything but `ƒ`) apply to every target in the group.
+/// An empty group, `@<>`, is an explicit bypass.
+///
+/// `default_mix` of None means "wet if attached to a call, dry otherwise".
+///
+/// Returns `(shims, next_pos, is_bypass)`.
+pub(crate) fn parse_shim_group(
+    text: &str,
+    at: usize,
+    line_idx: usize,
+    subs: u32,
+    attached: Option<usize>,
+    default_mix: Option<f64>,
+) -> (Vec<ShimEvent>, usize, bool) {
+    let bytes = text.as_bytes();
+    let inner_start = at + 2;
+    let Some(close) = find_shim_close(text, inner_start) else {
+        return (Vec::new(), text.len(), false);
+    };
+    let inner = &text[inner_start..close];
+    let mut pos = close + 1;
+
+    if inner.trim().is_empty() {
+        return (Vec::new(), pos, true);
+    }
+
+    let mut universal: Vec<String> = Vec::new();
+    let mut targets: Vec<String> = Vec::new();
+    for f in split_fields(inner) {
+        if f.starts_with(FIELD_SOURCE) {
+            targets.push(f);
+        } else if !f.is_empty() {
+            universal.push(f);
+        }
+    }
+
+    let n = targets.len();
+    let dm = default_mix.unwrap_or(if attached.is_some() { 1.0 } else { 0.0 });
+    let mut out = Vec::new();
+
+    for (i, tgt) in targets.into_iter().enumerate() {
+        let synthesized = if universal.is_empty() {
+            tgt
+        } else {
+            format!("{}, {}", universal.join(", "), tgt)
+        };
+        if let Some(mut shim) =
+            parse_shim_event_with_default(&synthesized, line_idx, subs, attached, dm)
+            {
+                // Waypoints attach to the final shim in the group.
+                if i == n - 1 {
+                    while pos < bytes.len() && text[pos..].starts_with("&<") {
+                        let wp_start = pos + 2;
+                        let Some(wp_close) = find_shim_close(text, wp_start) else { break };
+                        parse_shim_waypoint_into(&text[wp_start..wp_close], &mut shim, subs);
+                        pos = wp_close + 1;
+                    }
+                }
+                out.push(shim);
+            }
+    }
+
+    (out, pos, false)
+}
+
 /// Parse one BlockList line into calls and any shims on it.  Each shim
 /// is attached to the most recently parsed call (or None for standalone
-/// shims at the start of a line).
-///
-/// A single `@<...>` may contain multiple comma-separated targets:
-///   `@<ƒEQ2(), ƒReverb2()>` — two shims, no universal fields
-///   `@<§1/1, ~8, ƒEQ2(), ƒReverb2()>` — two shims sharing start/length
-/// Universal fields (anything but `ƒ`) apply to every target in the chain.
+/// shims at the start of a line).  `@<>` after a call marks that call
+/// as bypassing the part's declaration chain.
 fn parse_block_line(text: &str, line_idx: usize, subs: u32) -> (Vec<BlockCall>, Vec<ShimEvent>) {
     let mut calls: Vec<BlockCall> = Vec::new();
     let mut shims: Vec<ShimEvent> = Vec::new();
@@ -68,9 +137,9 @@ fn parse_block_line(text: &str, line_idx: usize, subs: u32) -> (Vec<BlockCall>, 
         if text[pos..].starts_with(FIELD_SOURCE) {
             let after_src = pos + FIELD_SOURCE.len();
             let name_end = text[after_src..]
-                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-' && c != '.')
-                .map(|i| after_src + i)
-                .unwrap_or(text.len());
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-' && c != '.')
+            .map(|i| after_src + i)
+            .unwrap_or(text.len());
             let name = text[after_src..name_end].to_string();
             if name.is_empty() {
                 pos = after_src;
@@ -83,57 +152,22 @@ fn parse_block_line(text: &str, line_idx: usize, subs: u32) -> (Vec<BlockCall>, 
                 selections = parse_call_selections(&text[pos + 1..close]);
                 pos = close + 1;
             }
-            calls.push(BlockCall { name, selections });
+            calls.push(BlockCall { name, selections, bypass_shims: false });
             last_call = Some(calls.len() - 1);
             continue;
         }
 
-        // @<...>  — a shim, possibly with comma-separated targets
+        // @<...>  — a shim group (or `@<>` bypass)
         if text[pos..].starts_with("@<") {
-            let inner_start = pos + 2;
-            let Some(close) = find_shim_close(text, inner_start) else { break };
-            let inner = &text[inner_start..close];
-            pos = close + 1;
-
-            // Split top-level commas. Fields before the first ƒ are
-            // universal; each ƒ-field is a target.
-            let all_fields = split_fields(inner);
-            let mut universal: Vec<String> = Vec::new();
-            let mut targets: Vec<String> = Vec::new();
-            for f in all_fields {
-                if f.starts_with(FIELD_SOURCE) {
-                    targets.push(f);
-                } else if !f.is_empty() {
-                    universal.push(f);
+            let (s, next, bypass) =
+            parse_shim_group(text, pos, line_idx, subs, last_call, None);
+            if bypass {
+                if let Some(ci) = last_call {
+                    calls[ci].bypass_shims = true;
                 }
             }
-
-            let n = targets.len();
-            if n == 0 {
-                continue;
-            }
-
-            for (i, tgt) in targets.into_iter().enumerate() {
-                let synthesized = if universal.is_empty() {
-                    tgt
-                } else {
-                    format!("{}, {}", universal.join(", "), tgt)
-                };
-                if let Some(mut shim) =
-                    parse_shim_event(&synthesized, line_idx, subs, last_call)
-                {
-                    // Waypoints attach to the final shim in the chain.
-                    if i == n - 1 {
-                        while pos < bytes.len() && text[pos..].starts_with("&<") {
-                            let wp_start = pos + 2;
-                            let Some(wp_close) = find_shim_close(text, wp_start) else { break };
-                            parse_shim_waypoint_into(&text[wp_start..wp_close], &mut shim, subs);
-                            pos = wp_close + 1;
-                        }
-                    }
-                    shims.push(shim);
-                }
-            }
+            shims.extend(s);
+            pos = next;
             continue;
         }
 
@@ -186,9 +220,9 @@ fn parse_call_selections(args: &str) -> Vec<MeasureSelection> {
 
 fn parse_call_overrides(text: &str) -> Option<CallOverrides> {
     let inner = text
-        .trim_start_matches('<')
-        .trim_end_matches('>')
-        .trim();
+    .trim_start_matches('<')
+    .trim_end_matches('>')
+    .trim();
     if inner.is_empty() {
         return None;
     }
@@ -248,9 +282,9 @@ pub(crate) fn parse_block_array(
         }
         let name_start = pos + FIELD_SOURCE.len();
         let name_end = body[name_start..]
-            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-' && c != '.')
-            .map(|i| name_start + i)
-            .unwrap_or(body.len());
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-' && c != '.')
+        .map(|i| name_start + i)
+        .unwrap_or(body.len());
         let name = body[name_start..name_end].to_string();
         if name.is_empty() {
             pos = next_char_boundary(body, pos);
@@ -278,9 +312,9 @@ pub(crate) fn parse_block_array(
         // composite
         if !args_str.starts_with('<') {
             let calls: Vec<String> = call_rx
-                .captures_iter(&args_str)
-                .map(|c| c[1].to_string())
-                .collect();
+            .captures_iter(&args_str)
+            .map(|c| c[1].to_string())
+            .collect();
             blocks.insert(name, calls);
             if pos < bytes.len() && bytes[pos] == b';' {
                 pos += 1;
@@ -289,9 +323,9 @@ pub(crate) fn parse_block_array(
         }
 
         let inner = args_str
-            .trim_start_matches('<')
-            .trim_end_matches('>')
-            .trim();
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim();
 
         let mut sample_path = String::new();
         let mut sample_offset: u32 = 0;
@@ -354,6 +388,19 @@ pub(crate) fn parse_block_array(
             }
         }
 
+        // Declaration-header shim chain: `ƒX(<...>)@<ƒA(), ƒB()>[ ... ]`.
+        // Always wet by default (there is no call to attach to).
+        let mut decl_shims: Vec<ShimEvent> = Vec::new();
+        while pos < bytes.len() && body[pos..].starts_with("@<") {
+            let (s, next, _bypass) =
+            parse_shim_group(body, pos, 0, subs_per_beat, None, Some(1.0));
+            decl_shims.extend(s);
+            pos = next;
+            while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+                pos += 1;
+            }
+        }
+
         let args = PartArgs {
             sample_path,
             sample_offset,
@@ -365,6 +412,7 @@ pub(crate) fn parse_block_array(
             default_vol,
             default_pan,
             default_dur,
+            shims: decl_shims,
         };
 
         let mut measures: Vec<Vec<HalotextEvent>> = Vec::new();
@@ -382,7 +430,7 @@ pub(crate) fn parse_block_array(
                 let Some((nb_str, ns_str)) = header.split_once('/') else { break };
                 let (Ok(nb), Ok(ns)) = (
                     nb_str.trim().parse::<u32>(),
-                    ns_str.trim().parse::<u32>(),
+                                        ns_str.trim().parse::<u32>(),
                 ) else { break };
 
                 let (sec_b, sec_s) = if frame_from_args {
@@ -425,7 +473,7 @@ pub(crate) fn parse_block_array(
 
         parts.insert(
             name.clone(),
-            make_part(name, &args, measures, section_lengths),
+                     make_part(name, &args, measures, section_lengths),
         );
         register_sub_blocks(&body_items, &args, &mut parts);
     }

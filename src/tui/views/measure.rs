@@ -28,6 +28,7 @@ pub struct PreparedNote {
     pub note_state: NoteState,
     pub style: Style,
     pub is_muted: bool,
+    pub block_title: String,
 }
 
 pub struct PreparedPart {
@@ -71,20 +72,27 @@ pub fn prepare_measure(
     let current_row = measure_frac * rpmeasure;
 
     // Build by_path from current line + lookback.
-    let mut by_path: HashMap<String, Vec<(String, f64, f64, f64)>> = HashMap::new();
+    let mut by_path: HashMap<String, Vec<(String, f64, f64, f64, String)>> = HashMap::new();
     let mut discovery: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
+    // Current line loop:
     for call in p.line_calls(li) {
         let Some(path) = p.part_path(&call.name) else { continue };
         let key = path.to_string();
         if seen.insert(key.clone()) { discovery.push(key.clone()); }
+        // Derive the section number from where this call starts reading the
+        // pattern. Immune to playhead state (unlike line_block_title).
+        let section_num = (call.pattern_measure_start / rpmeasure).floor() as i32 + 1;
+        let block_title = format!("ƒ{}({})", call.name, section_num);
         by_path.entry(key).or_default().push((
             call.name.clone(), 0.0,
                                               call.pattern_measure_start, call.pattern_measure_len,
+                                              block_title,
         ));
     }
 
+    // Lookback loop:
     for k in 1..=lookback {
         let prev_li = li - k;
         let offset_rows = k as f64 * rpmeasure;
@@ -100,9 +108,12 @@ pub fn prepare_measure(
             if !still_on { continue; }
             let key = path.to_string();
             if seen.insert(key.clone()) { discovery.push(key.clone()); }
+            let section_num = (call.pattern_measure_start / rpmeasure).floor() as i32 + 1;
+            let block_title = format!("ƒ{}({})", call.name, section_num);
             by_path.entry(key).or_default().push((
                 call.name.clone(), offset_rows,
                                                   call.pattern_measure_start, call.pattern_measure_len,
+                                                  block_title,
             ));
         }
     }
@@ -139,7 +150,7 @@ pub fn prepare_measure(
         let first_name = sources[0].0.clone();
 
         let shim_names: Vec<String> = sources.iter()
-        .map(|(_, off, _, _)| li.saturating_sub((off / rpmeasure).round() as usize))
+        .map(|(_, off, _, _, _)| li.saturating_sub((off / rpmeasure).round() as usize))
         .map(|l| p.shims_for_line_path(l, path))
         .find(|v| !v.is_empty())
         .map(|v| v.iter().map(|sh| sh.target.clone()).collect())
@@ -152,7 +163,7 @@ pub fn prepare_measure(
 
         let mut notes: Vec<PreparedNote> = Vec::new();
 
-        for (name, offset_rows, measure_start, measure_len) in sources {
+        for (name, offset_rows, measure_start, measure_len, block_title) in sources {
             let subs = p.part_subs_per_beat(name);
             let is_current = *offset_rows == 0.0;
             let offset_lines = (offset_rows / rpmeasure).round() as usize;
@@ -180,6 +191,11 @@ pub fn prepare_measure(
                 let still_fading = has_vol_waypoints && is_sustained && end_vol > 0.01;
                 if !active && !still_fading { continue; }
 
+                // Past its written end but still audible (volume tail).
+                // Anything that survives the check above and isn't `active`
+                // is one of these.
+                let still_ringing = !active;
+
                 let (display_start, display_end) = if is_current {
                     (note.start_row, note.end_row)
                 } else if active {
@@ -200,15 +216,19 @@ pub fn prepare_measure(
                 let note_local_row = dn.value_offset + current_row;
                 let lookup_row = note_local_row.max(original_start as f64);
 
-                let playing = dn.display_end > 0.0
+                let in_window = dn.display_end > 0.0
                 && dn.display_start <= current_row
                 && current_row < dn.display_end;
+                // A holdover that is still sounding counts as playing, even
+                // when it is only a volume tail.
+                let playing = in_window || still_ringing;
                 let played = !playing
                 && (dn.display_end == 0.0 || current_row >= dn.display_end);
 
+                let is_from_previous = *offset_rows > 0.0;
                 let note_state = if playing {
                     NoteState::Playing
-                } else if played {
+                } else if played && is_from_previous {
                     NoteState::Played
                 } else {
                     NoteState::Waiting
@@ -234,6 +254,7 @@ pub fn prepare_measure(
                     start_row: original_start,
                     lookup_row, note_state, style,
                     is_muted: is_note_muted,
+                    block_title: block_title.clone(),
                 });
             }
         }

@@ -71,11 +71,28 @@ fn parse_effect_params(args: &str) -> Vec<ShimParam> {
 /// Parse one `@<...>` body into a `ShimEvent`.  `attached_call` is the
 /// index of the preceding call on the same BlockList line, or None if
 /// the shim stands alone.
+///
+/// Wet/dry default: call-attached shims default to fully wet (1.0),
+/// standalone shims to dry (0.0) until ramped.
 pub(crate) fn parse_shim_event(
     inner: &str,
     line: usize,
     subs: u32,
     attached_call: Option<usize>,
+) -> Option<ShimEvent> {
+    let default_mix = if attached_call.is_some() { 1.0 } else { 0.0 };
+    parse_shim_event_with_default(inner, line, subs, attached_call, default_mix)
+}
+
+/// Same as `parse_shim_event`, but the caller picks the default `◊`.
+/// Declaration-header shims have no call to attach to but are always
+/// wet, so they pass 1.0.
+pub(crate) fn parse_shim_event_with_default(
+    inner: &str,
+    line: usize,
+    subs: u32,
+    attached_call: Option<usize>,
+    default_mix: f64,
 ) -> Option<ShimEvent> {
     let fields = split_fields(inner);
     let mut row: Option<f64> = None;
@@ -96,7 +113,7 @@ pub(crate) fn parse_shim_event(
             row = parse_position(&rest, subs);
         } else if let Some(rest) = f.strip_prefix(FIELD_DURATION) {
             length_rows = parse_f(rest.trim_start_matches('+'))
-                .map(|b| b * subs as f64);
+            .map(|b| b * subs as f64);
         } else if let Some(rest) = f.strip_prefix(FIELD_MIX) {
             mix = parse_f(rest.trim_start_matches('+')).map(|v| v.clamp(0.0, 1.0));
         } else if let Some(rest) = f.strip_prefix(FIELD_VOLUME) {
@@ -133,27 +150,23 @@ pub(crate) fn parse_shim_event(
         (gain, pan, String::new(), 0.0)
     };
 
-    // Call-attached: window defaults to the call's duration; ◊ defaults
-    // to 1.0 (wet).  Standalone: ◊ defaults to 0.0 (dry until ramped).
-    let default_mix = if attached_call.is_some() { 1.0 } else { 0.0 };
-
     Some(ShimEvent {
         line,
-        row: row.unwrap_or(0.0),
-        target,
-        params,
-        length_rows,
-        mix: mix.unwrap_or(default_mix),
-        gain,
-        pan,
-        attached_call,
-        waypoints: Vec::new(),
-        property,
-        start_value,
-        op: String::new(),
-        amount: 0.0,
-        interval_rows: 0.0,
-        count: None,
+         row: row.unwrap_or(0.0),
+         target,
+         params,
+         length_rows,
+         mix: mix.unwrap_or(default_mix),
+         gain,
+         pan,
+         attached_call,
+         waypoints: Vec::new(),
+         property,
+         start_value,
+         op: String::new(),
+         amount: 0.0,
+         interval_rows: 0.0,
+         count: None,
     })
 }
 

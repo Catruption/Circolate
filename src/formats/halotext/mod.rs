@@ -40,7 +40,8 @@ mod body;
 mod events;
 mod pitch;
 mod shim;
-mod types;
+pub mod emit;
+pub mod types;
 
 pub use pitch::*;
 pub use types::*;

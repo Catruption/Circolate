@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use crate::spec::FIELD_SOURCE;
 
 use super::events::parse_part_events;
-use super::types::{HalotextEvent, HalotextPart};
+use super::types::{HalotextEvent, HalotextPart, ShimEvent};
 
 pub(crate) enum BodyItem {
     Measure(Vec<HalotextEvent>),
@@ -246,7 +246,7 @@ pub(crate) fn register_sub_blocks(
             let section_lengths = vec![frame_len; measures.len()];
             parts.insert(
                 name.clone(),
-                make_part(name.clone(), args, measures, section_lengths),
+                         make_part(name.clone(), args, measures, section_lengths),
             );
             register_sub_blocks(sub_items, args, parts);
         }
@@ -264,6 +264,9 @@ pub(crate) struct PartArgs {
     pub(crate) default_vol: Option<f64>,
     pub(crate) default_pan: Option<f64>,
     pub(crate) default_dur: Option<f64>,
+    /// Declaration-header shim chain (`ƒX(<...>)@<...>[`).  Sub-blocks
+    /// inherit it.
+    pub(crate) shims: Vec<ShimEvent>,
 }
 
 pub(crate) fn make_part(
@@ -296,7 +299,8 @@ pub(crate) fn make_part(
         measures,
         section_lengths,
         default_vol: args.default_vol,
-        default_pan: args.default_pan,
-        default_dur: args.default_dur,
+            default_pan: args.default_pan,
+                default_dur: args.default_dur,
+                    shims: args.shims.clone(),
     }
 }

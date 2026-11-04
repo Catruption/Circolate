@@ -67,6 +67,7 @@ pub(crate) fn parse_part_events(
             mod_y: None,
             lyric: None,
             raw: format!("<{}>", inner),
+            waypoints: Vec::new(), // <--- ADD THIS LINE
         };
 
         let mut beat: Option<f64> = None;

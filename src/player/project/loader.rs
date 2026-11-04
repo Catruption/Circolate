@@ -619,7 +619,11 @@ pub(crate) fn load_project_from_source(
     }
 
     let mut tempo_events = parsed.tempo_events.clone();
-    let shim_tempo = tempo_shims_to_events(&parsed.shims, rows_per_measure);
+    // Effective shims: call-level shims plus each part\'s declaration chain,
+    // resolved by the halotext layer (the player never interprets syntax).
+    // Must run before `parsed.lyrics` is moved below.
+    let shims = parsed.effective_shims();
+    let shim_tempo = tempo_shims_to_events(&shims, rows_per_measure);
     if !shim_tempo.is_empty() {
         tempo_events.extend(shim_tempo);
         tempo_events.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -724,7 +728,7 @@ pub(crate) fn load_project_from_source(
         stereo_width: cfg.stereo_width, // <--- NEW
         initial_bpm: cfg.bpm, time_signature: cfg.time_signature,
         voice_count: total_voices, source_dir, cover_path, fidelity, requires,
-        shims: parsed.shims, lyrics, chains, channel_to_insert,
+        shims, lyrics, chains, channel_to_insert,
         note_rows_cache: std::sync::OnceLock::new(),
     };
     Ok((Arc::new(project), cache))
