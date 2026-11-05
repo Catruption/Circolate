@@ -432,14 +432,28 @@ fn emit_block_array(out: &mut String, f: &HalotextFile) {
 
 fn emit_block_def(out: &mut String, p: &HalotextPart) {
     out.push_str("    ");
+
+    let path = sanitize_ref(&p.sample_path);
+    let source_ref = if path.ends_with(".sf2") {
+        let preset = p.preset.unwrap_or(0);
+        let bank = p.bank.unwrap_or(0);
+        if bank == 0 {
+            format!("{part}'{path}'({preset})", part = GLYPH_PART, path = path, preset = preset)
+        } else {
+            format!("{part}'{path}'({bank}, {preset})", part = GLYPH_PART, path = path, bank = bank, preset = preset)
+        }
+    } else {
+        format!("{part}'{path}'", part = GLYPH_PART, path = path)
+    };
+
     out.push_str(&format!(
-        "{part}{name}(<{sigil}{beats}/{subs}, {part}'{path}'>)",
+        "{part}{name}(<{sigil}{beats}/{subs}, {source_ref}>)",
                           part = GLYPH_PART,
                           name = p.name,
                           sigil = GLYPH_PART_SIGIL,
                           beats = p.beats_per_measure,
                           subs = p.subs_per_beat,
-                          path = sanitize_ref(&p.sample_path),
+                          source_ref = source_ref,
     ));
     if !p.shims.is_empty() {
         let refs: Vec<&ShimEvent> = p.shims.iter().collect();

@@ -59,6 +59,30 @@ fn build_channel_to_insert(prj: &flp_src::Project) -> HashMap<u16, u8> {
     out
 }
 
+/// Read an `.instrument` sidecar and extract the underlying SF2 path + preset.
+fn read_sf2_sidecar(path: &str, aux_files: &[AuxFile]) -> Option<(String, i16, i16)> {
+    let aux = aux_files.iter().find(|a| a.rel_path == path)?;
+    let text = std::str::from_utf8(&aux.bytes).ok()?;
+    if !text.lines().any(|l| l.trim() == "Kind: sf2;") {
+        return None;
+    }
+    let file = text.lines()
+    .find(|l| l.trim().starts_with("File:"))
+    .and_then(|l| l.split('\'').nth(1))?
+    .to_string();
+    let bank = text.lines()
+    .find(|l| l.trim().starts_with("Bank:"))
+    .and_then(|l| l.split(':').nth(1))
+    .and_then(|s| s.trim().trim_end_matches(';').parse::<i16>().ok())
+    .unwrap_or(0);
+    let preset = text.lines()
+    .find(|l| l.trim().starts_with("Preset:"))
+    .and_then(|l| l.split(':').nth(1))
+    .and_then(|s| s.trim().trim_end_matches(';').parse::<i16>().ok())
+    .unwrap_or(0);
+    Some((file, bank, preset))
+}
+
 pub(super) fn convert(prj: &flp_src::Project, src_path: &Path, opts: &ConvertOptions) -> Result<Converted> {
     let subs = opts.subdivisions;
     let ppq = if prj.ppq == 0 { DEFAULT_FLPPQ } else { prj.ppq as u32 };
@@ -84,7 +108,7 @@ pub(super) fn convert(prj: &flp_src::Project, src_path: &Path, opts: &ConvertOpt
 
     let Classified {
         usable_samples, usable_embedded, usable_natives, usable_sf2,
-        resolved_map, sidecar_path: _, skipped, warnings: cls_warnings, envelope_only,
+        resolved_map, sidecar_path, skipped, warnings: cls_warnings, envelope_only,
     } = classify_channels(prj, &placed, opts, flp_dir, &plugin_index, fallback_table.as_ref(), &mut aux_files);
     warnings.extend(cls_warnings);
 
@@ -123,7 +147,6 @@ pub(super) fn convert(prj: &flp_src::Project, src_path: &Path, opts: &ConvertOpt
         let (pitch_semis, _) = channel_pitch(chan);
         styles.insert(chan.iid, NoteStyle { transpose: pitch_semis, full_secs: wav_secs(&bytes), bpm: tempo, vol_scale: chan.volume_scale(), pan_offset: chan.pan_norm(), sample_rate, sample_start: start_s, vol_env: extract_vol_env(chan) });
 
-        // Use target_name (bare filename) for the reference path
         sample_files.insert(chan.iid, target_name.clone());
 
         sample_outs.push(SampleOut { rel_path: rel.clone(), wav: bytes });
@@ -142,7 +165,6 @@ pub(super) fn convert(prj: &flp_src::Project, src_path: &Path, opts: &ConvertOpt
 
         styles.insert(chan.iid, NoteStyle { transpose: emb.root_key.map_or(0, |r| FL_C5_MIDI - r as i32) + pitch_semis, full_secs: wav_secs(&emb.wav), bpm: tempo, vol_scale: chan.volume_scale(), pan_offset: chan.pan_norm(), sample_rate, sample_start: chan.sample_start.unwrap_or(0), vol_env: extract_vol_env(chan) });
 
-        // Use primary_target (bare filename) for the reference path
         sample_files.insert(chan.iid, primary_target);
 
         let mut zone_files: Vec<String> = Vec::new();
@@ -197,22 +219,60 @@ pub(super) fn convert(prj: &flp_src::Project, src_path: &Path, opts: &ConvertOpt
         let name = if *count == 1 { base } else { format!("{}{:02}", base, count) };
         part_names.insert(chan.iid, name.clone());
 
-        let source_path: String = if let Some(Resolved::Fallback { replaces, .. }) = resolved_map.get(&chan.iid) {
-            ensure_vst3(replaces)
-        } else if let Some(s) = sample_files.get(&chan.iid) {
+        let mut preset: Option<i16> = None;
+        let mut bank: Option<i16> = None;
+
+        let source_path: String = if let Some(s) = sample_files.get(&chan.iid) {
             s.clone()
+        } else if let Some(Resolved::Fallback { replaces, .. }) = resolved_map.get(&chan.iid) {
+            ensure_vst3(replaces)
         } else if let Some(p) = &chan.plugin {
-            let clean: String = p.display_name.chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
-            .collect();
-            ensure_vst3(clean.trim_matches('_'))
+            if sf2::is_sf2_player(p) {
+                if let Some(sf) = sf2::parse_sf2_state(&p.state) {
+                    preset = Some(sf.preset as i16);
+                    bank = Some(sf.bank as i16);
+                    let filename = sf.path.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(&sf.path);
+                    format!("samples/{}", safe_name(&filename))
+                } else if let Some(path) = sidecar_path.get(&chan.iid) {
+                    if let Some((sf2_path, sf_bank, sf_preset)) = read_sf2_sidecar(path, &aux_files) {
+                        bank = Some(sf_bank);
+                        preset = Some(sf_preset);
+                        sf2_path
+                    } else {
+                        path.clone()
+                    }
+                } else {
+                    String::new()
+                }
+            } else if let Some(path) = sidecar_path.get(&chan.iid) {
+                if let Some((sf2_path, sf_bank, sf_preset)) = read_sf2_sidecar(path, &aux_files) {
+                    bank = Some(sf_bank);
+                    preset = Some(sf_preset);
+                    sf2_path
+                } else {
+                    path.clone()
+                }
+            } else {
+                let clean: String = p.display_name.chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
+                .collect();
+                ensure_vst3(clean.trim_matches('_'))
+            }
+        } else if let Some(path) = sidecar_path.get(&chan.iid) {
+            if let Some((sf2_path, sf_bank, sf_preset)) = read_sf2_sidecar(path, &aux_files) {
+                bank = Some(sf_bank);
+                preset = Some(sf_preset);
+                sf2_path
+            } else {
+                path.clone()
+            }
         } else {
             String::new()
         };
 
         let part = HalotextPart {
             name: name.clone(), sample_path: source_path, beats_per_measure: 4, subs_per_beat: subs, len_beats: None,
-            sample_offset: 0, preset: None, bank: None, src_bpm: None,
+            sample_offset: 0, preset, bank, src_bpm: None,
             events: Vec::new(), measures: Vec::new(), section_lengths: Vec::new(),
             default_vol: None, default_pan: None, default_dur: None,
                 shims: Vec::new(),
@@ -263,9 +323,7 @@ pub(super) fn convert(prj: &flp_src::Project, src_path: &Path, opts: &ConvertOpt
         part.events = all_events;
     }
 
-    // 4. Shims live on the part declaration.  Every call of a channel
-    //    shares the channel's insert chain, so it is declared once per
-    //    part instead of being attached to each BlockList call.
+    // 4. Shims live on the part declaration.
     for (iid, name) in &part_names {
         let Some(chain) = shims_by_channel.get(iid) else { continue };
         if let Some(part) = file.parts.get_mut(name) {
