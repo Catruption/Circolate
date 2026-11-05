@@ -18,7 +18,6 @@ mod emit;
 mod parse;
 mod model;
 mod deps;
-mod display;
 mod dump;
 mod effects;
 mod export;
