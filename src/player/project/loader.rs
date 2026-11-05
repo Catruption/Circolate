@@ -7,11 +7,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::asset::{AssetSource, DirSource, ENTRY_KEY};
-use crate::audio_decode::decode_audio;
+use crate::parse::wav::decode_audio;
 use crate::deps::index::PluginIndex;
 use crate::fidelity::{Fidelity, FIDELITY_FILENAME};
 use crate::deps::requires::{self, Requires};
-use crate::formats::halotext::parse_str;
+use crate::parse::halotext::parse_str;
 use crate::hosting::chip::patch::Patch;
 use crate::hosting::chip::patch::parse as parse_patch;
 use crate::timing::TempoMap;

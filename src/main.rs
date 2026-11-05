@@ -10,23 +10,24 @@ mod log;
 
 mod archive;
 mod asset;
-mod audio_decode;
 mod bundle;
 mod check;
-mod convert;
+mod cli;
+mod pipe;
+mod emit;
+mod parse;
+mod model;
 mod deps;
 mod display;
 mod dump;
 mod effects;
 mod export;
 mod fidelity;
-mod formats;
 mod hosting;
 mod measure;
 mod mixer;
 mod paths;
 mod pick;
-mod play;
 mod player;
 mod spec;
 mod test;
@@ -123,14 +124,14 @@ fn main() -> Result<()> {
 }
 
 fn run_app(args: &[String], _no_pick: bool) -> Result<()> {
-    let play_args = play::cli::parse_args(args)?;
+    let play_args = crate::cli::play::cli::parse_args(args)?;
 
     // --- ADD THIS BLOCK ---
     if play_args.render.is_some() {
-        return play::offline::render(&play_args);
+        return crate::cli::play::offline::render(&play_args);
     }
     if play_args.verify {
-        return play::offline::verify_cache(&play_args);
+        return crate::cli::play::offline::verify_cache(&play_args);
     }
     // ----------------------
 
@@ -150,7 +151,7 @@ fn run_app(args: &[String], _no_pick: bool) -> Result<()> {
         };
         tui::show_loading(&mut term, &queue, &settings, &msg, &[])?;
 
-        match play::session::play_one(
+        match crate::cli::play::session::play_one(
             &mut term,
             &play_args,
             current_song.as_deref(),

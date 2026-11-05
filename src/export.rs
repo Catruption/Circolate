@@ -11,7 +11,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
 
 use crate::archive;
-use crate::convert::{self, ConvertOptions, PitchMode};
+use crate::pipe::{ ConvertOptions, PitchMode};
 use crate::paths; // Added import
 
 pub fn run(argv: &[String]) -> Result<()> {
@@ -79,8 +79,8 @@ pub fn run(argv: &[String]) -> Result<()> {
         )
     })?;
 
-    let conv = convert::convert_file(&src, &opts)?;
-    let stem = convert::output_stem(&src);
+    let conv = crate::pipe::convert_file(&src, &opts)?;
+    let stem = crate::pipe::output_stem(&src);
 
     if archive_mode {
         write_archive_output(&src, &conv, &stem, out_dir.as_deref(), include_plugins.as_deref())?;
@@ -96,7 +96,7 @@ pub fn run(argv: &[String]) -> Result<()> {
 
 fn write_directory_output(
     src: &Path,
-    conv: &convert::Converted,
+    conv: &crate::pipe::Converted,
     stem: &str,
     out_dir: Option<&Path>,
 ) -> Result<()> {
@@ -118,7 +118,7 @@ fn write_directory_output(
 
 fn write_archive_output(
     src: &Path,
-    conv: &convert::Converted,
+    conv: &crate::pipe::Converted,
     stem: &str,
     out_dir: Option<&Path>,
     include_plugins: Option<&str>,

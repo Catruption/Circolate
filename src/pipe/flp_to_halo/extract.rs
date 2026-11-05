@@ -4,14 +4,14 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::convert::{identifier, AuxFile};
+use crate::pipe::{identifier, AuxFile};
 use crate::deps::index::PluginIndex;
 use crate::deps::registry::{RegistryTable, Resolution};
 use crate::fidelity::{
     ChannelFidelity, ChannelPluginFidelity, EnvelopeFidelity, Fidelity, InsertFidelity,
     InsertSlotFidelity, LevelsFidelity, PlaylistFidelity, TrackingFidelity, FIDELITY_VERSION,
 };
-use crate::formats::flp as flp_src;
+use crate::model::flp as flp_src;
 
 use super::resolve::{canonical_name, resolve_plugin, Resolved};
 
@@ -67,6 +67,7 @@ pub(super) fn build_fidelity(
                              state_path,
                              instrument_path,
                              fallback,
+                             ..Default::default()
             });
 
             if debug {
@@ -147,6 +148,7 @@ fn channel_fidelity_from_value(fallback_iid: u16, v: &serde_json::Value) -> Chan
         root_note: num("root_note"),
         fine_tune: num("fine_tune"),
         plugin: None,
+        ..Default::default()
     }
 }
 

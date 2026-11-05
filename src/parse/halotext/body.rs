@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use crate::spec::FIELD_SOURCE;
 
 use super::events::parse_part_events;
-use super::types::{HalotextEvent, HalotextPart, ShimEvent};
+use crate::model::halotext::{HalotextEvent, HalotextPart, ShimEvent};
 
 pub(crate) enum BodyItem {
     Measure(Vec<HalotextEvent>),

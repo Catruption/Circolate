@@ -1,8 +1,9 @@
 // src/convert/flp/render.rs
 use std::collections::BTreeMap;
 
-use crate::formats::flp::{Channel, ENV_VOLUME};
-use crate::formats::halotext::types::HalotextEvent;
+use crate::model::flp::Channel;
+use crate::spec::flp::ENV_VOLUME;
+use crate::model::halotext::HalotextEvent;
 
 use super::place::Placed;
 use super::{MAX_FULL_BEATS, PLAY_FULL_SAMPLE};
@@ -54,8 +55,18 @@ pub(super) fn extract_vol_env(chan: &Channel) -> Option<VolumeEnv> {
     })
 }
 
+/// Channel-level pitch/fine-tune offset, in semitones and residual cents.
+/// Does NOT include `root_note`: the sample loop adds it via
+/// `FL_C5_MIDI - root_note`, and the Slicex SF2 zones encode it per slice.
 pub(super) fn channel_pitch(chan: &Channel) -> (i32, i32) {
-    let cents = chan.levels.as_ref().map_or(0, |l| l.pitch_shift);
+    // Levels.pitch_shift = FL "Pitch" knob, cents.
+    // Channel.fine_tune   = FL "Fine tune" knob, cents.  Both are additive.
+    // Does NOT include root_note: callers add that separately where
+    // appropriate (external samples: `FL_C5_MIDI - root_note`; Slicex and
+    // VSTs rely on their own tuning data).
+    let shift_cents = chan.levels.as_ref().map_or(0, |l| l.pitch_shift);
+    let ft_cents = chan.fine_tune.unwrap_or(0);
+    let cents = shift_cents.saturating_add(ft_cents);
     if cents == 0 || cents.abs() > 4800 { return (0, 0); }
     let semis = (cents as f64 / 100.0).round() as i32;
     (semis, cents - semis * 100)
@@ -97,7 +108,7 @@ pub(super) fn render_part(
     for (row_key, mut row_notes) in by_row {
         row_notes.sort_by_key(|p| p.note.key);
         let row = row_key as f64 / 1000.0;
-        
+
         for p in row_notes {
             let n = &p.note;
             let key = n.key as i32 + style.transpose;
@@ -153,7 +164,7 @@ pub(super) fn render_part(
                 mod_x: if mx_delta != 0 { Some(mx_delta) } else { None },
                 mod_y: if my_delta != 0 { Some(my_delta) } else { None },
                 lyric: None, raw: String::new(),
-                waypoints: Vec::new(), // <--- ADD THIS LINE
+                waypoints: Vec::new(),
             });
 
             let mut wps: Vec<(f64, HalotextEvent)> = Vec::new();
@@ -163,7 +174,7 @@ pub(super) fn render_part(
                 source_line: 0, source_byte_column: 0, source_end_byte_column: 0,
                 sample_override: None, offset: None, bank: None, preset: None, root_note: None,
                 src_bpm: None, fine_pitch: None, release: None, mod_x: None, mod_y: None, lyric: None, raw: String::new(),
-                waypoints: Vec::new(), // <--- ADD THIS LINE
+                waypoints: Vec::new(),
             };
 
             if let Some(env) = style.vol_env {

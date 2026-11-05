@@ -16,7 +16,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
 
-use crate::convert::{self, ConvertOptions, DepKind, ProbeReport};
+use crate::pipe::{ ConvertOptions, DepKind, ProbeReport};
 
 pub fn run(argv: &[String]) -> Result<()> {
     let mut json = false;
@@ -92,7 +92,7 @@ pub fn run(argv: &[String]) -> Result<()> {
     let mut failed           = 0usize;
 
     for flp in &flps {
-        match convert::probe_file(flp, &opts) {
+        match crate::pipe::probe_file(flp, &opts) {
             Ok(rep) => {
                 total_files      += 1;
                 total_missing    += rep.missing.len();
@@ -207,7 +207,7 @@ fn write_requirements(root: &Path, out: &Path) -> Result<()> {
     let mut failed = 0;
 
     for flp in &flps {
-        match convert::probe_file(flp, &opts) {
+        match crate::pipe::probe_file(flp, &opts) {
             Ok(rep) => {
                 for m in &rep.missing {
                     let is_real = m.channel_name != "?" && !m.channel_name.is_empty();

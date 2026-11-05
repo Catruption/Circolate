@@ -2,12 +2,12 @@
 //! placements, and expand Tempo shims into tempo events.
 //!
 //! This module does not know halotext syntax.  Anything that needs to
-//! be shown as text (call titles) comes from `formats::halotext::emit`.
+//! be shown as text (call titles) comes from `emit::halotext`.
 
 use std::collections::HashMap;
 
-use crate::formats::halotext::emit::emit_call;
-use crate::formats::halotext::{BlockCall, CallOverrides, ShimEvent, HalotextPart};
+use crate::emit::halotext::emit_call;
+use crate::parse::halotext::{BlockCall, CallOverrides, ShimEvent, HalotextPart};
 
 #[derive(Clone)]
 pub(crate) struct LineCall {

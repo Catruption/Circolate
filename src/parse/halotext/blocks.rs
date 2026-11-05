@@ -19,7 +19,7 @@ use super::shim::{
 };
 use super::source_rx;
 use super::split_fields;
-use super::types::{
+use crate::model::halotext::{
     BlockCall, CallOverrides, HalotextEvent, HalotextPart, MeasureSelection, ShimEvent,
 };
 

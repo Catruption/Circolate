@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use crate::formats::halotext::HalotextPart;
+use crate::parse::halotext::HalotextPart;
 
 use super::stretch;
 use super::template::{build_template, PartTemplate};

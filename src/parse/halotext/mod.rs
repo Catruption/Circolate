@@ -40,11 +40,9 @@ mod body;
 mod events;
 mod pitch;
 mod shim;
-pub mod emit;
-pub mod types;
 
 pub use pitch::*;
-pub use types::*;
+pub use crate::model::halotext::*;
 
 pub(crate) use blocks::{parse_block_array, parse_block_list};
 pub(crate) use events::parse_part_events;

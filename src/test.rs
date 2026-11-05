@@ -13,8 +13,9 @@
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
-use crate::convert::{self, ConvertOptions, DepKind, ProbeReport};
-use crate::formats::flp;
+use crate::pipe::{ ConvertOptions, DepKind, ProbeReport};
+use crate::model::flp::Project;
+use crate::parse::flp::parse_file;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -98,7 +99,7 @@ fn print_help() {
 // ── FLP ────────────────────────────────────────────────────────────────
 
 fn test_flp(path: &Path, json: bool) -> Result<()> {
-    let prj = flp::parse_file(path)
+    let prj = parse_file(path)
     .with_context(|| format!("parsing {}", path.display()))?;
 
     if !json {
@@ -109,7 +110,7 @@ fn test_flp(path: &Path, json: bool) -> Result<()> {
     }
 
     let opts = ConvertOptions::default();
-    let rep = match convert::probe_file(path, &opts) {
+    let rep = match crate::pipe::probe_file(path, &opts) {
         Ok(r) => r,
         Err(e) => {
             if json {
@@ -139,7 +140,7 @@ fn test_flp(path: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn print_flp_header(path: &Path, prj: &flp::Project) {
+fn print_flp_header(path: &Path, prj: &Project) {
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
     println!("== {} ==", name);
     println!(
@@ -188,7 +189,7 @@ fn short_basename(p: &str) -> String {
     truncate(base, 32)
 }
 
-fn print_flp_channels(prj: &flp::Project) {
+fn print_flp_channels(prj: &Project) {
     // Count notes per channel across all patterns.
     let mut notes_per: std::collections::HashMap<u16, usize> =
     std::collections::HashMap::new();
@@ -244,7 +245,7 @@ fn print_flp_channels(prj: &flp::Project) {
     println!();
 }
 
-fn print_flp_patterns(prj: &flp::Project) {
+fn print_flp_patterns(prj: &Project) {
     if prj.patterns.is_empty() {
         return;
     }
@@ -268,7 +269,7 @@ fn print_flp_patterns(prj: &flp::Project) {
     println!();
 }
 
-fn print_flp_playlist(prj: &flp::Project) {
+fn print_flp_playlist(prj: &Project) {
     if prj.playlist.is_empty() {
         return;
     }

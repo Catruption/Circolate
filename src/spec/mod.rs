@@ -1,16 +1,21 @@
 // src/spec.rs
-//! Halotext language reference: one place for the syntax tables.
-//!
-//! Everything here is plain data (std only).  Four things read it:
-//!   * `render_markdown()` generates docs/LANGUAGE.md,
-//!   * the parser and converter ask `is_reserved` / `avoid_reserved`,
-//!   * the parser reads the glyph constants for regex construction,
-//!   * the converters call the `*_definition` / `call` / `source_arg`
-//!     helpers instead of writing syntax by hand.
-//!
-//! Regenerate the docs with:  UPDATE_DOCS=1 cargo test language_md
+// Halotext language reference: one place for the syntax tables.
+//
+// Everything here is plain data (std only).  Four things read it:
+//   * `render_markdown()` generates docs/LANGUAGE.md,
+//   * the parser and converter ask `is_reserved` / `avoid_reserved`,
+//   * the parser reads the glyph constants for regex construction,
+//   * the converters call the `*_definition` / `call` / `source_arg`
+//     helpers instead of writing syntax by hand.
+//
+// Regenerate the docs with:  UPDATE_DOCS=1 cargo test language_md
+
 
 #![allow(dead_code)]
+
+pub mod flp;
+pub mod it;
+pub mod sf2;
 
 use std::fmt::Write as _;
 
@@ -928,7 +933,7 @@ mod tests {
     #[test]
     fn implemented_examples_parse() {
         for e in EXAMPLES.iter().filter(|e| e.status == Status::Implemented) {
-            let file = crate::formats::halotext::parse_str(&wrap_example(e.src))
+            let file = crate::parse::halotext::parse_str(&wrap_example(e.src))
             .unwrap_or_else(|err| panic!("example {:?} failed: {:?}", e.title, err));
 
             let n_events: usize = file.parts.values().map(|p| p.events.len()).sum();

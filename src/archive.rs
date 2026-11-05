@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::asset::{AssetSource, ENTRY_KEY};
-use crate::convert::Converted;
+use crate::pipe::Converted;
 
 /// Compound suffix used for newly written archives.
 pub const EXTENSION: &str = "halo.zip";

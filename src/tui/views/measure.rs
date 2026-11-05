@@ -10,7 +10,7 @@ use std::sync::atomic::Ordering;
 
 use ratatui::style::Style;
 
-use crate::formats::halotext::C5_HZ;
+use crate::parse::halotext::C5_HZ;
 use crate::mixer::mute;
 use crate::player::notes::{value_at, DisplayNote};
 use crate::player::{Project, Transport};

@@ -335,6 +335,13 @@ ev("flp.place.slides_kept", Level::Debug, Category::Flp,
 ev("flp.place.disabled", Level::Debug, Category::Flp,
    "flp: skipping disabled channels {chans}", &["chans"],
    "Channels disabled in the source project were dropped.", "0.1.0"),
+ev("pipe.phase", Level::Info, Category::Flp,
+   "{stage}: {ms} ms", &["stage", "ms"],
+   "Wall-clock duration of one FLP→halotext pipe stage.", "0.2.0"),
+ev("pipe.progress", Level::Info, Category::Flp,
+   "{stage}: [{current}/{total}] {detail}", &["stage", "current", "total", "detail"],
+   "Per-item progress inside a pipe stage (currently emitted from classify).", "0.2.0"),
+
 
 // ── Slicex dumps ───────────────────────────────────────────────────
 ev("flp.slicex.header", Level::Debug, Category::FlpSlicex,

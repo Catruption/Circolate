@@ -13,7 +13,7 @@ use super::parse_f;
 use super::pitch::{parse_pitch_hz, parse_pitch_midi};
 use super::source_rx;
 use super::split_fields;
-use super::types::HalotextEvent;
+use crate::model::halotext::HalotextEvent;
 
 pub(crate) fn parse_part_events(
     body: &str,

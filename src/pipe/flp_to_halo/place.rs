@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::fidelity::InsertFidelity;
-use crate::formats::flp::{Note, Project};
+use crate::model::flp::{Note, Project};
 
 use super::{debug_on, hex, FL_C5_KEY, MAX_NOTE_TICKS};
 use super::slicex;
@@ -116,7 +116,7 @@ pub(super) fn place_notes(prj: &Project) -> (HashMap<u16, Vec<Placed>>, bool, us
     // FL emits NewPattern twice per pattern.  Both entries are in
     // prj.patterns; one carries the notes, the other carries metadata.
     // Keep whichever has more notes so we don't read the empty duplicate.
-    let mut pats: HashMap<u16, &crate::formats::flp::Pattern> = HashMap::new();
+    let mut pats: HashMap<u16, &crate::model::flp::Pattern> = HashMap::new();
     for p in &prj.patterns {
         pats.entry(p.iid)
         .and_modify(|old| {

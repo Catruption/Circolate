@@ -1,17 +1,32 @@
-// src/convert/flp/classify.rs
-//! Classify each FLP channel: usable sample, embedded sample, SF2, VST,
-//! or nothing.  Writes VST sidecars and SF2 file copies as a side effect
-//! of classification, since those are discovered along the way.
+// src/pipe/flp_to_halo/classify.rs
+//! Classify each FLP channel into one of five buckets: external sample,
+//! embedded sample, SF2 (native player or Slicex-generated), VST, or
+//! nothing.
+//!
+//! Dispatch is a fixed chain of handlers. Each returns
+//! `Option<HandlerOutcome>`:
+//!   * `None` = "not my format, try next handler"
+//!   * `Some(Done)` = "handled, stop"
+//!   * `Some(Skipped(reason))` = "my format but broken, stop"
+//!
+//! Classification runs in parallel via rayon: channels are independent,
+//! so each gets its own `Buckets`/`Sf2Cache`/`AuxFile` and the results
+//! merge in channel order afterward. The SF2 file-preset cache is
+//! per-channel for simplicity (paying a small duplication cost when
+//! several channels reference the same SF2); if that ever dominates,
+//! replace `Sf2Cache` with a shared `Arc<Mutex<_>>` or pre-scan.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::convert::{identifier, safe_name, AuxFile, ConvertOptions};
+use rayon::prelude::*;
+
+use crate::deps::index::PluginIndex;
 use crate::deps::registry::RegistryTable;
 use crate::fidelity::FIDELITY_FILENAME;
-use crate::deps::index::PluginIndex;
-use crate::formats::flp::{self as flp_src, Channel};
-use crate::formats::flp_audio;
+use crate::model::flp::{self as flp_src, Channel};
+use crate::parse::flp_audio;
+use crate::pipe::{identifier, safe_name, AuxFile, ConvertOptions};
 
 use super::place::Placed;
 use super::render::EmbeddedSample;
@@ -19,7 +34,9 @@ use super::resolve::{resolve_plugin, vst_sidecar, Resolved};
 use super::sf2::{self, SfState};
 use super::slicex;
 use super::wav::find_sample;
-use super::{debug_on, hex, MIN_EMBEDDED_BYTES, SF2_STATE_MAX};
+use super::{debug_on, MIN_EMBEDDED_BYTES, SF2_STATE_MAX};
+
+// ── output struct (field names unchanged; consumers depend on them) ───
 
 pub(super) struct Classified<'a> {
     pub(super) usable_samples: Vec<(&'a Channel, PathBuf)>,
@@ -33,318 +50,429 @@ pub(super) struct Classified<'a> {
     pub(super) envelope_only: Vec<(u16, String, usize)>,
 }
 
-/// What happened when we tried to handle an SF2 channel.
+// ── dispatch context ──────────────────────────────────────────────────
+
+struct Ctx<'a> {
+    placed: &'a HashMap<u16, Vec<Placed>>,
+    opts: &'a ConvertOptions,
+    flp_dir: &'a Path,
+    plugin_index: &'a PluginIndex,
+    fallback_table: Option<&'a RegistryTable>,
+    tempo: f64,
+}
+
+#[derive(Default)]
+struct Buckets<'a> {
+    usable_samples: Vec<(&'a Channel, PathBuf)>,
+    usable_embedded: Vec<(&'a Channel, EmbeddedSample)>,
+    usable_natives: Vec<&'a Channel>,
+    usable_sf2: Vec<&'a Channel>,
+    resolved_map: HashMap<u16, Resolved>,
+    sidecar_path: HashMap<u16, String>,
+    skipped: Vec<(&'a Channel, String)>,
+    warnings: Vec<String>,
+    envelope_only: Vec<(u16, String, usize)>,
+}
+
+impl<'a> Buckets<'a> {
+    fn merge(&mut self, other: Buckets<'a>) {
+        self.usable_samples.extend(other.usable_samples);
+        self.usable_embedded.extend(other.usable_embedded);
+        self.usable_natives.extend(other.usable_natives);
+        self.usable_sf2.extend(other.usable_sf2);
+        self.resolved_map.extend(other.resolved_map);
+        self.sidecar_path.extend(other.sidecar_path);
+        self.skipped.extend(other.skipped);
+        self.warnings.extend(other.warnings);
+        self.envelope_only.extend(other.envelope_only);
+    }
+}
+
+#[derive(Default)]
+struct Sf2Cache {
+    copied: HashMap<PathBuf, String>,
+    preset_cache: HashMap<PathBuf, Option<Vec<(u16, u16)>>>,
+}
+
+enum HandlerOutcome {
+    Done,
+    Skipped(String),
+}
+
+type HandlerResult = Option<HandlerOutcome>;
+
+/// One channel's worth of results, in the shape the parallel loop
+/// produces and the merge phase consumes.
+type ChannelResult<'a> = (HandlerOutcome, Buckets<'a>, Vec<AuxFile>);
+
+// ── entry point ───────────────────────────────────────────────────────
+
+pub(super) fn classify_channels<'a>(
+    prj: &'a flp_src::Project,
+    placed: &'a HashMap<u16, Vec<Placed>>,
+    opts: &'a ConvertOptions,
+    flp_dir: &'a Path,
+    plugin_index: &'a PluginIndex,
+    fallback_table: Option<&'a RegistryTable>,
+    aux_files: &mut Vec<AuxFile>,
+) -> Classified<'a> {
+    let tempo = if prj.tempo > 0.0 { prj.tempo } else { super::DEFAULT_TEMPO };
+    let cx = Ctx { placed, opts, flp_dir, plugin_index, fallback_table, tempo };
+    let n_channels = prj.channels.len();
+
+    // Phase 1 — parallel per-channel classification. Each channel's
+    // output lives in its own local `Buckets`/`AuxFile`; nothing shared
+    // is mutated. `enumerate` + `collect::<Vec<_>>()` preserves input
+    // order (rayon's IndexedParallelIterator contract), so downstream
+    // warning ordering matches the serial version.
+    let per_channel: Vec<ChannelResult<'a>> = prj
+    .channels
+    .par_iter()
+    .enumerate()
+    .map(|(idx, chan)| classify_one(idx, n_channels, chan, &cx))
+    .collect();
+
+    // Phase 2 — sequential merge, in channel order.
+    let mut merged = Buckets::default();
+    let mut merged_aux: Vec<AuxFile> = Vec::new();
+    for (idx, (outcome, local, local_aux)) in per_channel.into_iter().enumerate() {
+        merged.merge(local);
+        merged_aux.extend(local_aux);
+        if let HandlerOutcome::Skipped(reason) = outcome {
+            merged.skipped.push((&prj.channels[idx], reason));
+        }
+    }
+
+    // Phase 3 — deferred VST sidecar writing. Must be sequential: the
+    // basename counter across channels is order-dependent.
+    write_all_vst_sidecars(&mut merged, &mut merged_aux);
+
+    aux_files.extend(merged_aux);
+
+    Classified {
+        usable_samples: merged.usable_samples,
+        usable_embedded: merged.usable_embedded,
+        usable_natives: merged.usable_natives,
+        usable_sf2: merged.usable_sf2,
+        resolved_map: merged.resolved_map,
+        sidecar_path: merged.sidecar_path,
+        skipped: merged.skipped,
+        warnings: merged.warnings,
+        envelope_only: merged.envelope_only,
+    }
+}
+
+/// Per-channel worker. Runs on a rayon thread. Produces a self-contained
+/// result tuple; no shared state is touched.
+fn classify_one<'a>(
+    idx: usize,
+    n_total: usize,
+    chan: &'a Channel,
+    cx: &Ctx<'a>,
+) -> ChannelResult<'a> {
+    let t_chan = std::time::Instant::now();
+    let chan_label: String = if chan.name.is_empty() {
+        chan.channel_type.clone()
+    } else {
+        chan.name.clone()
+    };
+
+    crate::log_event!(
+        "pipe.progress",
+        stage: "classify",
+        current: format!("{}", idx + 1),
+                      total: format!("{}", n_total),
+                      detail: format!("chan {} {} starting", chan.iid, chan_label)
+    );
+
+    let mut out: Buckets<'a> = Buckets::default();
+    let mut aux_files: Vec<AuxFile> = Vec::new();
+    let mut sf2_cache = Sf2Cache::default();
+
+    let outcome = classify_one_inner(chan, cx, &mut out, &mut sf2_cache, &mut aux_files);
+
+    let elapsed = t_chan.elapsed().as_millis();
+    crate::log_event!(
+        "pipe.progress",
+        stage: "classify",
+        current: format!("{}", idx + 1),
+                      total: format!("{}", n_total),
+                      detail: format!("chan {} {} done in {} ms", chan.iid, chan_label, elapsed)
+    );
+
+    (outcome, out, aux_files)
+}
+
+/// Body of the per-channel logic. Split out so the logging wrappers in
+/// `classify_one` stay symmetric (start log before, duration log after).
+fn classify_one_inner<'a>(
+    chan: &'a Channel,
+    cx: &Ctx<'a>,
+    out: &mut Buckets<'a>,
+    sf2_cache: &mut Sf2Cache,
+    aux_files: &mut Vec<AuxFile>,
+) -> HandlerOutcome {
+    if !chan.enabled.unwrap_or(true) {
+        return HandlerOutcome::Skipped("disabled in FL".into());
+    }
+
+    let active_envs = chan.envelopes.iter().filter(|e| e.env_enabled != 0).count();
+    if active_envs > 0 {
+        let label = if chan.name.is_empty() {
+            chan.channel_type.clone()
+        } else {
+            chan.name.clone()
+        };
+        out.envelope_only.push((chan.iid, label, active_envs));
+    }
+
+    let has_notes = cx.placed.get(&chan.iid).map_or(false, |v| !v.is_empty());
+    if !has_notes {
+        let has_content = !chan.sample_path.is_empty()
+        || chan.plugin.as_ref().map_or(false, |p| !p.state.is_empty());
+        if has_content
+            && matches!(chan.channel_type.as_str(), "sampler" | "instrument" | "native")
+            {
+                return HandlerOutcome::Skipped("no notes".into());
+            }
+            // No notes, nothing to report. `Done` here means "successfully
+            // decided there's nothing to do" — the merge phase won't record
+            // a skip, matching the original silent-continue behaviour.
+            return HandlerOutcome::Done;
+    }
+
+    dispatch(chan, cx, out, sf2_cache, aux_files)
+}
+
+fn dispatch<'a>(
+    chan: &'a Channel,
+    cx: &Ctx<'a>,
+    out: &mut Buckets<'a>,
+    sf2_cache: &mut Sf2Cache,
+    aux_files: &mut Vec<AuxFile>,
+) -> HandlerOutcome {
+    if chan.channel_type == "native" && cx.opts.skip_native {
+        return HandlerOutcome::Skipped("native channel; --skip-native".into());
+    }
+
+    if let Some(o) = try_slicex(chan, cx, out, aux_files) { return o; }
+    if let Some(o) = try_sf2_player(chan, cx, out, sf2_cache, aux_files) { return o; }
+    if let Some(o) = try_sampler(chan, cx, out) { return o; }
+    if let Some(o) = try_embedded(chan, cx, out) { return o; }
+    if let Some(o) = try_vst(chan, cx, out) { return o; }
+
+    HandlerOutcome::Skipped(format!("channel type '{}' not converted", chan.channel_type))
+}
+
+// ── handlers (unchanged) ─────────────────────────────────────────────
+
+fn try_slicex<'a>(
+    chan: &'a Channel,
+    cx: &Ctx<'a>,
+    out: &mut Buckets<'a>,
+    aux_files: &mut Vec<AuxFile>,
+) -> HandlerResult {
+    let plugin = chan.plugin.as_ref()?;
+    match slicex::convert(chan, plugin, cx.placed, aux_files, &mut out.warnings, cx.tempo) {
+        Ok(slicex_out) => {
+            out.sidecar_path.insert(chan.iid, slicex_out.instrument_rel);
+            out.usable_sf2.push(chan);
+            Some(HandlerOutcome::Done)
+        }
+        Err(e) => {
+            if debug_on() {
+                eprintln!(
+                    "flp: chan {:>3} slicex: {} (not Slicex, trying next)",
+                          chan.iid, e
+                );
+            }
+            None
+        }
+    }
+}
+
+fn try_sf2_player<'a>(
+    chan: &'a Channel,
+    cx: &Ctx<'a>,
+    out: &mut Buckets<'a>,
+    sf2_cache: &mut Sf2Cache,
+    aux_files: &mut Vec<AuxFile>,
+) -> HandlerResult {
+    if chan.channel_type != "native" {
+        return None;
+    }
+    let plugin = chan.plugin.as_ref()?;
+
+    let is_sf2_plugin = sf2::is_sf2_player(plugin);
+    let has_sf2_marker = plugin
+    .state
+    .windows(4)
+    .any(|w| w.eq_ignore_ascii_case(b".sf2"));
+
+    if !is_sf2_plugin
+        || !plugin.vst_path.is_empty()
+        || plugin.state.len() >= SF2_STATE_MAX
+        || !has_sf2_marker
+        {
+            return None;
+        }
+
+        let sf = sf2::parse_sf2_state(&plugin.state)?;
+
+    match handle_sf2(
+        chan,
+        &sf,
+        cx.opts,
+        cx.flp_dir,
+        &mut sf2_cache.copied,
+        &mut sf2_cache.preset_cache,
+        aux_files,
+        &mut out.warnings,
+    ) {
+        Sf2Outcome::Done(rel) => {
+            out.sidecar_path.insert(chan.iid, rel);
+            out.usable_sf2.push(chan);
+            Some(HandlerOutcome::Done)
+        }
+        Sf2Outcome::PresetMissing(reason) => {
+            out.warnings.push(format!("[{:2}] {}", chan.iid, reason));
+            None
+        }
+        Sf2Outcome::Skip(reason) => Some(HandlerOutcome::Skipped(reason)),
+    }
+}
+
+fn try_sampler<'a>(chan: &'a Channel, cx: &Ctx<'a>, out: &mut Buckets<'a>) -> HandlerResult {
+    if chan.channel_type != "sampler" && chan.channel_type != "instrument" {
+        return None;
+    }
+    if chan.sample_path.is_empty() {
+        return Some(HandlerOutcome::Skipped("no sample path".into()));
+    }
+    match find_sample(&chan.sample_path, cx.opts.samples_dir.as_deref(), Some(cx.flp_dir)) {
+        Some(p) => {
+            out.usable_samples.push((chan, p));
+            Some(HandlerOutcome::Done)
+        }
+        None => {
+            let basename = Path::new(&chan.sample_path.replace('\\', "/"))
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?")
+            .to_string();
+            Some(HandlerOutcome::Skipped(format!("sample not found: {}", basename)))
+        }
+    }
+}
+
+fn try_embedded<'a>(chan: &'a Channel, _cx: &Ctx<'a>, out: &mut Buckets<'a>) -> HandlerResult {
+    if chan.channel_type != "native" {
+        return None;
+    }
+    let plugin = chan.plugin.as_ref()?;
+    let emb = extract_embedded(chan, &plugin.state, &mut out.warnings)?;
+    out.usable_embedded.push((chan, emb));
+    Some(HandlerOutcome::Done)
+}
+
+fn try_vst<'a>(chan: &'a Channel, cx: &Ctx<'a>, out: &mut Buckets<'a>) -> HandlerResult {
+    if chan.channel_type != "native" {
+        return Some(HandlerOutcome::Skipped(format!(
+            "channel type '{}' not converted",
+            chan.channel_type
+        )));
+    }
+
+    let Some(plugin) = chan.plugin.as_ref() else {
+        return Some(HandlerOutcome::Skipped("native channel without saved state".into()));
+    };
+    if plugin.state.is_empty() {
+        return Some(HandlerOutcome::Skipped("native channel without saved state".into()));
+    }
+
+    let resolved = resolve_plugin(plugin, cx.plugin_index, cx.fallback_table);
+
+    match &resolved {
+        Resolved::Exact { name, path } => {
+            out.warnings.push(format!(
+                "[{:2}] {}: using installed plugin at {}",
+                chan.iid, name, path.display()
+            ));
+        }
+        Resolved::Fallback { name, path, replaces, .. } => {
+            let path_str = path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<not found>".into());
+            out.warnings.push(format!(
+                "[{:2}] {}: not installed, falling back to {} ({})",
+                                      chan.iid, replaces, name, path_str
+            ));
+        }
+        Resolved::Unresolved { name } => {
+            out.warnings.push(format!(
+                "[{:2}] {}: not installed and no fallback configured — channel will be silent",
+                chan.iid, name
+            ));
+        }
+    }
+
+    out.resolved_map.insert(chan.iid, resolved);
+    out.usable_natives.push(chan);
+
+    Some(HandlerOutcome::Done)
+}
+
+// ── deferred sidecar writing (sequential, after merge) ────────────────
+
+fn write_all_vst_sidecars(out: &mut Buckets, aux_files: &mut Vec<AuxFile>) {
+    let chans: Vec<&Channel> = out.usable_natives.clone();
+    let mut used: HashMap<String, u32> = HashMap::new();
+
+    for chan in chans {
+        let base_raw = if chan.name.is_empty() {
+            format!("Ch{:02}", chan.iid)
+        } else {
+            chan.name.clone()
+        };
+        let base = identifier(&base_raw);
+        let count_ref = used.entry(base.clone()).or_insert(0);
+        *count_ref += 1;
+        let count = *count_ref;
+        let sidecar_name = if count == 1 {
+            base
+        } else {
+            format!("{}{:02}", base, count)
+        };
+
+        let result: Result<Vec<AuxFile>, String> = {
+            let Some(resolved) = out.resolved_map.get(&chan.iid) else {
+                continue;
+            };
+            vst_sidecar(&sidecar_name, chan, resolved)
+            .map_err(|e| format!("[{:2}] sidecar write failed: {:#}", chan.iid, e))
+        };
+
+        match result {
+            Ok(files) => {
+                aux_files.extend(files);
+                out.sidecar_path
+                .insert(chan.iid, format!("instruments/{}.instrument", sidecar_name));
+            }
+            Err(msg) => out.warnings.push(msg),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// SF2 handling — helper functions (unchanged behavior)
+// ─────────────────────────────────────────────────────────────────────
+
 enum Sf2Outcome {
     Done(String),
     PresetMissing(String),
     Skip(String),
 }
-
-pub(super) fn classify_channels<'a>(
-    prj: &'a flp_src::Project,
-    placed: &HashMap<u16, Vec<Placed>>,
-    opts: &ConvertOptions,
-    flp_dir: &Path,
-    plugin_index: &PluginIndex,
-    fallback_table: Option<&RegistryTable>,
-    aux_files: &mut Vec<AuxFile>,
-) -> Classified<'a> {
-    let mut usable_samples: Vec<(&Channel, PathBuf)> = Vec::new();
-    let mut usable_embedded: Vec<(&Channel, EmbeddedSample)> = Vec::new();
-    let mut usable_natives: Vec<&Channel> = Vec::new();
-    let mut usable_sf2: Vec<&Channel> = Vec::new();
-    let mut resolved_map: HashMap<u16, Resolved> = HashMap::new();
-    let mut skipped: Vec<(&Channel, String)> = Vec::new();
-    let mut warnings: Vec<String> = Vec::new();
-    let mut envelope_only: Vec<(u16, String, usize)> = Vec::new();
-    let mut sf2_copied: HashMap<PathBuf, String> = HashMap::new();
-    let mut sidecar_path: HashMap<u16, String> = HashMap::new();
-    let mut sf2_preset_cache: HashMap<PathBuf, Option<Vec<(u16, u16)>>> = HashMap::new();
-
-    for chan in &prj.channels {
-        if !chan.enabled.unwrap_or(true) {
-            skipped.push((chan, "disabled in FL".into()));
-            continue;
-        }
-
-        let active_envs = chan.envelopes.iter().filter(|e| e.env_enabled != 0).count();
-        if active_envs > 0 {
-            let label = if chan.name.is_empty() {
-                chan.channel_type.clone()
-            } else {
-                chan.name.clone()
-            };
-            envelope_only.push((chan.iid, label, active_envs));
-        }
-
-        let has_notes = placed.get(&chan.iid).map_or(false, |v| !v.is_empty());
-        if !has_notes {
-            let has_content = !chan.sample_path.is_empty()
-            || chan.plugin.as_ref().map_or(false, |p| !p.state.is_empty());
-            if has_content
-                && matches!(
-                    chan.channel_type.as_str(),
-                            "sampler" | "instrument" | "native"
-                )
-                {
-                    skipped.push((chan, "no notes".into()));
-                }
-                continue;
-        }
-
-        match chan.channel_type.as_str() {
-            "sampler" | "instrument" => {
-                if let Some(plugin) = chan.plugin.as_ref() {
-                    if slicex::is_slicex(plugin) {
-                        match slicex::convert(chan, plugin, placed, aux_files, &mut warnings, if prj.tempo > 0.0 { prj.tempo } else { super::DEFAULT_TEMPO }) {
-                            Ok(out) => {
-                                sidecar_path.insert(chan.iid, out.instrument_rel);
-                                usable_sf2.push(chan);
-                            }
-                            Err(e) => skipped.push((chan, format!("Slicex: {e}"))),
-                        }
-                        continue;
-                    }
-                }
-
-                if chan.sample_path.is_empty() {
-                    skipped.push((chan, "no sample path".into()));
-                    continue;
-                }
-                match find_sample(&chan.sample_path, opts.samples_dir.as_deref(), Some(flp_dir)) {
-                    Some(p) => usable_samples.push((chan, p)),
-                    None => {
-                        let basename = Path::new(&chan.sample_path.replace('\\', "/"))
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("?")
-                        .to_string();
-                        skipped.push((chan, format!("sample not found: {}", basename)));
-                    }
-                }
-            }
-            "native" => {
-                if opts.skip_native {
-                    skipped.push((chan, "native channel; --skip-native".into()));
-                    continue;
-                }
-
-                if debug_on() {
-                    if let Some(p) = chan.plugin.as_ref() {
-                        eprintln!(
-                            "flp: chan {:>3} native internal={:?} display={:?} vst_path={:?} state_len={}",
-                            chan.iid,
-                            p.internal_name,
-                            p.display_name,
-                            p.vst_path,
-                            p.state.len(),
-                        );
-                    } else {
-                        eprintln!("flp: chan {:>3} native, no plugin", chan.iid);
-                    }
-                }
-
-                if let Some(plugin) = chan.plugin.as_ref() {
-                    if slicex::is_slicex(plugin) {
-                        match slicex::convert(chan, plugin, placed, aux_files, &mut warnings, if prj.tempo > 0.0 { prj.tempo } else { super::DEFAULT_TEMPO }) {
-                            Ok(out) => {
-                                sidecar_path.insert(chan.iid, out.instrument_rel);
-                                usable_sf2.push(chan);
-                            }
-                            Err(e) => skipped.push((chan, format!("Slicex: {e}"))),
-                        }
-                        continue;
-                    }
-                }
-
-                if let Some(plugin) = chan.plugin.as_ref() {
-                    let is_sf2_plugin = sf2::is_sf2_player(plugin);
-                    let has_sf2_marker = plugin
-                    .state
-                    .windows(4)
-                    .any(|w| w.eq_ignore_ascii_case(b".sf2"));
-
-                    if debug_on() {
-                        let n = plugin.state.len();
-                        eprintln!(
-                            "flp: chan {} native internal={:?} sf2_player={} has_marker={} state={} bytes",
-                            chan.iid, plugin.internal_name, is_sf2_plugin, has_sf2_marker, n,
-                        );
-                        if !has_sf2_marker && plugin.vst_path.is_empty() && n > 0 {
-                            eprintln!(
-                                "flp: chan {} first 64: {}",
-                                chan.iid,
-                                hex(&plugin.state[..n.min(64)])
-                            );
-                        }
-                    }
-
-                    if is_sf2_plugin
-                        && plugin.vst_path.is_empty()
-                        && plugin.state.len() < SF2_STATE_MAX
-                        && has_sf2_marker
-                        {
-                            if let Some(sf) = sf2::parse_sf2_state(&plugin.state) {
-                                match handle_sf2(
-                                    chan,
-                                    &sf,
-                                    opts,
-                                    flp_dir,
-                                    &mut sf2_copied,
-                                    &mut sf2_preset_cache,
-                                    aux_files,
-                                    &mut warnings,
-                                ) {
-                                    Sf2Outcome::Done(rel) => {
-                                        sidecar_path.insert(chan.iid, rel);
-                                        usable_sf2.push(chan);
-                                        continue;
-                                    }
-                                    Sf2Outcome::PresetMissing(reason) => {
-                                        warnings.push(format!("[{:2}] {}", chan.iid, reason));
-                                    }
-                                    Sf2Outcome::Skip(reason) => {
-                                        skipped.push((chan, reason));
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
-                }
-
-                if let Some(plugin) = chan.plugin.as_ref() {
-                    if let Some(emb) = extract_embedded(chan, &plugin.state, &mut warnings) {
-                        usable_embedded.push((chan, emb));
-                        continue;
-                    }
-                }
-
-                let has_state = chan.plugin.as_ref().map_or(false, |p| !p.state.is_empty());
-                if !has_state {
-                    skipped.push((chan, "native channel without saved state".into()));
-                    continue;
-                }
-                if debug_on() {
-                    let p = chan.plugin.as_ref().unwrap();
-                    eprintln!(
-                        "flp: chan {} native -> VST branch: display={:?} internal={:?} vst_path={:?} state_len={}",
-                        chan.iid,
-                        p.display_name,
-                        p.internal_name,
-                        p.vst_path,
-                        p.state.len()
-                    );
-                }
-                let plugin = chan.plugin.as_ref().unwrap();
-                let resolved = resolve_plugin(plugin, plugin_index, fallback_table);
-
-                match &resolved {
-                    Resolved::Exact { name, path } => {
-                        warnings.push(format!(
-                            "[{:2}] {}: using installed plugin at {}",
-                            chan.iid,
-                            name,
-                            path.display()
-                        ));
-                    }
-                    Resolved::Fallback {
-                        name,
-                        path,
-                        replaces,
-                        ..
-                    } => {
-                        let path_str = path
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "<not found>".into());
-                        warnings.push(format!(
-                            "[{:2}] {}: not installed, falling back to {} ({})",
-                                              chan.iid, replaces, name, path_str
-                        ));
-                    }
-                    Resolved::Unresolved { name } => {
-                        warnings.push(format!(
-                            "[{:2}] {}: not installed and no fallback configured — channel will be silent",
-                            chan.iid, name
-                        ));
-                    }
-                }
-
-                resolved_map.insert(chan.iid, resolved);
-                usable_natives.push(chan);
-
-                if debug_on() {
-                    eprintln!(
-                        "flp: chan {:>3} native -> {:?}",
-                        chan.iid,
-                        match resolved_map.get(&chan.iid) {
-                            Some(Resolved::Exact { name, .. }) => format!("Exact({})", name),
-                              Some(Resolved::Fallback { name, path, .. }) =>
-                              format!("Fallback({} -> {:?})", name, path),
-                                  Some(Resolved::Unresolved { name }) => format!("Unresolved({})", name),
-                              None => "??".into(),
-                        }
-                    );
-                }
-            }
-            other => {
-                skipped.push((chan, format!("channel type '{}' not converted", other)));
-            }
-        }
-    }
-
-    {
-        let mut used: HashMap<String, u32> = HashMap::new();
-        for chan in &usable_natives {
-            let base_raw = if chan.name.is_empty() {
-                format!("Ch{:02}", chan.iid)
-            } else {
-                chan.name.clone()
-            };
-            let base = identifier(&base_raw);
-            let count_ref = used.entry(base.clone()).or_insert(0);
-            *count_ref += 1;
-            let count = *count_ref;
-            let sidecar_name = if count == 1 {
-                base
-            } else {
-                format!("{}{:02}", base, count)
-            };
-            let resolved = resolved_map
-            .get(&chan.iid)
-            .expect("every usable native has a resolution");
-            match vst_sidecar(&sidecar_name, chan, resolved) {
-                Ok(files) => {
-                    aux_files.extend(files);
-                    sidecar_path.insert(
-                        chan.iid,
-                        format!("instruments/{}.instrument", sidecar_name),
-                    );
-                }
-                Err(e) => {
-                    warnings.push(format!(
-                        "[{:2}] sidecar write failed: {:#}",
-                        chan.iid, e
-                    ));
-                }
-            }
-        }
-    }
-
-    Classified {
-        usable_samples,
-        usable_embedded,
-        usable_natives,
-        usable_sf2,
-        resolved_map,
-        sidecar_path,
-        skipped,
-        warnings,
-        envelope_only,
-    }
-}
-
-// ── SF2 handling ───────────────────────────────────────────────────────
 
 fn handle_sf2(
     chan: &Channel,
@@ -377,33 +505,9 @@ fn handle_sf2(
         dirs.push(root.as_path());
     }
 
-    if debug_on() {
-        eprintln!(
-            "flp: chan {} sf2 state: path={:?} bank={} patch={}",
-            chan.iid, want, sf.bank, sf.preset,
-        );
-        for d in &dirs {
-            eprintln!("flp:   search root: {}", d.display());
-        }
-    }
-
     let src: PathBuf = if let Some(p) = crate::paths::find_soundfont(&want) {
-        if debug_on() {
-            eprintln!(
-                "flp: chan {} sf2 resolved via paths::find_soundfont: {}",
-                chan.iid,
-                p.display()
-            );
-        }
         p
     } else if let Some(p) = sf2::find_sf2(Some(sf), &chan.name, &dirs) {
-        if debug_on() {
-            eprintln!(
-                "flp: chan {} sf2 resolved via channel-name search: {}",
-                chan.iid,
-                p.display()
-            );
-        }
         p
     } else {
         let roots: Vec<String> = crate::paths::soundfont_roots()
@@ -426,7 +530,6 @@ fn handle_sf2(
     let mut resolved_bank = sf.bank;
     let mut resolved_preset = sf.preset;
 
-    // 1. Read available presets and apply the fallback ladder
     if let Some(presets) = sf2_presets_of(&src, preset_cache) {
         if let Some((fb_bank, fb_preset)) =
             sf2::resolve_sf2_preset(sf.bank as u16, sf.preset as u16, &presets)
@@ -447,23 +550,12 @@ fn handle_sf2(
                     ));
                 }
             } else {
-                // No presets found at all (corrupt file), bail to VST.
                 return Sf2Outcome::PresetMissing(format!(
                     "{}: SF2 has no presets in {} — routing to fallback",
                     if chan.name.is_empty() { &chan.channel_type } else { &chan.name },
                         src.display(),
                 ));
             }
-    }
-
-    if debug_on() {
-        eprintln!(
-            "flp: chan {} sf2 {} bank {} patch {} (resolved)",
-                  chan.iid,
-                  src.display(),
-                  resolved_bank,
-                  resolved_preset
-        );
     }
 
     let base_raw = if chan.name.is_empty() {
@@ -473,7 +565,6 @@ fn handle_sf2(
     };
     let base = identifier(&base_raw);
 
-    // 2. Write sidecar with the RESOLVED values, not the original ones
     match write_sf2_sidecar(
         chan,
         &base,
@@ -499,17 +590,7 @@ fn sf2_presets_of(
     if let Some(cached) = cache.get(path) {
         return cached.clone();
     }
-    let result = (|| {
-        let mut engine = crate::hosting::sf2::engine::Sf2Engine::new(44100);
-        engine.load(path).ok()?;
-        Some(
-            engine
-            .list_presets()
-            .into_iter()
-            .map(|(b, p, _)| (b, p))
-            .collect(),
-        )
-    })();
+    let result = sf2::read_sf2_presets(path);
     cache.insert(path.to_path_buf(), result.clone());
     result
 }
@@ -573,7 +654,7 @@ fn write_sf2_sidecar(
     Some(inst_rel)
 }
 
-// ── embedded audio handling ────────────────────────────────────────────
+// ── embedded audio handling (unchanged) ───────────────────────────────
 
 fn extract_embedded(
     chan: &Channel,
@@ -581,31 +662,10 @@ fn extract_embedded(
     warnings: &mut Vec<String>,
 ) -> Option<EmbeddedSample> {
     let found = flp_audio::extract_all(state);
-    if debug_on() {
-        for (i, a) in found.iter().enumerate() {
-            eprintln!(
-                "flp: chan {} embedded #{} {} {} bytes, root {:?}",
-                chan.iid,
-                i,
-                a.extension,
-                a.data.len(),
-                      flp_audio::wav_root_key(&a.data)
-            );
-        }
-    }
 
     let mut all_zones: Vec<(Vec<u8>, Option<u8>)> = Vec::new();
     for (i, aud) in found.iter().enumerate() {
         if aud.data.len() < MIN_EMBEDDED_BYTES {
-            if debug_on() {
-                eprintln!(
-                    "flp: chan {} embedded #{} skipped ({} bytes < {} byte floor)",
-                          chan.iid,
-                          i,
-                          aud.data.len(),
-                          MIN_EMBEDDED_BYTES
-                );
-            }
             continue;
         }
         let wav = if aud.extension == "flac" {

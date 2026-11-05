@@ -1,57 +1,15 @@
-// src/sources/midi.rs
 //! Standard MIDI File parsing.
 //!
 //! Wraps `midly` and flattens the event stream into a per-channel note
-//! list.  Nothing here emits halotext; the shape is chosen so the
-//! converter doesn't have to touch midly types.
-//!
-//! Format 0 and 1 are supported.  Format 2 (independent sequences) is
-//! rejected — it isn't one song, so there's no meaningful conversion.
-//! Pitch bend, CC1, CC64, aftertouch and SysEx are ignored: the first
-//! pass is notes-only, which is a large fraction of the value.
+//! list. Format 0 and 1 supported; format 2 rejected. Pitch bend, CC1,
+//! CC64, aftertouch, SysEx ignored — first pass is notes-only.
 
 use anyhow::{bail, Context, Result};
 use midly::{Format, MetaMessage, MidiMessage, Smf, Timing, TrackEventKind};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-pub struct MidiFile {
-    /// Pulses per quarter note (metrical timing).  Usually 480.
-    pub ppq: u16,
-    /// Initial time signature (numerator, denominator).  Denominator is
-    /// already converted from the file's log2 encoding: `[4, 2]` in the
-    /// file becomes `(4, 4)` here.
-    pub time_sig: (u8, u8),
-    /// Initial tempo in BPM.
-    pub initial_bpm: f64,
-    /// One entry per MIDI channel that carried notes.
-    pub channels: Vec<MidiChannel>,
-}
-
-pub struct MidiChannel {
-    /// MIDI channel number, 0-15.  Channel 9 is percussion.
-    pub channel: u8,
-    /// Track name, if every track carrying this channel had the same one.
-    pub name: Option<String>,
-    /// Last program change on this channel.  Defaults to 0.
-    pub program: u8,
-    /// Bank select MSB (CC 0).
-    pub bank_msb: u8,
-    /// Bank select LSB (CC 32).
-    pub bank_lsb: u8,
-    pub notes: Vec<MidiNote>,
-}
-
-#[derive(Clone, Debug)]
-pub struct MidiNote {
-    /// Start, in quarter-note beats from the file's start.
-    pub start_beat: f64,
-    pub dur_beat: f64,
-    /// MIDI key number, 0-127.
-    pub key: u8,
-    /// Note-on velocity, 1-127.
-    pub velocity: u8,
-}
+use crate::model::midi::{MidiChannel, MidiFile, MidiNote};
 
 pub fn parse_file(path: &Path) -> Result<MidiFile> {
     let bytes = std::fs::read(path)
@@ -111,8 +69,6 @@ pub fn parse_bytes(bytes: &[u8]) -> Result<MidiFile> {
     let mut time_sig = (4u8, 4u8);
     let mut seen_time_sig = false;
 
-    // Per track, record the track name (if any) and which channels it
-    // touched — used below to name each channel's part.
     let mut track_names: Vec<Option<String>> = Vec::with_capacity(smf.tracks.len());
     let mut track_channels: Vec<HashSet<u8>> = Vec::with_capacity(smf.tracks.len());
 
@@ -135,12 +91,8 @@ pub fn parse_bytes(bytes: &[u8]) -> Result<MidiFile> {
                             let k = key.as_int();
                             let v = vel.as_int();
                             if v == 0 {
-                                // Note-on with velocity 0 == note-off.
                                 acc.close(k, tick, ppq_f);
                             } else {
-                                // Retrigger: close any pending same-key
-                                // note first so the previous one has a
-                                // duration.
                                 acc.close(k, tick, ppq_f);
                                 acc.held.insert(k, (tick, v));
                             }
@@ -162,19 +114,12 @@ pub fn parse_bytes(bytes: &[u8]) -> Result<MidiFile> {
                     }
                 }
                 TrackEventKind::Meta(MetaMessage::Tempo(us)) => {
-                    // Honour only the file's initial tempo.  Later
-                    // tempo changes would need halotext tempo shims,
-                    // which is a later pass.
                     if tick == 0 {
                         initial_bpm = 60_000_000.0 / us.as_int() as f64;
                     }
                 }
                 TrackEventKind::Meta(MetaMessage::TimeSignature(n, d, _, _)) => {
                     if !seen_time_sig {
-                        // The second byte is log2(denominator): 2 → 4,
-                        // 3 → 8, 1 → 2, 0 → 1.  A value above 7 is
-                        // malformed; clamp rather than shifting past
-                        // u8.
                         let denom: u8 = match d {
                             0..=7 => 1u8 << d,
                             _     => 128,
@@ -196,8 +141,7 @@ pub fn parse_bytes(bytes: &[u8]) -> Result<MidiFile> {
         track_channels.push(this_channels);
     }
 
-    // Close anything still held (damaged file, or a track that ends
-    // with notes on).  Half a beat is a safe default that won't click.
+    // Close still-held notes.
     for (_, acc) in accs.iter_mut() {
         let held: Vec<u8> = acc.held.keys().copied().collect();
         for k in held {
@@ -217,9 +161,6 @@ pub fn parse_bytes(bytes: &[u8]) -> Result<MidiFile> {
         });
     }
 
-    // Per-channel names: use a track name only if the track owned
-    // exactly one channel.  Otherwise fall back to None (part becomes
-    // ChNN).
     let mut chan_name: HashMap<u8, String> = HashMap::new();
     for (i, chans) in track_channels.iter().enumerate() {
         if chans.len() == 1 {

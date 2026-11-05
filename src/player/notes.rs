@@ -6,7 +6,7 @@
 //! ratatui, colours, or note states.  Formatting for the tracker
 //! views lives in `crate::tui::shared::note_fmt`.
 
-use crate::formats::halotext::HalotextEvent;
+use crate::parse::halotext::HalotextEvent;
 
 #[derive(Clone)]
 pub struct Point {

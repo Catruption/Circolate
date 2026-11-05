@@ -4,8 +4,8 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 
 use crate::archive;
-use crate::convert::{self, ConvertOptions};
-use crate::formats::SourceKind;
+use crate::pipe::{ ConvertOptions};
+use crate::model::source::SourceKind;
 
 use super::audio::Silence;
 use super::cli::Args;
@@ -37,7 +37,7 @@ impl TempBundle {
         Ok(TempBundle { dir })
     }
 
-    pub fn write(&self, c: &convert::Converted, stem: &str) -> Result<PathBuf> {
+    pub fn write(&self, c: &crate::pipe::Converted, stem: &str) -> Result<PathBuf> {
         let ts_path = self.dir.join(format!("{}{}", stem, crate::spec::SOURCE_EXT));
         std::fs::write(&ts_path, &c.halotext)?;
         for s in &c.samples {
@@ -88,14 +88,14 @@ pub fn resolve_source(src: &Path, args: &Args) -> Result<(PathBuf, Option<TempBu
             let conv = {
                 let _s = Silence::new();
                 if let SourceKind::Vgm = SourceKind::from_path(src)? {
-                    crate::convert::vgm::convert_vgm(src, &opts)?
+                    crate::pipe::vgm::convert_vgm(src, &opts)?
                 } else {
-                    convert::convert_file(src, &opts)?
+                    crate::pipe::convert_file(src, &opts)?
                 }
             };
 
             let tb = TempBundle::new("play")?;
-            let stem = convert::output_stem(src);
+            let stem = crate::pipe::output_stem(src);
             let ts = tb.write(&conv, &stem)?;
             if let Some(parent) = src.parent() {
                 for name in ["cover.jpg", "cover.jpeg", "cover.png", "cover.webp"] {

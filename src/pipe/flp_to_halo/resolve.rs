@@ -5,10 +5,10 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
-use crate::convert::AuxFile;
+use crate::pipe::AuxFile;
 use crate::deps::index::PluginIndex;
 use crate::deps::registry::{RegistryTable, Resolution};
-use crate::formats::flp::{self as flp_src, Channel};
+use crate::model::flp::{self as flp_src, Channel};
 
 pub(super) enum Resolved {
     Exact { name: String, path: PathBuf },

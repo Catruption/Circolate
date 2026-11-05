@@ -17,9 +17,9 @@ use super::{safe_name, AuxFile, ConvertOptions, Converted, SampleJsonEntry, Samp
 use crate::deps::index::PluginIndex;
 use crate::deps::registry::RegistryTable;
 use crate::fidelity::MultiSampleFidelity;
-use crate::formats::flp as flp_src;
-use crate::formats::halotext::emit::emit_document_normalized;
-use crate::formats::halotext::{
+use crate::model::flp as flp_src;
+use crate::emit::halotext::emit_document_normalized;
+use crate::parse::halotext::{
     BlockCall, Config, HalotextFile, HalotextPart, MeasureSelection, ShimEvent, FallbackSpec
 };
 
@@ -54,12 +54,13 @@ fn ensure_vst3(s: &str) -> String {
 fn build_channel_to_insert(prj: &flp_src::Project) -> HashMap<u16, u8> {
     let mut out = HashMap::new();
     for chan in &prj.channels {
-        if chan.insert > 0 && chan.insert <= 255 { out.insert(chan.iid, chan.insert as u8); }
+        if chan.insert > 0 && chan.insert <= 255 {
+            out.insert(chan.iid, chan.insert as u8);
+        }
     }
     out
 }
 
-/// Read an `.instrument` sidecar and extract the underlying SF2 path + preset.
 fn read_sf2_sidecar(path: &str, aux_files: &[AuxFile]) -> Option<(String, i16, i16)> {
     let aux = aux_files.iter().find(|a| a.rel_path == path)?;
     let text = std::str::from_utf8(&aux.bytes).ok()?;
@@ -83,14 +84,27 @@ fn read_sf2_sidecar(path: &str, aux_files: &[AuxFile]) -> Option<(String, i16, i
     Some((file, bank, preset))
 }
 
-pub(super) fn convert(prj: &flp_src::Project, src_path: &Path, opts: &ConvertOptions) -> Result<Converted> {
+fn timed<T>(stage: &str, f: impl FnOnce() -> T) -> T {
+    let t = std::time::Instant::now();
+    let r = f();
+    crate::log_event!(
+        "pipe.phase",
+        stage: stage,
+        ms: format!("{}", t.elapsed().as_millis())
+    );
+    r
+}
+
+pub fn convert(prj: &flp_src::Project, src_path: &Path, opts: &ConvertOptions) -> Result<Converted> {
     let subs = opts.subdivisions;
     let ppq = if prj.ppq == 0 { DEFAULT_FLPPQ } else { prj.ppq as u32 };
     let ticks_per_measure = ppq * 4;
     let flp_dir = src_path.parent().unwrap_or_else(|| Path::new("."));
     let tempo = if prj.tempo > 0.0 { prj.tempo } else { DEFAULT_TEMPO };
 
-    let (placed, _used_playlist, dropped_notes) = place_notes(prj);
+    let (placed, _used_playlist, dropped_notes) =
+    timed("place", || place_notes(prj));
+
     let plugin_index = PluginIndex::scan();
     let fallback_table = match RegistryTable::load() {
         Ok(t) => Some(t),
@@ -99,17 +113,24 @@ pub(super) fn convert(prj: &flp_src::Project, src_path: &Path, opts: &ConvertOpt
 
     let mut aux_files: Vec<AuxFile> = Vec::new();
     let mut multi_zones: BTreeMap<String, MultiSampleFidelity> = BTreeMap::new();
-    let mut warnings: Vec<String> = Vec::new();
-    if dropped_notes > 0 { warnings.push(format!("{} note(s) dropped as misdecoded", dropped_notes)); }
 
-    let inserts = extract_inserts(prj, &plugin_index, fallback_table.as_ref(), &mut aux_files);
+    let mut warnings: Vec<String> = prj.parse_warnings.clone();
+    if dropped_notes > 0 {
+        warnings.push(format!("{} note(s) dropped as misdecoded", dropped_notes));
+    }
+
+    let inserts = timed("inserts", || {
+        extract_inserts(prj, &plugin_index, fallback_table.as_ref(), &mut aux_files)
+    });
     let channel_to_insert = build_channel_to_insert(prj);
     let shims_by_channel = place::channel_shims(&inserts, &channel_to_insert);
 
     let Classified {
         usable_samples, usable_embedded, usable_natives, usable_sf2,
         resolved_map, sidecar_path, skipped, warnings: cls_warnings, envelope_only,
-    } = classify_channels(prj, &placed, opts, flp_dir, &plugin_index, fallback_table.as_ref(), &mut aux_files);
+    } = timed("classify", || {
+        classify_channels(prj, &placed, opts, flp_dir, &plugin_index, fallback_table.as_ref(), &mut aux_files)
+    });
     warnings.extend(cls_warnings);
 
     if usable_samples.is_empty() && usable_embedded.is_empty() && usable_natives.is_empty() && usable_sf2.is_empty() {
@@ -127,7 +148,9 @@ pub(super) fn convert(prj: &flp_src::Project, src_path: &Path, opts: &ConvertOpt
     let mut styles: HashMap<u16, NoteStyle> = HashMap::new();
     let mut sample_files: HashMap<u16, String> = HashMap::new();
 
-    // ── sample extraction ──
+    let t_extract = std::time::Instant::now();
+
+    // ── sample extraction (external WAV files) ──
     let mut decoded: Vec<(&flp_src::Channel, PathBuf)> = Vec::with_capacity(usable_samples.len());
     for (chan, src) in &usable_samples {
         let raw_name = if chan.name.is_empty() { src.file_stem().and_then(|s| s.to_str()).unwrap_or("sample").to_string() } else { chan.name.clone() };
@@ -145,7 +168,19 @@ pub(super) fn convert(prj: &flp_src::Project, src_path: &Path, opts: &ConvertOpt
         }
 
         let (pitch_semis, _) = channel_pitch(chan);
-        styles.insert(chan.iid, NoteStyle { transpose: pitch_semis, full_secs: wav_secs(&bytes), bpm: tempo, vol_scale: chan.volume_scale(), pan_offset: chan.pan_norm(), sample_rate, sample_start: start_s, vol_env: extract_vol_env(chan) });
+        let root_offset = chan.root_note.map(|r| FL_C5_MIDI - r as i32).unwrap_or(0);
+        let transpose = pitch_semis + root_offset;
+
+        styles.insert(chan.iid, NoteStyle {
+            transpose,
+            full_secs: wav_secs(&bytes),
+                      bpm: tempo,
+                      vol_scale: chan.volume_scale(),
+                      pan_offset: chan.pan_norm(),
+                      sample_rate,
+                      sample_start: start_s,
+                      vol_env: extract_vol_env(chan),
+        });
 
         sample_files.insert(chan.iid, target_name.clone());
 
@@ -155,6 +190,7 @@ pub(super) fn convert(prj: &flp_src::Project, src_path: &Path, opts: &ConvertOpt
     }
     let usable_samples = decoded;
 
+    // ── embedded sample extraction (zones) ──
     for (chan, emb) in &usable_embedded {
         let raw_name = if chan.name.is_empty() { format!("Ch{:02}", chan.iid) } else { chan.name.clone() };
         let safe = safe_name(&raw_name);
@@ -163,7 +199,16 @@ pub(super) fn convert(prj: &flp_src::Project, src_path: &Path, opts: &ConvertOpt
         let sample_rate = wav_sample_rate(&emb.wav).unwrap_or(44100);
         let (pitch_semis, _) = channel_pitch(chan);
 
-        styles.insert(chan.iid, NoteStyle { transpose: emb.root_key.map_or(0, |r| FL_C5_MIDI - r as i32) + pitch_semis, full_secs: wav_secs(&emb.wav), bpm: tempo, vol_scale: chan.volume_scale(), pan_offset: chan.pan_norm(), sample_rate, sample_start: chan.sample_start.unwrap_or(0), vol_env: extract_vol_env(chan) });
+        styles.insert(chan.iid, NoteStyle {
+            transpose: emb.root_key.map_or(0, |r| FL_C5_MIDI - r as i32) + pitch_semis,
+                      full_secs: wav_secs(&emb.wav),
+                      bpm: tempo,
+                      vol_scale: chan.volume_scale(),
+                      pan_offset: chan.pan_norm(),
+                      sample_rate,
+                      sample_start: chan.sample_start.unwrap_or(0),
+                      vol_env: extract_vol_env(chan),
+        });
 
         sample_files.insert(chan.iid, primary_target);
 
@@ -182,10 +227,41 @@ pub(super) fn convert(prj: &flp_src::Project, src_path: &Path, opts: &ConvertOpt
         if !zone_files.is_empty() { multi_zones.insert(chan.iid.to_string(), MultiSampleFidelity { files: zone_files, root_keys: zone_roots }); }
     }
 
-    for chan in usable_natives.iter().chain(usable_sf2.iter()) {
-        let gain = match resolved_map.get(&chan.iid) { Some(Resolved::Fallback { gain, .. }) => *gain, _ => 1.0 };
-        styles.insert(chan.iid, NoteStyle { vol_scale: chan.volume_scale() * gain as f64, pan_offset: chan.pan_norm(), ..NoteStyle::neutral(tempo) });
+    crate::log_event!(
+        "pipe.phase",
+        stage: "extract_assets",
+        ms: format!("{}", t_extract.elapsed().as_millis())
+    );
+
+    // ── VST / native FL plugin styles ──
+    for chan in usable_natives.iter() {
+        let gain = match resolved_map.get(&chan.iid) {
+            Some(Resolved::Fallback { gain, .. }) => *gain,
+            _ => 1.0,
+        };
+        styles.insert(chan.iid, NoteStyle {
+            vol_scale: chan.volume_scale() * gain as f64,
+                      pan_offset: chan.pan_norm(),
+                      ..NoteStyle::neutral(tempo)
+        });
     }
+
+    // ── Slicex / SoundFont player styles ──
+    for chan in usable_sf2.iter() {
+        let gain = match resolved_map.get(&chan.iid) {
+            Some(Resolved::Fallback { gain, .. }) => *gain,
+            _ => 1.0,
+        };
+        let (pitch_semis, _) = channel_pitch(chan);
+        styles.insert(chan.iid, NoteStyle {
+            transpose: pitch_semis,
+            vol_scale: chan.volume_scale() * gain as f64,
+                      pan_offset: chan.pan_norm(),
+                      ..NoteStyle::neutral(tempo)
+        });
+    }
+
+    let t_assemble = std::time::Instant::now();
 
     // ── assemble HalotextFile ──
     let title = if prj.title.is_empty() { src_path.file_stem().and_then(|s| s.to_str()).unwrap_or("(untitled)").to_string() } else { prj.title.clone() };
@@ -348,9 +424,14 @@ pub(super) fn convert(prj: &flp_src::Project, src_path: &Path, opts: &ConvertOpt
         }
     }
 
-    let mut halotext = emit_document_normalized(&mut file);
+    crate::log_event!(
+        "pipe.phase",
+        stage: "assemble",
+        ms: format!("{}", t_assemble.elapsed().as_millis())
+    );
 
-    // Append comments directly to the output string
+    let mut halotext = timed("emit", || emit_document_normalized(&mut file));
+
     halotext.push_str("\n// ------------------------------------------------------------\n");
     halotext.push_str(&format!("// {}\n", title));
     halotext.push_str(&format!("// converted from FL Studio project ({}) by flp2halotext\n", source_name));
@@ -371,22 +452,39 @@ pub(super) fn convert(prj: &flp_src::Project, src_path: &Path, opts: &ConvertOpt
         format: "halotext-sample-library", version: 2, samples: sample_meta, instruments: vec![],
     })?;
 
-    let mut fidelity = build_fidelity(prj, &resolved_map, &HashMap::new());
+    let mut fidelity = timed("fidelity", || {
+        build_fidelity(prj, &resolved_map, &HashMap::new())
+    });
     fidelity.multi_sample = multi_zones;
     fidelity.inserts = inserts;
 
+    // FIDELITY FIX: serialize fidelity.json into aux so the player's
+    // loader (player/project/loader.rs::read_text(FIDELITY_FILENAME))
+    // actually finds it. Without this, build_fidelity runs and its
+    // result is discarded, and `Fidelity::from_json` in the player
+    // always returns None.
+    match fidelity.to_json() {
+        Ok(json) => aux_files.push(AuxFile {
+            rel_path: crate::fidelity::FIDELITY_FILENAME.to_string(),
+                                   bytes: json.into_bytes(),
+        }),
+        Err(e) => warnings.push(format!("fidelity serialization failed: {:#}", e)),
+    }
+
+    // FIDELITY FIX: the retain used to strip `fidelity.json` here, which
+    // is what broke the round-trip. It now only strips per-channel
+    // .instrument sidecars (redundant with the halotext part declaration).
     aux_files.retain(|a| {
         let p = a.rel_path.as_str();
-        let is_instrument_sidecar = p.starts_with("instruments/") && p.ends_with(".instrument");
-        !is_instrument_sidecar && !p.starts_with("inserts/") && p != crate::fidelity::FIDELITY_FILENAME
+        let is_channel_instrument = p.starts_with("instruments/") && p.ends_with(".instrument");
+        !is_channel_instrument
     });
 
     Ok(Converted { halotext, samples: sample_outs, samples_json, aux: aux_files })
 }
 
-// probe() left exactly as it was...
 pub fn probe(src_path: &Path, opts: &ConvertOptions) -> Result<ProbeReport> {
-    let prj = crate::formats::flp::parse_file(src_path)?;
+    let prj = crate::parse::flp::parse_file(src_path)?;
     let flp_dir = src_path.parent().unwrap_or_else(|| Path::new("."));
     let (placed, _, _) = place_notes(&prj);
     let plugin_index = PluginIndex::scan();
@@ -402,7 +500,14 @@ pub fn probe(src_path: &Path, opts: &ConvertOptions) -> Result<ProbeReport> {
     for c in &usable_natives       { used.insert(c.iid); }
     for c in &usable_sf2           { used.insert(c.iid); }
 
-    let mut report = ProbeReport { warnings, ..Default::default() };
+    let mut report = ProbeReport {
+        warnings: {
+            let mut w = prj.parse_warnings.clone();
+            w.extend(warnings);
+            w
+        },
+        ..Default::default()
+    };
 
     for chan in &prj.channels {
         if used.contains(&chan.iid) { continue; }

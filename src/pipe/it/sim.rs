@@ -5,9 +5,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::formats::it::{
-    note_termination, Instrument, ITEnvelope, Module, NoteTermination, PatternEvent,
-};
+use crate::model::it::{Instrument, ITEnvelope, Module, NoteTermination, PatternEvent};
+use crate::parse::it::note_termination;
 
 use super::helpers::*;
 
@@ -179,7 +178,7 @@ pub(super) struct ExecutedRow {
 
 pub(super) struct Converter<'a> {
     pub(super) m: &'a Module,
-    pub(super) pitch_mode: crate::convert::PitchMode,
+    pub(super) pitch_mode: crate::pipe::PitchMode,
     pub(super) fake_ins: Instrument,
 
     pub(super) warn: Vec<(String, u32)>,
@@ -209,7 +208,7 @@ pub(super) struct Converter<'a> {
 }
 
 impl<'a> Converter<'a> {
-    pub(super) fn new(m: &'a Module, pitch_mode: crate::convert::PitchMode) -> Self {
+    pub(super) fn new(m: &'a Module, pitch_mode: crate::pipe::PitchMode) -> Self {
         let ch = (0..64)
             .map(|i| {
                 let pan = m.chnpan.get(i).copied().unwrap_or(32);

@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::fidelity::Fidelity;
 use crate::deps::requires::Requires;
-use crate::formats::halotext::{ShimEvent, HalotextEvent, HalotextPart};
+use crate::parse::halotext::{ShimEvent, HalotextEvent, HalotextPart};
 use crate::hosting::chip::patch::Patch;
 use crate::hosting::chip::dac::DacTrack;
 use crate::timing::TempoMap;

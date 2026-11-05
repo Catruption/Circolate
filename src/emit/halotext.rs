@@ -1,6 +1,6 @@
 //! Halotext emitter. The only module that writes halotext syntax.
 
-use super::types::*;
+use crate::model::halotext::*;
 use crate::spec::{
     slot_to_greek, FIELD_DURATION, FIELD_MIX, FIELD_PAN, FIELD_SOURCE, FIELD_VOLUME,
 };

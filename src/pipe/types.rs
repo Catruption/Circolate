@@ -6,19 +6,13 @@
 //! the source.  Callers (`export`, `play`, `test`) write the bundle
 //! themselves.
 
-pub mod vgm;
-mod flp;
-mod it;
-mod midi;
-mod song;
-pub use flp::{DepKind, ProbeReport};
+pub use crate::pipe::flp_to_halo::{DepKind, ProbeReport};
 
 use anyhow::Result;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
-use crate::formats::halotext;
-use crate::formats::{self, SourceKind};
+use crate::model::source::SourceKind;
 
 // ── public API ─────────────────────────────────────────────────────────
 
@@ -77,21 +71,21 @@ pub struct Converted {
 pub fn convert_file(src: &Path, opts: &ConvertOptions) -> Result<Converted> {
     match SourceKind::from_path(src)? {
         SourceKind::Flp => {
-            let prj = formats::flp::parse_file(src)?;
-            flp::convert(&prj, src, opts)
+            let prj = crate::parse::flp::parse_file(src)?;
+            crate::pipe::flp_to_halo::convert(&prj, src, opts)
         }
         SourceKind::It => {
-            let module = formats::it::parse_file(src)?;
-            it::convert(&module, src, opts)
+            let module = crate::parse::it::parse_file(src)?;
+            super::it::convert(&module, src, opts)
         }
         SourceKind::Midi => {
-            let mf = formats::midi::parse_file(src)?;
-            midi::convert(&mf, src, opts)
+            let mf = crate::parse::midi::parse_file(src)?;
+            super::midi::convert(&mf, src, opts)
         }
-        SourceKind::Vgm => vgm::convert_vgm(src, opts), // <--- ADD THIS ARM
+        SourceKind::Vgm => crate::pipe::vgm::convert_vgm(src, opts), // <--- ADD THIS ARM
         SourceKind::Halotext => {
             let text = std::fs::read_to_string(src)?;
-            halotext::parse_str(&text)?;
+            crate::parse::halotext::parse_str(&text)?;
             Ok(Converted {
                 halotext: text,
                 samples: Vec::new(),
@@ -104,7 +98,7 @@ pub fn convert_file(src: &Path, opts: &ConvertOptions) -> Result<Converted> {
 
 pub fn probe_file(src: &Path, opts: &ConvertOptions) -> Result<ProbeReport> {
     match SourceKind::from_path(src)? {
-        SourceKind::Flp => flp::probe(src, opts),
+        SourceKind::Flp => crate::pipe::flp_to_halo::probe(src, opts),
         _ => anyhow::bail!("check only supports .flp files (got {})", src.display()),
     }
 }
@@ -143,13 +137,13 @@ const NOTE_NAMES: [&str; 12] = [
     "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
 ];
 
-fn note_name(n: i32) -> String {
+pub fn note_name(n: i32) -> String {
     let idx = n.rem_euclid(12) as usize;
     let octave = n.div_euclid(12);
     format!("{}{}", NOTE_NAMES[idx], octave)
 }
 
-fn safe_name(s: &str) -> String {
+pub fn safe_name(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut prev_us = false;
     for c in s.chars() {
@@ -165,7 +159,7 @@ fn safe_name(s: &str) -> String {
     if t.is_empty() { "part".into() } else { t.into() }
 }
 
-fn identifier(s: &str) -> String {
+pub fn identifier(s: &str) -> String {
     let s = safe_name(s);
     if s.chars().next().map_or(false, |c| c.is_ascii_digit()) {
         format!("_{}", s)
@@ -174,13 +168,13 @@ fn identifier(s: &str) -> String {
     }
 }
 
-fn fmt(x: f64, nd: usize) -> String {
+pub fn fmt(x: f64, nd: usize) -> String {
     let s = format!("{:.*}", nd, x);
     let t = s.trim_end_matches('0').trim_end_matches('.');
     if t.is_empty() || t == "-0" { "0".into() } else { t.into() }
 }
 
-fn pos_str(row: f64, subs: u32) -> String {
+pub fn pos_str(row: f64, subs: u32) -> String {
     let subs_f = subs as f64;
     let mut beat = (row / subs_f).floor() as i64 + 1;
     let sub = row - subs_f * (beat as f64 - 1.0) + 1.0;
@@ -200,18 +194,18 @@ fn pos_str(row: f64, subs: u32) -> String {
 // ── samples.json ───────────────────────────────────────────────────────
 
 #[derive(Serialize)]
-struct SamplesJson {
-    format: &'static str,
-    version: u32,
-    samples: Vec<SampleJsonEntry>,
-    instruments: Vec<serde_json::Value>,
+pub struct SamplesJson {
+    pub format: &'static str,
+    pub version: u32,
+    pub samples: Vec<SampleJsonEntry>,
+    pub instruments: Vec<serde_json::Value>,
 }
 
 #[derive(Serialize)]
-struct SampleJsonEntry {
-    id: u16,
-    name: String,
-    file: String,
+pub struct SampleJsonEntry {
+    pub id: u16,
+    pub name: String,
+    pub file: String,
     #[serde(rename = "c5Speed")]
-    c5_speed: u32,
+    pub c5_speed: u32,
 }

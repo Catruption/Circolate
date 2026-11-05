@@ -16,7 +16,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 use anyhow::Result;
 use arc_swap::ArcSwapOption;
 
-use crate::audio_decode::decode_audio;
+use crate::parse::wav::decode_audio;
 use crate::deps::index::PluginIndex;
 
 use super::project::Project;

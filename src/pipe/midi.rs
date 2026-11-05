@@ -33,7 +33,7 @@ use super::{fmt, note_name, pos_str, safe_name, AuxFile, ConvertOptions, Convert
 use crate::hosting::sf2::sfl2::hi::SoundFont;
 use crate::hosting::sf2::sfl2::lo::Sf2Data;
 use crate::spec;
-use crate::formats::midi::{MidiChannel, MidiFile, MidiNote};
+use crate::model::midi::{MidiChannel, MidiFile, MidiNote};
 
 /// Files bigger than this are assumed to be general-purpose GM banks
 /// and skipped during per-channel matching.  A single-instrument SF2

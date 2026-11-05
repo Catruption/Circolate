@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
-use crate::formats::SourceKind;
+use crate::model::source::SourceKind;
 use crate::player::{self, Cache, Engine, Loader, Msg, Project, Transport};
 use crate::tui::{self, app::{LoopOutcome, TuiBackend}};
 use crate::tui::config::Settings;
@@ -164,7 +164,7 @@ pub fn play_one(
         let ipc_path = args.ipc.as_deref().unwrap_or_else(|| Path::new("/tmp/circolate.sock"));
         let source_file = std::fs::canonicalize(&project_path)
             .unwrap_or_else(|_| project_path.clone());
-        crate::play::playhead::spawn_ipc_server(
+        crate::cli::play::playhead::spawn_ipc_server(
             ipc_path.to_string_lossy().into_owned(),
             source_file.to_string_lossy().into_owned(),
             Arc::clone(&transport),

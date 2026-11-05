@@ -4,7 +4,7 @@
 
 use crate::player::{Project, Sample};
 use crate::player::notes::{split_notes, value_at};
-use crate::formats::halotext::C5_HZ;
+use crate::parse::halotext::C5_HZ;
 
 /// Cap source samples read per pixel row.  Long samples otherwise stall
 /// the renderer at 20 FPS.

@@ -1,52 +1,38 @@
-// src/sources/flp.rs
-//! FL Studio project (.flp) reader — Rust port of flp_parser.py.
+//! FL Studio project (.flp) reader — byte walking and decoding.
+//!
+//! Pure functions: given the same bytes, produce the same `Project`.
+//! One exception: `parse_file` reads from disk. See the TODO on it.
+//!
+//! Design goals:
+//! 1. Read the event stream top-to-bottom without ever losing alignment.
+//!    All 192–255 events carry a varint length; versioned sizes do not
+//!    affect alignment.
+//! 2. Decode every field that circolate's output format can represent.
+//! 3. Preserve raw bytes for anything we do not decode, and report what
+//!    was skipped, so a downstream converter can grow without re-reading
+//!    the original FLP.
 
 use anyhow::{anyhow, bail, Result};
-use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-// ── event ids ──────────────────────────────────────────────────────────
-
-const EV_CHAN_ENABLED: u8 = 0;
-const EV_CHAN_TYPE: u8 = 21;
-const EV_CHAN_SAMPLE_START: u8 = 67;
-const EV_CHAN_SAMPLE_END: u8 = 68;
-const EV_CHAN_ROOT_NOTE: u8 = 135;
-const EV_CHAN_FINE_TUNE: u8 = 142;
-const EV_CHAN_SAMPLER_FLAGS: u8 = 143;
-const EV_CHAN_ENV_LFO: u8 = 218;
-const EV_CHAN_LEVELS: u8 = 219;
-const EV_CHAN_TRACKING: u8 = 228;
-const EV_CHAN_LEVEL_ADJUSTS: u8 = 229;
-/// Mixer insert for a channel.  0 = master (no per-channel effects),
-/// 1..=127 = user insert index (matches the key in `prj.inserts`).
-/// Verified against pyflp: `EventID.Channel_MixerTrack = 178`.
-const EV_CHAN_MIXER_TRACK: u8 = 178;
-
-const EV_NEW_CHAN: u8 = 64;
-const EV_NEW_PAT: u8 = 65;
-const EV_TEMPO_OLD: u8 = 66;
-const EV_FINE_TEMPO: u8 = 156;
-const EV_COLOR: u8 = 128;
-const EV_TEXT_CHAN_NAME: u8 = 192;
-const EV_TEXT_PAT_NAME: u8 = 193;
-const EV_TEXT_TITLE: u8 = 194;
-const EV_TEXT_COMMENT: u8 = 195;
-const EV_TEXT_SAMPLE: u8 = 196;
-const EV_TEXT_VERSION: u8 = 199;
-const EV_TEXT_DEF_PLUGIN: u8 = 201;
-const EV_TEXT_DATA_PATH: u8 = 202;
-const EV_TEXT_PLUGIN_NAME: u8 = 203;
-const EV_TEXT_FX_NAME: u8 = 204;
-const EV_TEXT_GENRE: u8 = 206;
-const EV_TEXT_AUTHOR: u8 = 207;
-const EV_NEW_PLUGIN: u8 = 212;
-const EV_PLUGIN_PARAMS: u8 = 213;
-const EV_PAT_NOTES: u8 = 224;
-const EV_PLAYLIST: u8 = 233;
-
-const NOTE_SIZE: usize = 24;
+use crate::model::flp::{
+    Channel, ChannelDelay, EnvelopeLfo, EventCoverage, Insert, LevelAdjusts, Levels,
+    Note, Pattern, PlaylistItem, Plugin, Project, RawEvent, Tracking,
+};
+use crate::spec::flp::events::{
+    CHANNEL_TYPE_NAMES, HANDLED_EVENT_IDS, NOTE_SIZE,
+    EV_CHAN_DELAY, EV_CHAN_ENABLED, EV_CHAN_ENV_LFO, EV_CHAN_FINE_TUNE,
+    EV_CHAN_LEVEL_ADJUSTS, EV_CHAN_LEVELS, EV_CHAN_MIXER_TRACK,
+    EV_CHAN_PARAMETERS, EV_CHAN_POLYPHONY, EV_CHAN_ROOT_NOTE,
+    EV_CHAN_SAMPLER_FLAGS, EV_CHAN_SAMPLE_END, EV_CHAN_SAMPLE_START,
+    EV_CHAN_TRACKING, EV_CHAN_TYPE, EV_COLOR, EV_FINE_TEMPO, EV_NEW_CHAN,
+    EV_NEW_PAT, EV_NEW_PLUGIN, EV_PAT_NOTES, EV_PLAYLIST, EV_PLUGIN_PARAMS,
+    EV_REMOTE_CONTROLLER, EV_TEMPO_OLD, EV_TEXT_AUTHOR, EV_TEXT_CHAN_NAME,
+    EV_TEXT_COMMENT, EV_TEXT_DATA_PATH, EV_TEXT_DEF_PLUGIN, EV_TEXT_FX_NAME,
+    EV_TEXT_GENRE, EV_TEXT_PAT_NAME, EV_TEXT_PLUGIN_NAME, EV_TEXT_SAMPLE,
+    EV_TEXT_TITLE, EV_TEXT_VERSION, EV_TRACK_DATA,
+};
 
 // ── little-endian field helpers ────────────────────────────────────────
 
@@ -65,60 +51,7 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{:02x}", x)).collect::<Vec<_>>().join(" ")
 }
 
-// ── channel substructures ──────────────────────────────────────────────
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct EnvelopeLfo {
-    pub flags: i32,
-    pub env_enabled: i32,
-    pub env_predelay: i32,
-    pub env_attack: i32,
-    pub env_hold: i32,
-    pub env_decay: i32,
-    pub env_sustain: i32,
-    pub env_release: i32,
-    pub env_amount: i32,
-    pub lfo_predelay: u32,
-    pub lfo_attack: u32,
-    pub lfo_amount: i32,
-    pub lfo_speed: u32,
-    pub lfo_shape: i32,
-    pub env_attack_tension: i32,
-    pub env_decay_tension: i32,
-    pub env_release_tension: i32,
-}
-
-pub const ENV_PANNING: usize = 0;
-pub const ENV_VOLUME: usize = 1;
-pub const ENV_MOD_X: usize = 2;
-pub const ENV_MOD_Y: usize = 3;
-pub const ENV_PITCH: usize = 4;
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct Levels {
-    pub pan: i32,
-    pub volume: u32,
-    pub pitch_shift: i32,
-    pub filter_mod_x: u32,
-    pub filter_mod_y: u32,
-    pub filter_type: u32,
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct Tracking {
-    pub middle_value: u32,
-    pub pan: i32,
-    pub mod_x: i32,
-    pub mod_y: i32,
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct LevelAdjusts {
-    pub pan: i32,
-    pub volume: u32,
-    pub mod_x: i32,
-    pub mod_y: i32,
-}
+// ── substructure decoders ─────────────────────────────────────────────
 
 fn decode_env_lfo(b: &[u8]) -> Option<EnvelopeLfo> {
     if b.len() < 68 {
@@ -126,22 +59,22 @@ fn decode_env_lfo(b: &[u8]) -> Option<EnvelopeLfo> {
     }
     Some(EnvelopeLfo {
         flags: i32le(b, 0),
-         env_enabled: i32le(b, 4),
-         env_predelay: i32le(b, 8),
-         env_attack: i32le(b, 12),
-         env_hold: i32le(b, 16),
-         env_decay: i32le(b, 20),
-         env_sustain: i32le(b, 24),
-         env_release: i32le(b, 28),
-         env_amount: i32le(b, 32),
-         lfo_predelay: u32le(b, 36),
-         lfo_attack: u32le(b, 40),
-         lfo_amount: i32le(b, 44),
-         lfo_speed: u32le(b, 48),
-         lfo_shape: i32le(b, 52),
-         env_attack_tension: i32le(b, 56),
-         env_decay_tension: i32le(b, 60),
-         env_release_tension: i32le(b, 64),
+        env_enabled: i32le(b, 4),
+        env_predelay: i32le(b, 8),
+        env_attack: i32le(b, 12),
+        env_hold: i32le(b, 16),
+        env_decay: i32le(b, 20),
+        env_sustain: i32le(b, 24),
+        env_release: i32le(b, 28),
+        env_amount: i32le(b, 32),
+        lfo_predelay: u32le(b, 36),
+        lfo_attack: u32le(b, 40),
+        lfo_amount: i32le(b, 44),
+        lfo_speed: u32le(b, 48),
+        lfo_shape: i32le(b, 52),
+        env_attack_tension: i32le(b, 56),
+        env_decay_tension: i32le(b, 60),
+        env_release_tension: i32le(b, 64),
     })
 }
 
@@ -151,11 +84,11 @@ fn decode_levels(b: &[u8]) -> Option<Levels> {
     }
     Some(Levels {
         pan: i32le(b, 0),
-         volume: u32le(b, 4),
-         pitch_shift: i32le(b, 8),
-         filter_mod_x: u32le(b, 12),
-         filter_mod_y: u32le(b, 16),
-         filter_type: u32le(b, 20),
+        volume: u32le(b, 4),
+        pitch_shift: i32le(b, 8),
+        filter_mod_x: u32le(b, 12),
+        filter_mod_y: u32le(b, 16),
+        filter_type: u32le(b, 20),
     })
 }
 
@@ -165,9 +98,9 @@ fn decode_tracking(b: &[u8]) -> Option<Tracking> {
     }
     Some(Tracking {
         middle_value: u32le(b, 0),
-         pan: i32le(b, 4),
-         mod_x: i32le(b, 8),
-         mod_y: i32le(b, 12),
+        pan: i32le(b, 4),
+        mod_x: i32le(b, 8),
+        mod_y: i32le(b, 12),
     })
 }
 
@@ -177,271 +110,34 @@ fn decode_level_adjusts(b: &[u8]) -> Option<LevelAdjusts> {
     }
     Some(LevelAdjusts {
         pan: i32le(b, 0),
-         volume: u32le(b, 4),
-         mod_x: i32le(b, 12),
-         mod_y: i32le(b, 16),
+        volume: u32le(b, 4),
+        mod_x: i32le(b, 12),
+        mod_y: i32le(b, 16),
     })
 }
 
-// ── data model ─────────────────────────────────────────────────────────
+fn decode_channel_delay(b: &[u8]) -> Option<ChannelDelay> {
+    if b.len() < 20 {
+        return None;
+    }
+    Some(ChannelDelay {
+        feedback: i32le(b, 0),
+        pan: i32le(b, 4),
+        pitch_shift: i32le(b, 8),
+        echoes: i32le(b, 12),
+        time: i32le(b, 16),
+    })
+}
 
 fn channel_type_name(id: u8) -> String {
-    match id {
-        0 => "sampler".into(),
-        2 => "native".into(),
-        3 => "layer".into(),
-        4 => "instrument".into(),
-        5 => "automation".into(),
-        _ => format!("type{id}"),
-    }
+    CHANNEL_TYPE_NAMES
+        .iter()
+        .find(|(k, _)| *k == id)
+        .map(|(_, v)| v.to_string())
+        .unwrap_or_else(|| format!("type{id}"))
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct Note {
-    pub position: u32,
-    pub length: u32,
-    pub key: u16,
-    pub channel: u16,
-    pub velocity: u8,
-    pub pan: u8,
-    pub fine_pitch: u8,
-    pub release: u8,
-    pub mod_x: u8,
-    pub mod_y: u8,
-    pub flags: u16,
-    pub group: u16,
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct Plugin {
-    pub owner: u32,
-    pub internal_name: String,
-    pub display_name: String,
-    pub vst_path: String,
-    pub state_size: usize,
-    #[serde(skip)]
-    pub state: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct Channel {
-    pub iid: u16,
-    pub type_id: i16,
-    #[serde(rename = "type")]
-    pub channel_type: String,
-    pub name: String,
-    pub color: Option<u32>,
-    pub sample_path: String,
-    pub plugin: Option<Plugin>,
-
-    /// Mixer insert the channel feeds.  0 = master, 1..=127 = user
-    /// insert index (matches the key in `Project.inserts`).
-    pub insert: u16,
-
-    pub enabled: Option<bool>,
-    pub levels: Option<Levels>,
-    pub envelopes: Vec<EnvelopeLfo>,
-    pub tracking: Vec<Tracking>,
-    pub level_adjusts: Option<LevelAdjusts>,
-    pub sampler_flags: Option<u32>,
-    pub sample_start: Option<u32>,
-    pub sample_end: Option<u32>,
-    pub root_note: Option<u32>,
-    pub fine_tune: Option<i32>,
-}
-
-impl Channel {
-    fn new(iid: u16) -> Self {
-        Channel {
-            iid,
-            type_id: -1,
-            channel_type: "?".into(),
-            name: String::new(),
-            color: None,
-            sample_path: String::new(),
-            plugin: None,
-            insert: 0,
-            enabled: None,
-            levels: None,
-            envelopes: Vec::new(),
-            tracking: Vec::new(),
-            level_adjusts: None,
-            sampler_flags: None,
-            sample_start: None,
-            sample_end: None,
-            root_note: None,
-            fine_tune: None,
-        }
-    }
-
-    pub fn envelope(&self, slot: usize) -> Option<&EnvelopeLfo> {
-        self.envelopes.get(slot)
-    }
-
-    pub fn pan_norm(&self) -> f64 {
-        if let Some(l) = &self.levels {
-            return ((l.pan as f64 - 6400.0) / 6400.0).clamp(-1.0, 1.0);
-        }
-        if let Some(l) = &self.level_adjusts {
-            return (l.pan as f64 / 12800.0).clamp(-1.0, 1.0);
-        }
-        0.0
-    }
-
-    pub fn volume_scale(&self) -> f64 {
-        if let Some(l) = &self.levels {
-            if l.volume == 0 {
-                return 0.0;
-            }
-            return (l.volume as f64 / 12800.0).clamp(0.0, 2.0);
-        }
-        if let Some(l) = &self.level_adjusts {
-            if l.volume == 0 {
-                return 0.0;
-            }
-            return (l.volume as f64 / 12800.0).clamp(0.0, 2.0);
-        }
-        1.0
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct Pattern {
-    pub iid: u16,
-    pub name: String,
-    pub notes: Vec<Note>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct PlaylistItem {
-    pub position: u32,
-    pub length: u32,
-    pub track: i32,
-    pub kind: String,
-    #[serde(rename = "ref")]
-    pub ref_id: u16,
-    pub flags: u16,
-    pub start_offset_ms: f32,
-    pub end_offset_ms: f32,
-    pub clip_start_ticks: u32,
-    pub fade_in_ms: f32,
-    pub fade_out_ms: f32,
-    pub fade_in_curve: f32,
-    pub fade_out_curve: f32,
-    #[serde(skip)]
-    pub raw: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct Insert {
-    pub index: u32,
-    pub name: String,
-    pub plugins: Vec<Plugin>,
-}
-
-#[derive(Debug, Default, Serialize)]
-pub struct Project {
-    pub version: String,
-    pub ppq: u16,
-    pub tempo: f64,
-    pub title: String,
-    pub author: String,
-    pub genre: String,
-    pub comment: String,
-    pub data_path: String,
-    pub channels: Vec<Channel>,
-    pub patterns: Vec<Pattern>,
-    pub inserts: BTreeMap<u32, Insert>,
-    pub playlist: Vec<PlaylistItem>,
-    pub samples: Vec<String>,
-    #[serde(skip)]
-    pub events: Vec<(u8, Vec<u8>)>,
-    #[serde(default)]
-    pub parse_warnings: Vec<String>,
-}
-
-// ── event stream ───────────────────────────────────────────────────────
-
-fn read_events(data: &[u8]) -> Result<(u16, Vec<(u8, Vec<u8>)>, Vec<String>)> {
-    if data.len() < 14 || &data[0..4] != b"FLhd" {
-        bail!("not an FL Studio project (missing FLhd)");
-    }
-    let hdr_len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
-    let ppq = u16::from_le_bytes([data[12], data[13]]);
-
-    let mut p = 8 + hdr_len;
-    if p + 8 > data.len() || &data[p..p + 4] != b"FLdt" {
-        bail!("missing FLdt data chunk");
-    }
-    let length =
-    u32::from_le_bytes([data[p + 4], data[p + 5], data[p + 6], data[p + 7]]) as usize;
-    p += 8;
-    let end = (p + length).min(data.len());
-
-    let mut events = Vec::new();
-    let mut warnings: Vec<String> = Vec::new();
-
-    while p < end {
-        let ev_off = p;
-        let ev = data[p];
-        p += 1;
-
-        let size = if ev < 64 {
-            1
-        } else if ev < 128 {
-            2
-        } else if ev < 192 {
-            4
-        } else {
-            let mut size: usize = 0;
-            let mut shift: u32 = 0;
-            loop {
-                if p >= end {
-                    warnings.push(format!(
-                        "truncated varint length for event {:#04x} at offset {:#x}; stopping parse",
-                        ev, ev_off
-                    ));
-                    return Ok((ppq, events, warnings));
-                }
-                let b = data[p];
-                p += 1;
-                size |= ((b & 0x7F) as usize) << shift;
-                shift += 7;
-                if b & 0x80 == 0 {
-                    break;
-                }
-                if shift > 28 {
-                    bail!("event length overflow at offset {:#x}", ev_off);
-                }
-            }
-            size
-        };
-
-        if p + size > end {
-            let have = end.saturating_sub(p);
-            warnings.push(format!(
-                "truncated event {:#04x} at offset {:#x}: needs {} byte(s), {} available; stopping parse",
-                                  ev, ev_off, size, have
-            ));
-            return Ok((ppq, events, warnings));
-        }
-
-        events.push((ev, data[p..p + size].to_vec()));
-        p += size;
-    }
-
-    if p != end {
-        warnings.push(format!(
-            "event stream ended at offset {:#x}, expected {:#x} ({} bytes unread); \
-event sizes are likely misparsed",
-p, end, end.saturating_sub(p)
-        ));
-    }
-
-    Ok((ppq, events, warnings))
-}
-
-// ── text decoding ──────────────────────────────────────────────────────
+// ── text decoding ─────────────────────────────────────────────────────
 
 fn decode_utf16le(raw: &[u8]) -> String {
     let cap = raw.len() & !1;
@@ -453,9 +149,9 @@ fn decode_utf16le(raw: &[u8]) -> String {
         n += 2;
     }
     let units: Vec<u16> = (0..n)
-    .step_by(2)
-    .map(|i| u16::from_le_bytes([raw[i], raw[i + 1]]))
-    .collect();
+        .step_by(2)
+        .map(|i| u16::from_le_bytes([raw[i], raw[i + 1]]))
+        .collect();
     String::from_utf16_lossy(&units)
 }
 
@@ -495,7 +191,7 @@ fn text(ev: u8, raw: &[u8]) -> String {
     String::from_utf8_lossy(&raw[..nul]).into_owned()
 }
 
-// ── VST path extraction ────────────────────────────────────────────────
+// ── VST path extraction ───────────────────────────────────────────────
 
 fn vst_path_of(blob: &[u8]) -> String {
     let n = blob.len();
@@ -535,7 +231,7 @@ fn vst_path_of(blob: &[u8]) -> String {
     String::new()
 }
 
-// ── note decoding ──────────────────────────────────────────────────────
+// ── note decoding ─────────────────────────────────────────────────────
 
 fn decode_notes(raw: &[u8]) -> Vec<Note> {
     let mut out = Vec::with_capacity(raw.len() / NOTE_SIZE);
@@ -567,7 +263,7 @@ fn decode_notes(raw: &[u8]) -> Vec<Note> {
     out
 }
 
-// ── playlist decoding ──────────────────────────────────────────────────
+// ── playlist decoding ─────────────────────────────────────────────────
 
 fn version_major(v: &str) -> Option<u32> {
     v.split('.').next()?.trim().parse().ok()
@@ -687,7 +383,88 @@ fn decode_playlist(raw: &[u8], major: Option<u32>) -> Vec<PlaylistItem> {
     items
 }
 
-// ── main parse ─────────────────────────────────────────────────────────
+// ── event stream ──────────────────────────────────────────────────────
+
+fn read_events(data: &[u8]) -> Result<(u16, Vec<(u8, Vec<u8>)>, Vec<String>)> {
+    if data.len() < 14 || &data[0..4] != b"FLhd" {
+        bail!("not an FL Studio project (missing FLhd)");
+    }
+    let hdr_len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+    let ppq = u16::from_le_bytes([data[12], data[13]]);
+
+    let mut p = 8 + hdr_len;
+    if p + 8 > data.len() || &data[p..p + 4] != b"FLdt" {
+        bail!("missing FLdt data chunk");
+    }
+    let length =
+    u32::from_le_bytes([data[p + 4], data[p + 5], data[p + 6], data[p + 7]]) as usize;
+    p += 8;
+    let end = (p + length).min(data.len());
+
+    let mut events = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    while p < end {
+        let ev_off = p;
+        let ev = data[p];
+        p += 1;
+
+        let size = if ev < 64 {
+            1
+        } else if ev < 128 {
+            2
+        } else if ev < 192 {
+            4
+        } else {
+            let mut size: usize = 0;
+            let mut shift: u32 = 0;
+            loop {
+                if p >= end {
+                    warnings.push(format!(
+                        "truncated varint length for event {:#04x} at offset {:#x}; stopping parse",
+                        ev, ev_off
+                    ));
+                    return Ok((ppq, events, warnings));
+                }
+                let b = data[p];
+                p += 1;
+                size |= ((b & 0x7F) as usize) << shift;
+                shift += 7;
+                if b & 0x80 == 0 {
+                    break;
+                }
+                if shift > 28 {
+                    bail!("event length overflow at offset {:#x}", ev_off);
+                }
+            }
+            size
+        };
+
+        if p + size > end {
+            let have = end.saturating_sub(p);
+            warnings.push(format!(
+                "truncated event {:#04x} at offset {:#x}: needs {} byte(s), {} available; stopping parse",
+                ev, ev_off, size, have
+            ));
+            return Ok((ppq, events, warnings));
+        }
+
+        events.push((ev, data[p..p + size].to_vec()));
+        p += size;
+    }
+
+    if p != end {
+        warnings.push(format!(
+            "event stream ended at offset {:#x}, expected {:#x} ({} bytes unread); \
+             event sizes are likely misparsed",
+            p, end, end.saturating_sub(p)
+        ));
+    }
+
+    Ok((ppq, events, warnings))
+}
+
+// ── main parse ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy)]
 enum PluginRef {
@@ -709,7 +486,7 @@ pub fn parse(data: &[u8]) -> Result<Project> {
 
     if std::env::var_os("FLP_DUMP_EVENTS").is_some() {
         let mut freq: std::collections::BTreeMap<u8, Vec<usize>> =
-        std::collections::BTreeMap::new();
+            std::collections::BTreeMap::new();
         for (ev, raw) in &events {
             freq.entry(*ev).or_default().push(raw.len());
         }
@@ -718,7 +495,7 @@ pub fn parse(data: &[u8]) -> Result<Project> {
             let sample: Vec<usize> = lens.iter().take(4).copied().collect();
             eprintln!(
                 "  id={:>3} ({:#04x}) count={:>3} lens={:?}",
-                      ev, ev, lens.len(), sample
+                ev, ev, lens.len(), sample
             );
         }
     }
@@ -736,23 +513,20 @@ pub fn parse(data: &[u8]) -> Result<Project> {
     let mut pending_fx_names: Vec<String> = Vec::new();
     let debug = std::env::var_os("FLP_DEBUG").is_some();
 
-    // Diagnostic: FLP_DUMP_CHAN=5 dumps every event that fires while
-    // channel iid=5 is the current one.  FLP_DUMP_IDS=128,155,215 dumps
-    // specific event IDs regardless of channel context.
     let dump_iid: Option<u16> = std::env::var("FLP_DUMP_CHAN")
-    .ok()
-    .and_then(|s| s.trim().parse().ok());
+        .ok()
+        .and_then(|s| s.trim().parse().ok());
     let dump_ids: Option<Vec<u8>> = std::env::var("FLP_DUMP_IDS").ok().map(|s| {
         s.split(',')
-        .filter_map(|x| {
-            let x = x.trim();
-            if let Some(h) = x.strip_prefix("0x") {
-                u8::from_str_radix(h, 16).ok()
-            } else {
-                x.parse().ok()
-            }
-        })
-        .collect()
+            .filter_map(|x| {
+                let x = x.trim();
+                if let Some(h) = x.strip_prefix("0x") {
+                    u8::from_str_radix(h, 16).ok()
+                } else {
+                    x.parse().ok()
+                }
+            })
+            .collect()
     });
 
     for (ev, raw) in &events {
@@ -760,7 +534,7 @@ pub fn parse(data: &[u8]) -> Result<Project> {
             if prj.channels[i].iid == target {
                 eprintln!(
                     "flp: CHAN{:>3} ev={:>3} ({:#04x}) len={:>3} hex={}",
-                          target, *ev, *ev, raw.len(), hex(raw)
+                    target, *ev, *ev, raw.len(), hex(raw)
                 );
             }
         }
@@ -768,7 +542,7 @@ pub fn parse(data: &[u8]) -> Result<Project> {
             if ids.contains(ev) {
                 eprintln!(
                     "flp: EV{:>3} ({:#04x}) len={:>3} hex={}",
-                          *ev, *ev, raw.len(), hex(raw)
+                    *ev, *ev, raw.len(), hex(raw)
                 );
             }
         }
@@ -809,11 +583,6 @@ pub fn parse(data: &[u8]) -> Result<Project> {
                 }
             }
             EV_CHAN_MIXER_TRACK => {
-                // Log unconditionally — if this fires with chan_idx ==
-                // None, the routing event is happening at a point in
-                // the stream we aren't tracking (e.g. after the last
-                // NewPat, as a batch block).  That distinction tells
-                // us whether to fix the event ID or fix the scoping.
                 if debug {
                     eprintln!("flp: EV178 raw={} chan_idx={:?}", hex(raw), chan_idx);
                 }
@@ -839,7 +608,7 @@ pub fn parse(data: &[u8]) -> Result<Project> {
             EV_COLOR if raw.len() == 4 && pat_idx.is_none() => {
                 if let Some(i) = chan_idx {
                     prj.channels[i].color =
-                    Some(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]));
+                        Some(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]));
                 }
             }
             EV_TEXT_CHAN_NAME => {
@@ -890,20 +659,11 @@ pub fn parse(data: &[u8]) -> Result<Project> {
                 if let Some(i) = chan_idx {
                     let v = u32le(raw, 0);
                     prj.channels[i].sampler_flags = Some(v);
-                    // Empirical: for nightlight4000, channel 5 (pianoer)
-                    // has value 2 here, and insert 2 carries
-                    // Fruity Reeverb 2.  pyflp labels 0x8F
-                    // Channel_SamplerFlags, but the low byte's value
-                    // semantics match insert indices in this FL
-                    // version (0 = master, 1..=127 = user insert).
-                    // Store both interpretations: sampler_flags keeps
-                    // whatever the bitfield means, insert takes the
-                    // low byte for routing.
                     prj.channels[i].insert = (v & 0xFF) as u16;
                     if debug {
                         eprintln!(
                             "flp: chan {:>3} insert={} (ev143={:#x})",
-                                  prj.channels[i].iid, prj.channels[i].insert, v
+                            prj.channels[i].iid, prj.channels[i].insert, v
                         );
                     }
                 }
@@ -928,6 +688,45 @@ pub fn parse(data: &[u8]) -> Result<Project> {
                     prj.channels[i].fine_tune = Some(i32le(raw, 0));
                 }
             }
+            EV_CHAN_DELAY => {
+                if let Some(i) = chan_idx {
+                    if let Some(d) = decode_channel_delay(raw) {
+                        prj.channels[i].delay = Some(d);
+                    }
+                }
+            }
+            EV_CHAN_PARAMETERS => {
+                if let Some(i) = chan_idx {
+                    prj.channels[i].parameters = Some(RawEvent {
+                        id: EV_CHAN_PARAMETERS,
+                        len: raw.len(),
+                        bytes: raw.clone(),
+                    });
+                }
+            }
+            EV_CHAN_POLYPHONY => {
+                if let Some(i) = chan_idx {
+                    prj.channels[i].polyphony = Some(RawEvent {
+                        id: EV_CHAN_POLYPHONY,
+                        len: raw.len(),
+                        bytes: raw.clone(),
+                    });
+                }
+            }
+            EV_REMOTE_CONTROLLER => {
+                prj.remote_controllers.push(RawEvent {
+                    id: EV_REMOTE_CONTROLLER,
+                    len: raw.len(),
+                    bytes: raw.clone(),
+                });
+            }
+            EV_TRACK_DATA => {
+                prj.track_data.push(RawEvent {
+                    id: EV_TRACK_DATA,
+                    len: raw.len(),
+                    bytes: raw.clone(),
+                });
+            }
 
             EV_NEW_PLUGIN => {
                 let owner = if raw.len() >= 4 {
@@ -938,6 +737,7 @@ pub fn parse(data: &[u8]) -> Result<Project> {
                 let blank = Plugin {
                     owner,
                     internal_name: pending_def_plugin.take().unwrap_or_default(),
+                    wrapper_bytes: raw.clone(),
                     ..Default::default()
                 };
                 if owner == 0 {
@@ -955,7 +755,7 @@ pub fn parse(data: &[u8]) -> Result<Project> {
                     let ins = prj.inserts.entry(owner).or_insert_with(|| Insert {
                         index: owner,
                         name: String::new(),
-                                                                      plugins: Vec::new(),
+                        plugins: Vec::new(),
                     });
                     ins.plugins.push(blank);
                     let j = ins.plugins.len() - 1;
@@ -970,10 +770,10 @@ pub fn parse(data: &[u8]) -> Result<Project> {
                         if p.internal_name.is_empty()
                             && p.display_name.is_empty()
                             && p.state.is_empty()
-                            {
-                                p.internal_name = s.clone();
-                                assigned = true;
-                            }
+                        {
+                            p.internal_name = s.clone();
+                            assigned = true;
+                        }
                     }
                 }
                 pending_def_plugin = if assigned { None } else { Some(s) };
@@ -1009,7 +809,7 @@ pub fn parse(data: &[u8]) -> Result<Project> {
                 prj.patterns.push(Pattern {
                     iid,
                     name: String::new(),
-                                  notes: Vec::new(),
+                    notes: Vec::new(),
                 });
                 pat_idx = Some(prj.patterns.len() - 1);
                 chan_idx = None;
@@ -1026,10 +826,10 @@ pub fn parse(data: &[u8]) -> Result<Project> {
                     if debug {
                         eprintln!(
                             "flp: PAT_NOTES pat_idx={} iid={} {} note(s) (existing: {})",
-                                  i,
-                                  prj.patterns[i].iid,
-                                  notes.len(),
-                                  prj.patterns[i].notes.len()
+                            i,
+                            prj.patterns[i].iid,
+                            notes.len(),
+                            prj.patterns[i].notes.len()
                         );
                     }
                     if prj.patterns[i].notes.is_empty() {
@@ -1039,7 +839,7 @@ pub fn parse(data: &[u8]) -> Result<Project> {
             }
             EV_PLAYLIST => {
                 prj.playlist
-                .extend(decode_playlist(raw, version_major(&prj.version)));
+                    .extend(decode_playlist(raw, version_major(&prj.version)));
             }
             _ => {}
         }
@@ -1050,6 +850,43 @@ pub fn parse(data: &[u8]) -> Result<Project> {
         if let Some(ins) = prj.inserts.get_mut(&key) {
             ins.name = name;
         }
+    }
+
+    // Coverage report. Every event whose ID is not in HANDLED_EVENT_IDS
+    // is preserved raw and counted here, so nothing is silently lost.
+    let handled: BTreeSet<u8> = HANDLED_EVENT_IDS.iter().copied().collect();
+    let mut seen: BTreeSet<u8> = BTreeSet::new();
+    let mut unhandled_id_counts: BTreeMap<u8, usize> = BTreeMap::new();
+    for (id, raw) in &events {
+        seen.insert(*id);
+        if !handled.contains(id) {
+            *unhandled_id_counts.entry(*id).or_insert(0) += 1;
+            prj.unknown_events.push(RawEvent {
+                id: *id,
+                len: raw.len(),
+                bytes: raw.clone(),
+            });
+        }
+    }
+    prj.coverage = EventCoverage {
+        total_events: events.len(),
+        unique_ids: seen.len(),
+        handled_ids: seen.iter().copied().filter(|id| handled.contains(id)).collect(),
+        unhandled_id_counts,
+    };
+
+    if !prj.coverage.unhandled_id_counts.is_empty() {
+        let ids: Vec<String> = prj
+            .coverage
+            .unhandled_id_counts
+            .keys()
+            .map(|id| format!("{}({})", id, id))
+            .collect();
+        prj.parse_warnings.push(format!(
+            "{} event id(s) preserved raw but not decoded: {}",
+            prj.coverage.unhandled_id_counts.len(),
+            ids.join(", ")
+        ));
     }
 
     prj.events = events;
@@ -1065,28 +902,16 @@ pub fn parse(data: &[u8]) -> Result<Project> {
     Ok(prj)
 }
 
-/// Derive project tempo from playlist audio clips whose source window
-/// equals their playlist window (i.e. clips that aren't stretched).
-/// Returns the modal value across all such clips, or `None` if no clip
-/// gives a plausible reading.
 fn derive_tempo_from_clips(prj: &Project) -> Option<f64> {
     let ppq = prj.ppq as f64;
     if ppq <= 0.0 {
         return None;
     }
-
-    // Drum one-shots are typically < 500 ms and are placed with a length
-    // that was snapped to the nearest tick, not to a musical unit.  Skip
-    // anything too short to be a whole-measure sample; long enough clips
-    // are almost always trimmed to a clean beat boundary.
     const MIN_SOURCE_MS: f64 = 500.0;
-    // Allow only near-exact integer-beat clips (within 2% of a whole beat
-    // at the boundary).  A clip of 4.00 beats gives a precise reading;
-    // 0.51 or 6.83 beats does not.
     const BEAT_TOLERANCE: f64 = 0.02;
 
     let mut candidates: std::collections::BTreeMap<i32, usize> =
-    std::collections::BTreeMap::new();
+        std::collections::BTreeMap::new();
 
     for item in &prj.playlist {
         if item.kind != "channel" || item.length == 0 {
@@ -1116,11 +941,14 @@ fn derive_tempo_from_clips(prj: &Project) -> Option<f64> {
     }
 
     candidates
-    .into_iter()
-    .max_by_key(|(_, count)| *count)
-    .map(|(bpm, _)| bpm as f64)
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(bpm, _)| bpm as f64)
 }
 
+/// Convenience wrapper: read an FLP file and parse it.
+/// The only I/O function in this module — `parse(bytes)` is pure.
+/// TODO: move to `cli/flp.rs` so this module is 100% pure.
 pub fn parse_file(path: &Path) -> Result<Project> {
     let data = std::fs::read(path).map_err(|e| anyhow!("reading {}: {}", path.display(), e))?;
     parse(&data)

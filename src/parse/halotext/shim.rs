@@ -7,7 +7,7 @@ use crate::spec::{
 
 use super::parse_f;
 use super::split_fields;
-use super::types::{ShimEvent, ShimField, ShimParam, ShimWaypoint};
+use crate::model::halotext::{ShimEvent, ShimField, ShimParam, ShimWaypoint};
 
 /// Given `§a/b`, return `(a-1)*subs + (b-1)`.  Non-numeric returns None.
 fn parse_position(s: &str, subs: u32) -> Option<f64> {

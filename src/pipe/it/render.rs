@@ -5,9 +5,9 @@ use std::collections::HashMap;
 
 use super::helpers::*;
 use super::sim::{Converter, Voice};
-use crate::convert::song::{Call, MeasureLine, Song};
-use crate::convert::PitchMode;
-use crate::formats::it::Module;
+use crate::pipe::song::{Call, MeasureLine, Song};
+use crate::pipe::PitchMode;
+use crate::model::it::Module;
 
 // ── position / pitch / pan text ────────────────────────────────────────
 

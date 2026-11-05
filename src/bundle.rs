@@ -4,8 +4,8 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
 use crate::archive::{Entry, EntryKind, Manifest, FORMAT_TAG, FORMAT_VERSION};
-use crate::audio_decode::decode_audio;
-use crate::convert::{AuxFile, Converted};
+use crate::parse::wav::decode_audio;
+use crate::pipe::{AuxFile, Converted};
 
 #[derive(Clone)]
 pub struct BundleFile {

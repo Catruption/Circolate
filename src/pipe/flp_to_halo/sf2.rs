@@ -21,7 +21,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::formats::flp::Plugin;
+use crate::model::flp::Plugin;
 
 pub(super) struct SfState {
     pub path: String,

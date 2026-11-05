@@ -1,96 +1,25 @@
-//! Minimal SoundFont 2 (SF2) reader.
+//! SF2 — RIFF walking and zone extraction.
 //!
-//! Parses pdta sections and exposes a flat list of zones.  Each zone has a
-//! key range, a velocity range, a sample reference, tuning, and volume
-//! envelope parameters (SF2 generators 33..38).
-//!
-//! Preset support: `load_preset(path, bank, preset)` walks the phdr/pbag/
-//! pgen chain to find the instrument(s) that the requested preset
-//! references, and loads only those zones.  `load(path)` still loads every
-//! zone in the file, which is fine for single-instrument banks but wrong
-//! for GM banks.
-//!
-//! Limitations:
-//!   * Modulators (pmod/imod) are ignored; velocity → attenuation uses
-//!     the SF2 default modulator.
-//!   * Filter generators (8, 9) are parsed but not applied yet.
-//!   * Envelope key/velocity scaling (39, 40) is parsed but not applied.
+//! Pure except `load*` wrappers, which are marked TODO to move to `cli/`
+//! once `cli/` grows a file-reading surface.
 
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 
-#[derive(Debug, Clone)]
-pub struct Sf2Sample {
-    pub name: String,
-    pub start: u32,
-    pub end: u32,
-    pub loop_start: u32,
-    pub loop_end: u32,
-    pub rate: u32,
-    pub root_key: u8,
-    pub loop_mode: u8,
-}
+use crate::model::sf2::{Sf2File, Sf2Sample, Sf2Zone};
+use crate::spec::sf2::chunks::*;
 
-#[derive(Debug, Clone)]
-pub struct Sf2Zone {
-    pub key_lo: u8,
-    pub key_hi: u8,
-    pub vel_lo: u8,
-    pub vel_hi: u8,
-    pub sample_idx: usize,
-    pub tune_cents: i16,
-    pub root_override: Option<u8>,
-    pub start_offset: i32,
-    pub end_offset: i32,
-    pub loop_start_offset: i32,
-    pub loop_end_offset: i32,
-    pub loop_mode: u8,
-
-    pub initial_attenuation_cb: i16,
-    pub delay_timecents: i16,
-    pub attack_timecents: i16,
-    pub hold_timecents: i16,
-    pub decay_timecents: i16,
-    pub sustain_level_cb: i16,
-    pub release_timecents: i16,
-
-    pub initial_filter_fc: i16,
-    pub initial_filter_q: i16,
-}
-
-#[derive(Debug)]
-pub struct Sf2File {
-    pub samples: Vec<Sf2Sample>,
-    pub zones: Vec<Sf2Zone>,
-    pub pcm: Vec<i16>,
-}
-
-// ── unit conversions (SF2 §8.1.2) ──────────────────────────────────────
-
-pub fn timecents_to_secs(tc: i16) -> f32 {
-    if tc <= -12000 {
-        return 0.0;
-    }
-    (2f32).powf(tc as f32 / 1200.0)
-}
-
-pub fn attenuation_cb_to_linear(cb: i16) -> f32 {
-    if cb <= 0 {
-        return 1.0;
-    }
-    if cb >= 1440 {
-        return 0.0;
-    }
-    (10f32).powf(-(cb as f32) / 200.0)
-}
+// ── public entry points ───────────────────────────────────────────────
 
 impl Sf2File {
+    /// TODO: move to `cli/`. Reads from disk.
     pub fn load(path: &Path) -> Result<Self> {
         let data =
         std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
         Self::parse(&data, None)
     }
 
+    /// TODO: move to `cli/`. Reads from disk.
     pub fn load_preset(path: &Path, bank: u16, preset: u16) -> Result<Self> {
         let data =
         std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
@@ -105,22 +34,27 @@ impl Sf2File {
         Self::parse(data, None)
     }
 
-    fn parse(data: &[u8], want: Option<(u16, u16)>) -> Result<Self> {
-        if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"sfbk" {
+    /// Convenience: `parse_file` = `load`, named for symmetry with flp/it/midi.
+    pub fn parse_file(path: &Path) -> Result<Self> {
+        Self::load(path)
+    }
+
+    pub fn parse(data: &[u8], want: Option<(u16, u16)>) -> Result<Self> {
+        if data.len() < 12 || &data[0..4] != &RIFF || &data[8..12] != &SFBK {
             bail!("not an SF2 (missing RIFF/sfbk)");
         }
-        let sdta = find_list(data, b"sdta").ok_or_else(|| anyhow::anyhow!("no sdta"))?;
-        let pdta = find_list(data, b"pdta").ok_or_else(|| anyhow::anyhow!("no pdta"))?;
+        let sdta = find_list(data, &SDTA).ok_or_else(|| anyhow::anyhow!("no sdta"))?;
+        let pdta = find_list(data, &PDTA).ok_or_else(|| anyhow::anyhow!("no pdta"))?;
 
-        let smpl = find_chunk(sdta, b"smpl").ok_or_else(|| anyhow::anyhow!("no smpl"))?;
-        let shdr = find_chunk(pdta, b"shdr").ok_or_else(|| anyhow::anyhow!("no shdr"))?;
-        let inst = find_chunk(pdta, b"inst").ok_or_else(|| anyhow::anyhow!("no inst"))?;
-        let ibag = find_chunk(pdta, b"ibag").ok_or_else(|| anyhow::anyhow!("no ibag"))?;
-        let igen = find_chunk(pdta, b"igen").ok_or_else(|| anyhow::anyhow!("no igen"))?;
+        let smpl = find_chunk(sdta, &SMPL).ok_or_else(|| anyhow::anyhow!("no smpl"))?;
+        let shdr = find_chunk(pdta, &SHDR).ok_or_else(|| anyhow::anyhow!("no shdr"))?;
+        let inst = find_chunk(pdta, &INST).ok_or_else(|| anyhow::anyhow!("no inst"))?;
+        let ibag = find_chunk(pdta, &IBAG).ok_or_else(|| anyhow::anyhow!("no ibag"))?;
+        let igen = find_chunk(pdta, &IGEN).ok_or_else(|| anyhow::anyhow!("no igen"))?;
 
-        let phdr = find_chunk(pdta, b"phdr");
-        let pbag = find_chunk(pdta, b"pbag");
-        let pgen = find_chunk(pdta, b"pgen");
+        let phdr = find_chunk(pdta, &PHDR);
+        let pbag = find_chunk(pdta, &PBAG);
+        let pgen = find_chunk(pdta, &PGEN);
 
         if smpl.len() % 2 != 0 {
             bail!("smpl size is odd");
@@ -130,15 +64,15 @@ impl Sf2File {
             pcm.push(i16::from_le_bytes([c[0], c[1]]));
         }
 
-        if shdr.len() < 46 * 2 || shdr.len() % 46 != 0 {
-            bail!("shdr size not multiple of 46");
+        if shdr.len() < SHDR_RECORD_SIZE * 2 || shdr.len() % SHDR_RECORD_SIZE != 0 {
+            bail!("shdr size not multiple of {}", SHDR_RECORD_SIZE);
         }
-        let n_samples = shdr.len() / 46;
+        let n_samples = shdr.len() / SHDR_RECORD_SIZE;
         let mut samples = Vec::with_capacity(n_samples);
         for i in 0..n_samples {
-            let r = &shdr[i * 46..i * 46 + 46];
+            let r = &shdr[i * SHDR_RECORD_SIZE..i * SHDR_RECORD_SIZE + SHDR_RECORD_SIZE];
             let name = cstr(&r[0..20]);
-            if name == "EOS" {
+            if name == TERMINAL_NAME {
                 break;
             }
             let start = u32::from_le_bytes([r[20], r[21], r[22], r[23]]);
@@ -159,61 +93,55 @@ impl Sf2File {
             });
         }
 
-        if inst.len() % 22 != 0 {
-            bail!("inst size not multiple of 22");
+        if inst.len() % INST_RECORD_SIZE != 0 {
+            bail!("inst size not multiple of {}", INST_RECORD_SIZE);
         }
-        let n_inst = inst.len() / 22;
+        let n_inst = inst.len() / INST_RECORD_SIZE;
         let mut inst_bag_idx: Vec<usize> = Vec::with_capacity(n_inst);
         for i in 0..n_inst {
-            let r = &inst[i * 22..i * 22 + 22];
+            let r = &inst[i * INST_RECORD_SIZE..i * INST_RECORD_SIZE + INST_RECORD_SIZE];
             inst_bag_idx.push(u16::from_le_bytes([r[20], r[21]]) as usize);
         }
 
-        if ibag.len() % 4 != 0 {
-            bail!("ibag size not multiple of 4");
+        if ibag.len() % IBAG_RECORD_SIZE != 0 {
+            bail!("ibag size not multiple of {}", IBAG_RECORD_SIZE);
         }
-        let n_ibag = ibag.len() / 4;
+        let n_ibag = ibag.len() / IBAG_RECORD_SIZE;
         let mut ibag_gen_idx: Vec<usize> = Vec::with_capacity(n_ibag);
         for i in 0..n_ibag {
-            let r = &ibag[i * 4..i * 4 + 4];
+            let r = &ibag[i * IBAG_RECORD_SIZE..i * IBAG_RECORD_SIZE + IBAG_RECORD_SIZE];
             ibag_gen_idx.push(u16::from_le_bytes([r[0], r[1]]) as usize);
         }
 
-        if igen.len() % 4 != 0 {
-            bail!("igen size not multiple of 4");
+        if igen.len() % IGEN_RECORD_SIZE != 0 {
+            bail!("igen size not multiple of {}", IGEN_RECORD_SIZE);
         }
-        let mut igens: Vec<(u16, u16)> = Vec::with_capacity(igen.len() / 4);
-        for i in 0..igen.len() / 4 {
-            let r = &igen[i * 4..i * 4 + 4];
+        let mut igens: Vec<(u16, u16)> = Vec::with_capacity(igen.len() / IGEN_RECORD_SIZE);
+        for i in 0..igen.len() / IGEN_RECORD_SIZE {
+            let r = &igen[i * IGEN_RECORD_SIZE..i * IGEN_RECORD_SIZE + IGEN_RECORD_SIZE];
             igens.push((
                 u16::from_le_bytes([r[0], r[1]]),
-                        u16::from_le_bytes([r[2], r[3]]),
+                u16::from_le_bytes([r[2], r[3]]),
             ));
         }
 
-        // ── Filter to a single preset if requested ────────────────────
-        //
-        // phdr entry layout (SF2 §7.4), 38 bytes:
-        //   name[20], preset u16, bank u16, bag_idx u16,
-        //   library u32, genre u32, morphology u32
-        // The last entry is "EOP".
-        //
-        // Each preset's bag range is [bag_idx, next.bag_idx).  Each pbag
-        // entry's first u16 is the start index into pgen.  Walking pgen
-        // for a preset yields any instrument generators (op 41) it uses.
+        // Filter to a single preset if requested.
         let mut inst_filter: Option<Vec<usize>> = None;
         if let Some((want_bank, want_preset)) = want {
             if let (Some(phdr), Some(pbag), Some(pgen)) = (phdr, pbag, pgen) {
-                if phdr.len() % 38 == 0 && pbag.len() % 4 == 0 && pgen.len() % 4 == 0 {
-                    let n_phdr = phdr.len() / 38;
-                    let n_pbag = pbag.len() / 4;
-                    let n_pgen = pgen.len() / 4;
+                if phdr.len() % PHDR_RECORD_SIZE == 0
+                    && pbag.len() % PBAG_RECORD_SIZE == 0
+                    && pgen.len() % PGEN_RECORD_SIZE == 0
+                {
+                    let n_phdr = phdr.len() / PHDR_RECORD_SIZE;
+                    let n_pbag = pbag.len() / PBAG_RECORD_SIZE;
+                    let n_pgen = pgen.len() / PGEN_RECORD_SIZE;
 
                     let mut phdr_entries: Vec<(u16, u16, usize)> = Vec::with_capacity(n_phdr);
                     for i in 0..n_phdr {
-                        let r = &phdr[i * 38..i * 38 + 38];
+                        let r = &phdr[i * PHDR_RECORD_SIZE..i * PHDR_RECORD_SIZE + PHDR_RECORD_SIZE];
                         let name = cstr(&r[0..20]);
-                        if name == "EOP" {
+                        if name == PRESET_TERMINAL_NAME {
                             break;
                         }
                         let p = u16::from_le_bytes([r[20], r[21]]);
@@ -224,7 +152,7 @@ impl Sf2File {
 
                     let mut pbag_gen_idx: Vec<usize> = Vec::with_capacity(n_pbag);
                     for i in 0..n_pbag {
-                        let r = &pbag[i * 4..i * 4 + 4];
+                        let r = &pbag[i * PBAG_RECORD_SIZE..i * PBAG_RECORD_SIZE + PBAG_RECORD_SIZE];
                         pbag_gen_idx.push(u16::from_le_bytes([r[0], r[1]]) as usize);
                     }
 
@@ -252,10 +180,10 @@ impl Sf2File {
                         }
                         let mut wanted_insts: Vec<usize> = Vec::new();
                         for gi in gen_start..gen_end {
-                            let r = &pgen[gi * 4..gi * 4 + 4];
+                            let r = &pgen[gi * PGEN_RECORD_SIZE..gi * PGEN_RECORD_SIZE + PGEN_RECORD_SIZE];
                             let op = u16::from_le_bytes([r[0], r[1]]);
                             let val = u16::from_le_bytes([r[2], r[3]]);
-                            if op == 41 {
+                            if op == GEN_INSTRUMENT {
                                 wanted_insts.push(val as usize);
                             }
                         }
@@ -306,24 +234,23 @@ impl Sf2File {
             eprintln!(
                 "sf2: {} samples, {} zones{}",
                 samples.len(),
-                      zones.len(),
-                      match want {
-                          Some((b, p)) => format!(" (bank {} preset {})", b, p),
-                      None => String::new(),
-                      }
+                zones.len(),
+                match want {
+                    Some((b, p)) => format!(" (bank {} preset {})", b, p),
+                    None => String::new(),
+                }
             );
             for (i, z) in zones.iter().take(30).enumerate() {
                 eprintln!(
                     "  zone {:>3}: key {:>3}..{:<3} vel {:>3}..{:<3} sample {:>4} \
-root {:?} tune {} atten {} a={:.3} h={:.3} d={:.3} s={:.3} r={:.3}",
-i, z.key_lo, z.key_hi, z.vel_lo, z.vel_hi, z.sample_idx,
-z.root_override, z.tune_cents,
-z.initial_attenuation_cb,
-timecents_to_secs(z.attack_timecents),
-                          timecents_to_secs(z.hold_timecents),
-                          timecents_to_secs(z.decay_timecents),
-                          attenuation_cb_to_linear(z.sustain_level_cb),
-                          timecents_to_secs(z.release_timecents),
+                     root {:?} tune {} atten {} a={:.3} h={:.3} d={:.3} s={:.3} r={:.3}",
+                    i, z.key_lo, z.key_hi, z.vel_lo, z.vel_hi, z.sample_idx,
+                    z.root_override, z.tune_cents, z.initial_attenuation_cb,
+                    crate::spec::sf2::units::timecents_to_secs(z.attack_timecents),
+                    crate::spec::sf2::units::timecents_to_secs(z.hold_timecents),
+                    crate::spec::sf2::units::timecents_to_secs(z.decay_timecents),
+                    crate::spec::sf2::units::attenuation_cb_to_linear(z.sustain_level_cb),
+                    crate::spec::sf2::units::timecents_to_secs(z.release_timecents),
                 );
             }
         }
@@ -332,16 +259,18 @@ timecents_to_secs(z.attack_timecents),
     }
 }
 
+// ── internals ────────────────────────────────────────────────────────
+
 fn walk_igens(
     igens: &[(u16, u16)],
-              gen_start: usize,
-              gen_end: usize,
-              samples: &[Sf2Sample],
-              out: &mut Vec<Sf2Zone>,
+    gen_start: usize,
+    gen_end: usize,
+    samples: &[Sf2Sample],
+    out: &mut Vec<Sf2Zone>,
 ) {
     let mut cur = ZoneAccum::default();
     for &(op, val) in &igens[gen_start..gen_end] {
-        if op == 53 {
+        if op == GEN_SAMPLE_ID {
             let sidx = val as usize;
             if sidx < samples.len() {
                 out.push(cur.finish(sidx, &samples[sidx]));
@@ -420,37 +349,37 @@ impl Default for ZoneAccum {
 impl ZoneAccum {
     fn apply(&mut self, op: u16, val: u16) {
         match op {
-            0 => self.start_offset = val as i16 as i32,
-            1 => self.end_offset = val as i16 as i32,
-            2 => self.loop_start_offset = val as i16 as i32,
-            3 => self.loop_end_offset = val as i16 as i32,
-            4 => self.start_coarse = val as i16 as i32,
-            8 => self.initial_filter_fc = val as i16,
-            9 => self.initial_filter_q = val as i16,
-            12 => self.end_coarse = val as i16 as i32,
-            33 => self.delay_timecents = val as i16,
-            34 => self.attack_timecents = val as i16,
-            35 => self.hold_timecents = val as i16,
-            36 => self.decay_timecents = val as i16,
-            37 => self.sustain_level_cb = val as i16,
-            38 => self.release_timecents = val as i16,
-            43 => {
+            GEN_START_ADDRS1 => self.start_offset = val as i16 as i32,
+            GEN_END_ADDRS1 => self.end_offset = val as i16 as i32,
+            GEN_STARTLOOP_ADDRS1 => self.loop_start_offset = val as i16 as i32,
+            GEN_ENDLOOP_ADDRS1 => self.loop_end_offset = val as i16 as i32,
+            GEN_START_ADDRS2 => self.start_coarse = val as i16 as i32,
+            GEN_INITIAL_FILTER_FC => self.initial_filter_fc = val as i16,
+            GEN_INITIAL_FILTER_Q => self.initial_filter_q = val as i16,
+            GEN_END_ADDRS2 => self.end_coarse = val as i16 as i32,
+            GEN_DELAY_MOD_ENV => self.delay_timecents = val as i16,
+            GEN_ATTACK_MOD_ENV => self.attack_timecents = val as i16,
+            GEN_HOLD_MOD_ENV => self.hold_timecents = val as i16,
+            GEN_DECAY_MOD_ENV => self.decay_timecents = val as i16,
+            GEN_SUSTAIN_MOD_ENV => self.sustain_level_cb = val as i16,
+            GEN_RELEASE_MOD_ENV => self.release_timecents = val as i16,
+            GEN_KEY_RANGE => {
                 self.key_lo = (val & 0xFF) as u8;
                 self.key_hi = (val >> 8) as u8;
                 self.saw_key = true;
             }
-            44 => {
+            GEN_VEL_RANGE => {
                 self.vel_lo = (val & 0xFF) as u8;
                 self.vel_hi = (val >> 8) as u8;
                 self.saw_vel = true;
             }
-            45 => self.loop_start_coarse = val as i16 as i32,
-            48 => self.initial_attenuation_cb = val as i16,
-            50 => self.loop_end_coarse = val as i16 as i32,
-            51 => self.coarse_tune = val as i8 as i16,
-            52 => self.fine_tune = val as i8 as i16,
-            54 => self.loop_mode = (val & 0x03) as u8,
-            58 => self.root_override = Some((val as i8).clamp(0, 127) as u8),
+            GEN_STARTLOOP_ADDRS2 => self.loop_start_coarse = val as i16 as i32,
+            GEN_INITIAL_ATTENUATION => self.initial_attenuation_cb = val as i16,
+            GEN_ENDLOOP_ADDRS2 => self.loop_end_coarse = val as i16 as i32,
+            GEN_COARSE_TUNE => self.coarse_tune = val as i8 as i16,
+            GEN_FINE_TUNE => self.fine_tune = val as i8 as i16,
+            GEN_SAMPLE_MODES => self.loop_mode = (val & 0x03) as u8,
+            GEN_OVERRIDING_ROOT_KEY => self.root_override = Some((val as i8).clamp(0, 127) as u8),
             _ => {}
         }
     }
@@ -482,15 +411,13 @@ impl ZoneAccum {
     }
 }
 
-// ── RIFF helpers ───────────────────────────────────────────────────────
-
 fn cstr(raw: &[u8]) -> String {
     let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
     String::from_utf8_lossy(&raw[..end]).into_owned()
 }
 
 fn find_list<'a>(data: &'a [u8], want: &[u8; 4]) -> Option<&'a [u8]> {
-    if data.len() < 12 || &data[0..4] != b"RIFF" {
+    if data.len() < 12 || &data[0..4] != &RIFF {
         return None;
     }
     let mut p = 12;
@@ -502,7 +429,7 @@ fn find_list<'a>(data: &'a [u8], want: &[u8; 4]) -> Option<&'a [u8]> {
         if body + size > data.len() {
             break;
         }
-        if id == b"LIST" && size >= 4 {
+        if id == &LIST && size >= 4 {
             let ty = &data[body..body + 4];
             if ty == want {
                 return Some(&data[body + 4..body + size]);

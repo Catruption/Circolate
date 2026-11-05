@@ -131,25 +131,36 @@ pub(crate) fn render_offline(
         }
         sf2.set_gain(effective);
         engine.install_sf2_engine(spec.iid, sf2);
-        engine.register_part_path(spec.iid, name.clone());
+        // PART_VOLUME FIX: `name` here is the composite key from
+        // sf2_engine_specs ("path.sf2#preset" or "path.sf2#bank:preset").
+        // part_volume lookups (TUI fader, voices.rs, this file's own
+        // VST/SF2 mix passes) are keyed by part.sample_path without the
+        // '#preset' suffix. Registering the composite key means the
+        // lookup in the SF2 mix pass below never matches, and every SF2
+        // channel silently ignores per-part volume — which is why dside
+        // (SF2-heavy) doesn't respond to fader changes but nightlight4000
+        // (VST + samples only) does. Strip the suffix so SF2 channels
+        // share a key with the rest of the mixer.
+        let base_path = name.split('#').next().unwrap_or(name.as_str());
+        engine.register_part_path(spec.iid, base_path.to_string());
     }
     crate::log_event!(
         "player.render.sf2_engines_installed",
         count: engine.sf2_engine_count(),
     );
 
-    crate::play::install::install_shims(
+    crate::cli::play::install::install_shims(
         &mut engine,
         project,
-        crate::play::install::find_share_dir().as_deref(),
+        crate::cli::play::install::find_share_dir().as_deref(),
     );
 
     crate::player::inserts::install_chains(&mut engine, project, project.sample_rate);
 
-    crate::play::install::install_chip_players(
+    crate::cli::play::install::install_chip_players(
         &mut engine,
         project,
-        crate::play::install::find_share_dir().as_deref(),
+        crate::cli::play::install::find_share_dir().as_deref(),
     );
 
     if !no_master_fx {

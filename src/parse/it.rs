@@ -1,61 +1,15 @@
-// src/sources/it.rs
-//! Impulse Tracker (.it) decoder — Rust port of it_parser.py.
+//! Impulse Tracker (.it) decoder — byte walking.
 //!
-//! Owns the binary IT parsing/decompression logic.  Consumers should use
-//! `parse_file` / `parse` and `unpack_pattern` rather than re-implementing
-//! the format.  Behaviour is kept identical to the Python original,
-//! including the odd corners of the IT compression bit reader.
+//! Pure except `parse_file`, which is marked TODO to move to `cli/`.
 
 use anyhow::{anyhow, bail, Result};
-use serde::Serialize;
-use std::collections::BTreeMap;
 use std::path::Path;
 
-// ── constants ──────────────────────────────────────────────────────────
+use crate::model::it::{Instrument, ITEnvelope, Module, NoteTermination, PatternEvent, Sample};
+use crate::spec::it::constants::*;
 
-// Raw special note values in packed patterns.
-pub const ITNOTE_MPT_FADE: u8 = 0xFD;
-pub const ITNOTE_FADE: u8 = 0xFD;
-pub const ITNOTE_CUT: u8 = 0xFE;
-pub const ITNOTE_KEY_OFF: u8 = 0xFF;
+// ── note termination classifier ───────────────────────────────────────
 
-// Non-pattern order-list entries.
-pub const ITORDER_SKIP: u8 = 0xFE;
-pub const ITORDER_END: u8 = 0xFF;
-
-// Sample header flag bits (flg).
-pub const ITSF_DATA_PRESENT: u8 = 0x01;
-pub const ITSF_BIT_16: u8 = 0x02;
-pub const ITSF_STEREO: u8 = 0x04;
-pub const ITSF_COMPRESSED: u8 = 0x08;
-pub const ITSF_LOOP: u8 = 0x10;
-pub const ITSF_SUSTAIN_LOOP: u8 = 0x20;
-pub const ITSF_PINGPONG_LOOP: u8 = 0x40;
-pub const ITSF_PINGPONG_SUSTAIN: u8 = 0x80;
-
-// Sample conversion flag bits (cvt).
-pub const ITCVT_SIGNED: u8 = 0x01;
-pub const ITCVT_BIG_ENDIAN: u8 = 0x02;
-pub const ITCVT_DELTA: u8 = 0x04;
-pub const ITCVT_PTM_8_TO_16: u8 = 0x08;
-
-/// IT ADPCM marker in the cvt byte.  Exact value, not a bit flag.
-pub const ITCVT_ADPCM: u8 = 0xFF;
-
-// ── note termination ───────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NoteTermination {
-    Fade,
-    Cut,
-    KeyOff,
-}
-
-/// Classify a raw termination note.
-///
-/// OpenMPT treats 0xFD as fade only in MPTM; in standard IT it is not a
-/// note.  Matches the Python `note_termination`.
 pub fn note_termination(note: u8, mptm: bool) -> Option<NoteTermination> {
     match note {
         ITNOTE_MPT_FADE => {
@@ -71,115 +25,7 @@ pub fn note_termination(note: u8, mptm: bool) -> Option<NoteTermination> {
     }
 }
 
-// ── data model ─────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct ITEnvelope {
-    pub enabled: bool,
-    pub loop_enabled: bool,
-    pub sustain_enabled: bool,
-    pub loop_start: u8,
-    pub loop_end: u8,
-    pub sustain_start: u8,
-    pub sustain_end: u8,
-    /// (tick, value) pairs.  Value is signed (-128..127).
-    pub points: Vec<(u16, i8)>,
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct Instrument {
-    pub name: String,
-    pub nna: u8,
-    pub dct: u8,
-    pub dca: u8,
-    pub fadeout: u16,
-    pub gbv: u8,
-    pub dfp: u8,
-    /// (note, sample) pairs.  Note 0..119, sample 0..255 (0 = none).
-    pub keymap: Vec<(u8, u8)>,
-    /// Envelope enabled flags, keyed by "volume" / "pan" / "pitch".
-    pub env: BTreeMap<String, bool>,
-    pub envelopes: BTreeMap<String, ITEnvelope>,
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct Sample {
-    pub name: String,
-    pub gvl: u8,
-    pub flg: u8,
-    pub vol: u8,
-    pub cvt: u8,
-    pub dfp: u8,
-    pub length: u32,
-    pub loop_beg: u32,
-    pub loop_end: u32,
-    pub c5: u32,
-    pub sus_beg: u32,
-    pub sus_end: u32,
-    pub ptr: u32,
-    pub has_data: bool,
-    pub is16: bool,
-    pub stereo: bool,
-    pub compressed: bool,
-    pub r#loop: bool,
-    pub pingpong: bool,
-    pub sus_loop: bool,
-    pub pingpong_sus: bool,
-    /// Decoded PCM, signed.  `i32` because 16-bit samples need the range.
-    #[serde(skip)]
-    pub pcm: Vec<i32>,
-    /// Filled in by the converter; None during parse.
-    pub file: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct PatternEvent {
-    pub note: Option<u8>,
-    pub instrument: Option<u8>,
-    pub volume: Option<u8>,
-    pub command: Option<u8>,
-    pub parameter: u8,
-}
-
-impl PatternEvent {
-    /// True when the cell encodes nothing (used by the converter's row log).
-    pub fn is_empty(&self) -> bool {
-        self.note.is_none()
-        && self.instrument.is_none()
-        && self.volume.is_none()
-        && self.command.is_none()
-    }
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct Module {
-    pub title: String,
-    pub cwtv: u16,
-    pub cmwt: u16,
-    pub highlight_minor: u8,
-    pub highlight_major: u8,
-    pub gv: u8,
-    pub mv: u8,
-    pub speed: u8,
-    pub tempo: u8,
-    pub sep: u8,
-    pub pwd: u8,
-    pub flags: u16,
-    pub special: u16,
-    pub stereo: bool,
-    pub use_instruments: bool,
-    pub linear: bool,
-    pub old_effects: bool,
-    pub chnpan: Vec<u8>,
-    pub chnvol: Vec<u8>,
-    pub orders: Vec<u8>,
-    pub message: String,
-    pub instruments: Vec<Instrument>,
-    pub samples: Vec<Sample>,
-    pub patterns: Vec<Vec<Vec<Option<PatternEvent>>>>,
-}
-
-// ── byte helpers ───────────────────────────────────────────────────────
+// ── byte helpers ──────────────────────────────────────────────────────
 
 #[inline]
 fn u16_at(data: &[u8], off: usize) -> u16 {
@@ -191,19 +37,16 @@ fn u32_at(data: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
 }
 
-/// Latin1 (ISO-8859-1) byte slice to String: each byte is its own code point.
 fn latin1(bytes: &[u8]) -> String {
     bytes.iter().map(|&b| b as char).collect()
 }
 
-/// Split on NUL, take the first piece, latin1-decode, trim.
-/// Equivalent of Python's `cstr`.
 fn cstr(b: &[u8]) -> String {
     let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
     latin1(&b[..end]).trim().to_string()
 }
 
-// ── envelope decoding ──────────────────────────────────────────────────
+// ── envelope decoding ─────────────────────────────────────────────────
 
 pub fn parse_envelope(data: &[u8], offset: usize) -> ITEnvelope {
     let flags = data[offset];
@@ -237,7 +80,7 @@ pub fn parse_envelope(data: &[u8], offset: usize) -> ITEnvelope {
     }
 }
 
-// ── top-level parse ────────────────────────────────────────────────────
+// ── top-level parse ───────────────────────────────────────────────────
 
 pub fn parse(data: &[u8]) -> Result<Module> {
     if data.len() < 4 || &data[0..4] != b"IMPM" {
@@ -274,10 +117,10 @@ pub fn parse(data: &[u8]) -> Result<Module> {
     let msglen = u16_at(data, 0x36) as usize;
     let msgoff = u32_at(data, 0x38) as usize;
 
-    m.stereo = m.flags & 1 != 0;
-    m.use_instruments = m.flags & 4 != 0;
-    m.linear = m.flags & 8 != 0;
-    m.old_effects = m.flags & 16 != 0;
+    m.stereo = m.flags & ITFLAG_STEREO != 0;
+    m.use_instruments = m.flags & ITFLAG_USE_INSTRUMENTS != 0;
+    m.linear = m.flags & ITFLAG_LINEAR_SLIDES != 0;
+    m.old_effects = m.flags & ITFLAG_OLD_EFFECTS != 0;
 
     m.chnpan = data[0x40..0x80].to_vec();
     m.chnvol = data[0x80..0xC0].to_vec();
@@ -299,14 +142,12 @@ pub fn parse(data: &[u8]) -> Result<Module> {
         pat_ptr.push(u32_at(data, p + i * 4) as usize);
     }
 
-    // Message: only present when special bit 0 is set and the offsets fit.
     if m.special & 1 != 0 && msglen > 0 && msgoff + msglen <= data.len() {
         let raw = &data[msgoff..msgoff + msglen];
         let nul = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
         m.message = latin1(&raw[..nul]).replace('\r', "\n");
     }
 
-    // ── instruments ──
     for &o in &ins_ptr {
         if o + 0x3A > data.len() {
             bail!("instrument offset out of range");
@@ -340,7 +181,6 @@ pub fn parse(data: &[u8]) -> Result<Module> {
         m.instruments.push(i);
     }
 
-    // ── samples ──
     for &o in &smp_ptr {
         if o + 0x50 > data.len() {
             bail!("sample offset out of range");
@@ -370,8 +210,6 @@ pub fn parse(data: &[u8]) -> Result<Module> {
         s.pingpong_sus = (s.flg & ITSF_PINGPONG_SUSTAIN) != 0;
         m.samples.push(s);
     }
-    // Decode PCM in a second pass so the borrow of the freshly pushed sample
-    // doesn't fight the &data slice.
     for i in 0..m.samples.len() {
         if m.samples[i].has_data {
             let s = m.samples[i].clone();
@@ -379,7 +217,6 @@ pub fn parse(data: &[u8]) -> Result<Module> {
         }
     }
 
-    // ── patterns ──
     for &off in &pat_ptr {
         m.patterns.push(unpack_pattern(data, off));
     }
@@ -387,13 +224,14 @@ pub fn parse(data: &[u8]) -> Result<Module> {
     Ok(m)
 }
 
+/// TODO: move to `cli/`. Reads from disk.
 pub fn parse_file(path: &Path) -> Result<Module> {
     let data = std::fs::read(path)
     .map_err(|e| anyhow!("reading {}: {}", path.display(), e))?;
     parse(&data)
 }
 
-// ── pattern unpacking ──────────────────────────────────────────────────
+// ── pattern unpacking ────────────────────────────────────────────────
 
 pub fn unpack_pattern(data: &[u8], off: usize) -> Vec<Vec<Option<PatternEvent>>> {
     if off == 0 {
@@ -452,8 +290,6 @@ pub fn unpack_pattern(data: &[u8], off: usize) -> Vec<Vec<Option<PatternEvent>>>
         let mut cmd: Option<u8> = None;
         let mut par: u8 = 0;
 
-        // The Python version catches IndexError mid-record and breaks the
-        // outer loop.  Match that: check bounds before each byte read.
         macro_rules! byte_or_break {
             () => {{
                 if p >= data.len() {
@@ -502,12 +338,10 @@ pub fn unpack_pattern(data: &[u8], off: usize) -> Vec<Vec<Option<PatternEvent>>>
         if note.is_some() || inst.is_some() || vol.is_some() || cmd.is_some() {
             grid[r][ch] = Some(PatternEvent {
                 note,
-                // Python: inst or None -- 0 becomes None.
                 instrument: inst.filter(|&v| v != 0),
-                               volume: vol,
-                               // Python: cmd or None.
-                               command: cmd.filter(|&v| v != 0),
-                               parameter: par,
+                volume: vol,
+                command: cmd.filter(|&v| v != 0),
+                parameter: par,
             });
         }
     }
@@ -515,7 +349,7 @@ pub fn unpack_pattern(data: &[u8], off: usize) -> Vec<Vec<Option<PatternEvent>>>
     grid
 }
 
-// ── IT compression (the width-escape bit reader) ───────────────────────
+// ── IT compression (the width-escape bit reader) ──────────────────────
 
 struct BitReader<'a> {
     blk: &'a [u8],
@@ -529,8 +363,6 @@ impl<'a> BitReader<'a> {
         BitReader { blk, bi: 0, acc: 0, nb: 0 }
     }
 
-    /// Read `n` bits LSB-first.  Past the end of the block, reads zeroes,
-    /// matching the Python reader's auto-padding.
     fn read(&mut self, n: u32) -> u32 {
         while self.nb < n {
             let b = if self.bi < self.blk.len() {
@@ -550,8 +382,6 @@ impl<'a> BitReader<'a> {
     }
 }
 
-/// Python `_change_it_width`.  Kept as a separate function because it is
-/// the whole point of the escape coding.
 #[inline]
 fn change_it_width(current_width: u32, encoded_width: u32) -> u32 {
     let mut new_width = encoded_width + 1;
@@ -561,11 +391,6 @@ fn change_it_width(current_width: u32, encoded_width: u32) -> u32 {
     new_width
 }
 
-/// One channel of packed IT sample data.
-///
-/// Ported 1:1 from the Python, including the `width < 1 || width >
-/// initial_width` early break (which mirrors OpenMPT's behaviour when a
-/// malformed block pushes width out of the legal range).
 fn it_decompress_channel(
     src: &[u8],
     mut pos: usize,
@@ -629,7 +454,6 @@ fn it_decompress_channel(
                 if w >= half {
                     w -= 1i64 << bitsize;
                 }
-                // Arithmetic shift-right of a possibly-negative i64.
                 w >> shift
             } else {
                 let mut w = value & mask;
@@ -652,8 +476,6 @@ fn it_decompress_channel(
     (out, pos)
 }
 
-/// Port of `it_decompress`.  `channels` is 1 (mono) or 2 (stereo); for
-/// stereo, planes are decompressed sequentially and interleaved.
 pub fn it_decompress(
     src: &[u8],
     length: usize,
@@ -674,7 +496,6 @@ pub fn it_decompress(
     if channels == 1 {
         return planes.into_iter().next().unwrap_or_default();
     }
-    // Interleave: L0 R0 L1 R1 ...
     let shortest = planes.iter().map(|p| p.len()).min().unwrap_or(0);
     let mut out = Vec::with_capacity(shortest * channels);
     for i in 0..shortest {
@@ -685,9 +506,6 @@ pub fn it_decompress(
     out
 }
 
-// ── sample decoding ────────────────────────────────────────────────────
-
-/// Decode a single sample's PCM.  Returns signed i32; caller scales.
 pub fn decode_sample(data: &[u8], s: &Sample) -> Vec<i32> {
     if !s.has_data || s.ptr == 0 || s.ptr as usize >= data.len() {
         return Vec::new();
@@ -698,13 +516,7 @@ pub fn decode_sample(data: &[u8], s: &Sample) -> Vec<i32> {
 
     if s.compressed {
         let it215 = (cvt & ITCVT_DELTA) != 0;
-        return it_decompress(
-            &data[ptr..],
-            s.length as usize,
-            s.is16,
-            it215,
-            channels,
-        );
+        return it_decompress(&data[ptr..], s.length as usize, s.is16, it215, channels);
     }
 
     if !s.is16 && cvt == ITCVT_ADPCM {
@@ -777,7 +589,6 @@ pub fn decode_sample(data: &[u8], s: &Sample) -> Vec<i32> {
         return vals;
     }
 
-    // 8-bit
     let mut needed = s.length as usize * channels;
     if ptr + needed > data.len() {
         needed = data.len().saturating_sub(ptr);

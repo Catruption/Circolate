@@ -16,7 +16,7 @@ use crate::player::envelope::{synth_envelope_static, whole_sample_envelope, wrap
 use crate::player::notes::{value_at, DisplayNote};
 use crate::player::scope::{scope_snapshot_recent, vgm_scope_slot};
 use crate::player::{Project, Transport};
-use crate::formats::halotext::C5_HZ;
+use crate::parse::halotext::C5_HZ;
 use crate::tui::shared::label;
 use crate::tui::shared::note_fmt::{fmt_num, fmt_pitch};
 use crate::tui::shared::note_style::{note_style, NoteState};
