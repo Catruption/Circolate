@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use crate::mixer::mute;
 use crate::player::{Project, Transport};
 use crate::player::notes::{split_notes, value_at};
-use crate::parse::halotext::hz_to_note;
+use crate::formats::halotext::parse::hz_to_note;
 use super::analysis_mir::{self, N, Features};
 use super::motion;
 use super::theory;

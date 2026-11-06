@@ -15,8 +15,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::hosting::chip::chip::{Chip, CapValue, Role};
-use crate::hosting::chip::patch::{Patch, Envelope};
+use crate::formats::chip::chip::{Chip, CapValue, Role};
+use crate::formats::chip::patch::{Patch, Envelope};
 use crate::hosting::chip::engine::runtime::ScheduledWrite;
 
 const RLEPS: f64 = 1e-6;

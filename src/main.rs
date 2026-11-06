@@ -9,27 +9,19 @@
 mod log;
 
 mod archive;
+mod audio;
 mod asset;
 mod bundle;
-mod check;
 mod cli;
+mod conversion;
 mod pipe;
-mod emit;
-mod parse;
-mod model;
 mod deps;
-mod dump;
 mod effects;
-mod export;
-mod fidelity;
+mod formats;
 mod hosting;
-mod measure;
 mod mixer;
 mod paths;
-mod pick;
 mod player;
-mod spec;
-mod test;
 mod timing;
 mod tui;
 
@@ -97,12 +89,12 @@ fn main() -> Result<()> {
     if let Some(cmd) = cli.command {
         let result = match cmd {
             Command::Play    { args } => run_app(&args, cli.no_pick),
-            Command::Export  { args } => export::run(&pick_if_empty(args, cli.no_pick, pick::FILTER_SOURCE, "Export source")),
-            Command::Dump    { args } => dump::run(&pick_if_empty(args, cli.no_pick, pick::FILTER_HALOTEXT, "Dump halotext")),
-            Command::Test    { args } => test::run(&pick_if_empty(args, cli.no_pick, pick::FILTER_HALOTEXT, "Test halotext")),
-            Command::Check   { args } => check::run(&args),
-            Command::Census  { args } => check::run_census(&args),
-            Command::Measure { args } => measure::run(&args),
+            Command::Export  { args } => cli::export::run(&pick_if_empty(args, cli.no_pick, cli::pick::FILTER_SOURCE, "Export source")),
+            Command::Dump    { args } => cli::dump::run(&pick_if_empty(args, cli.no_pick, cli::pick::FILTER_HALOTEXT, "Dump halotext")),
+            Command::Test    { args } => cli::test::run(&pick_if_empty(args, cli.no_pick, cli::pick::FILTER_HALOTEXT, "Test halotext")),
+            Command::Check   { args } => cli::check::run(&args),
+            Command::Census  { args } => cli::check::run_census(&args),
+            Command::Measure { args } => cli::measure::run(&args),
             Command::Plugins { args } => deps::index::run(&args),
             Command::Fetch   { args } => deps::fetch::run(&args),
             Command::VstSmoke { args } => hosting::vst::smoke::run(&args),
@@ -181,7 +173,7 @@ fn pick_if_empty(mut args: Vec<String>, no_pick: bool, filter: &str, title: &str
     if no_pick || !args.is_empty() {
         return args;
     }
-    if let Some(p) = pick::pick_file(&picker_start_dir(), filter, title) {
+    if let Some(p) = cli::pick::pick_file(&picker_start_dir(), filter, title) {
         args.push(p.to_string_lossy().into_owned());
     }
     args

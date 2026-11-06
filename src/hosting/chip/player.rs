@@ -12,10 +12,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::hosting::chip::chip::{
+use crate::formats::chip::chip::{
     Chip, CapValue, Capability, Field, Role, Scope, Voice,
 };
-use crate::hosting::chip::patch::Patch;
+use crate::formats::chip::patch::Patch;
 use crate::hosting::chip::adapter::{Adapter, Dispatch, Note};
 use crate::hosting::chip::engine::core::ChipCore;
 use crate::hosting::chip::engine::runtime::CoreState;

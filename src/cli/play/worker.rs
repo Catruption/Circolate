@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use crate::deps::requires;
-use crate::fidelity::FIDELITY_FILENAME;
+use crate::formats::flp::fidelity::FIDELITY_FILENAME;
 use crate::player::{self, Cache, Loader, Msg, Project, Transport};
 
 pub struct ReloadSlot {

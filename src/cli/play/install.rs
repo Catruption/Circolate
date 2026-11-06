@@ -336,8 +336,8 @@ pub(crate) fn install_chip_players(
     .and_then(|t| parse_chip(&t).ok());
 
     // Group patches by chip.
-    let mut psg_patches: Vec<(String, crate::hosting::chip::patch::Patch)> = Vec::new();
-    let mut fm_patches:  Vec<(String, crate::hosting::chip::patch::Patch)> = Vec::new();
+    let mut psg_patches: Vec<(String, crate::formats::chip::patch::Patch)> = Vec::new();
+    let mut fm_patches:  Vec<(String, crate::formats::chip::patch::Patch)> = Vec::new();
     for (path, patch) in &project.patch_instruments {
         if patch.requires.iter().any(|r| r.capability == "sample.pcm") {
             continue;

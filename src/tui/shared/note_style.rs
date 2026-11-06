@@ -48,7 +48,7 @@ fn synesthetic_bg(pitch_hz: f64, vol: f64, synth: &SynesthesiaConfig) -> Option<
     if !synth.enabled {
         return None;
     }
-    let midi = crate::parse::halotext::hz_to_note(pitch_hz);
+    let midi = crate::formats::halotext::parse::hz_to_note(pitch_hz);
     let hue = midi.rem_euclid(12) as f64 * synth.hue_step;
 
     // Use volume to control brightness (value), not saturation.

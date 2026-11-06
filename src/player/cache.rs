@@ -5,9 +5,9 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use crate::parse::halotext::HalotextPart;
+use crate::formats::halotext::parse::HalotextPart;
 
-use super::stretch;
+use crate::audio::stretch;
 use super::template::{build_template, PartTemplate};
 use super::types::{
     MultiSampleInstrument, Sample, Sf2EngineSpec, Sf2Instrument, VstInstrument,

@@ -3,8 +3,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::hosting::chip::chip::{Chip, Out, Variant};
-use crate::hosting::chip::expr::{self, Context, Expr};
+use crate::formats::chip::chip::{Chip, Out, Variant};
+use crate::formats::chip::expr::{self, Context, Expr};
 use super::primitives::{Divider, Lfsr};
 
 /// A pending field write. `t` is absolute seconds from playback start.

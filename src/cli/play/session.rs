@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
-use crate::model::source::SourceKind;
+use crate::formats::common::source::SourceKind;
 use crate::player::{self, Cache, Engine, Loader, Msg, Project, Transport};
 use crate::tui::{self, app::{LoopOutcome, TuiBackend}};
 use crate::tui::config::Settings;

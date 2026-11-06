@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::archive;
 use crate::pipe::{ ConvertOptions};
-use crate::model::source::SourceKind;
+use crate::formats::common::source::SourceKind;
 
 use super::audio::Silence;
 use super::cli::Args;
@@ -38,7 +38,7 @@ impl TempBundle {
     }
 
     pub fn write(&self, c: &crate::pipe::Converted, stem: &str) -> Result<PathBuf> {
-        let ts_path = self.dir.join(format!("{}{}", stem, crate::spec::SOURCE_EXT));
+        let ts_path = self.dir.join(format!("{}{}", stem, crate::formats::halotext::spec::SOURCE_EXT));
         std::fs::write(&ts_path, &c.halotext)?;
         for s in &c.samples {
             let p = self.dir.join(&s.rel_path);
@@ -88,7 +88,7 @@ pub fn resolve_source(src: &Path, args: &Args) -> Result<(PathBuf, Option<TempBu
             let conv = {
                 let _s = Silence::new();
                 if let SourceKind::Vgm = SourceKind::from_path(src)? {
-                    crate::pipe::vgm::convert_vgm(src, &opts)?
+                    crate::formats::vgm::convert::convert_vgm(src, &opts)?
                 } else {
                     crate::pipe::convert_file(src, &opts)?
                 }

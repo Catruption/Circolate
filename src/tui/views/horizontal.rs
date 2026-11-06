@@ -19,7 +19,7 @@ use crate::player::envelope::{
 use crate::player::notes::{value_at, ColumnLine};
 use crate::player::scope::{scope_snapshot_recent, vgm_scope_slot};
 use crate::player::{Project, Transport};
-use crate::parse::halotext::C5_HZ;
+use crate::formats::halotext::parse::C5_HZ;
 use crate::tui::shared::braille::{braille_str, dot_bit};
 use crate::tui::shared::label;
 use crate::tui::shared::note_fmt::fmt_note;

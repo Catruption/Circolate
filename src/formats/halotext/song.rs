@@ -1,0 +1,227 @@
+// src/convert/song.rs
+//! Shared Halotext assembly.
+//!
+//! Both FLP and IT converters build a `Song` and call `write()`.  The
+//! writer emits one part per channel with N measures, addressed from
+//! BlockList by 1-based measure index:
+//!
+//!     BlockList()
+//!     {
+//!         ƒpianoer(1);
+//!         ;
+//!         ƒpianoer(2); ƒZENOLOGY(1);
+//!     }
+//!
+//!     BlockArray()
+//!     {
+//!         ƒpianoer(<|4/4, ƒ'samples/05_pianoer.wav'>)[
+//!             <§1/1,#C5,~14,%78.1>
+//!             <§1/1,#C5,~14.55,%78.1>
+//!         ]
+//!         ;
+//!     }
+
+use std::collections::HashMap;
+
+use crate::conversion::fmt;
+use crate::formats::halotext::spec;
+
+pub(crate) struct Part {
+    pub(crate) name: String,
+    /// Pre-formatted source argument, e.g. `ƒ'samples/05_pianoer.wav'`.
+    pub(crate) source_arg: String,
+    /// One rendered body per unique measure.  Deduped by content.
+    pub(crate) sections: Vec<String>,
+}
+
+pub(crate) struct Call {
+    pub(crate) part_idx: usize,
+    /// 0-based; written as 1-based in the file.
+    pub(crate) section_idx: usize,
+    /// Optional per-measure override block (raw text, no brackets),
+    /// e.g. `Some("<%50>")`.
+    pub(crate) overrides: Option<String>,
+}
+
+pub(crate) struct MeasureLine {
+    pub(crate) calls: Vec<Call>,
+    /// Parallel to `calls`: `extra[i]` is the shim suffix appended to
+    /// `calls[i]` before its terminating `;`.  Empty string means no
+    /// shim for that call.  `write()` indexes with `extra.get(ci)`, so
+    /// a line may have fewer entries than calls (missing = no shim);
+    /// this is how `it.rs` leaves shims off every call.
+    ///
+    /// Entries past `calls.len()` are not emitted — standalone shims
+    /// (own BlockList line) must be authored in the file directly, not
+    /// produced via this struct.
+    pub(crate) extra: Vec<String>,
+}
+
+pub(crate) struct Song {
+    pub(crate) title: String,
+    pub(crate) source_name: String,
+    pub(crate) source_format: &'static str,
+    pub(crate) tempo: f64,
+    pub(crate) subs: u32,
+    pub(crate) time_signature: (u32, u32),
+    pub(crate) song_volume_pct: f64,
+    pub(crate) panning_law: &'static str,
+    pub(crate) pitch_default: &'static str,
+
+    pub(crate) parts: Vec<Part>,
+    pub(crate) part_index: HashMap<String, usize>,
+
+    pub(crate) measures: Vec<MeasureLine>,
+
+    pub(crate) post_comments: Vec<String>,
+
+    pub(crate) soundfont: Option<String>,
+}
+
+impl Song {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        title: &str,
+        source_name: &str,
+        source_format: &'static str,
+        tempo: f64,
+        subs: u32,
+        time_signature: (u32, u32),
+                      song_volume_pct: f64,
+                      panning_law: &'static str,
+                      pitch_default: &'static str,
+    ) -> Self {
+        Song {
+            title: title.to_string(),
+            source_name: source_name.to_string(),
+            source_format,
+            tempo,
+            subs,
+            time_signature,
+            song_volume_pct,
+            panning_law,
+            pitch_default,
+            parts: Vec::new(),
+            part_index: HashMap::new(),
+            measures: Vec::new(),
+            post_comments: Vec::new(),
+            soundfont: None,
+        }
+    }
+
+    pub(crate) fn get_or_create_part(&mut self, name: &str, source_arg: String) -> usize {
+        if let Some(&idx) = self.part_index.get(name) {
+            return idx;
+        }
+        let idx = self.parts.len();
+        self.parts.push(Part {
+            name: name.to_string(),
+                        source_arg,
+                        sections: Vec::new(),
+        });
+        self.part_index.insert(name.to_string(), idx);
+        idx
+    }
+
+    /// Dedup by content; returns the 0-based section index.
+    pub(crate) fn add_section(&mut self, part_idx: usize, body: String) -> usize {
+        let sections = &mut self.parts[part_idx].sections;
+        if let Some(pos) = sections.iter().position(|s| s == &body) {
+            return pos;
+        }
+        sections.push(body);
+        sections.len() - 1
+    }
+
+    /// Grow `measures` if needed and return the requested line.
+    pub(crate) fn measure_line(&mut self, m: usize) -> &mut MeasureLine {
+        while self.measures.len() <= m {
+            self.measures.push(MeasureLine { calls: Vec::new(), extra: Vec::new() });
+        }
+        &mut self.measures[m]
+    }
+
+    pub(crate) fn write(self) -> String {
+        let mut out = String::new();
+        let (num, den) = self.time_signature;
+
+        // ── Config ────────────────────────────────────────────────
+        out.push_str("Config\n{\n");
+        out.push_str("    HalotextVersion: 1.10;\n");
+        out.push_str(&format!("    BeatsPerMinute: {};\n", fmt(self.tempo, 2)));
+        out.push_str(&format!("    TimeSignature: {}/{};\n", num, den));
+        out.push_str(&format!("    Subdivisions: {};\n", self.subs));
+        out.push_str(&format!(
+            "    SongVolume: {}%;\n",
+            fmt(self.song_volume_pct, 2)
+        ));
+        out.push_str(&format!("    PanningLaw: {};\n", self.panning_law));
+        out.push_str("    Overlap: stack;\n");
+        out.push_str(&format!("    PitchDefault: {};\n", self.pitch_default));
+        if let Some(sf) = &self.soundfont {
+            out.push_str(&format!("    SoundFont: {};\n", sf));
+        }
+        out.push_str("}\n\n");
+
+        // ── BlockList ─────────────────────────────────────────────
+        out.push_str("BlockList()\n{\n");
+        for line in &self.measures {
+            if line.calls.is_empty() {
+                out.push_str("    ;\n");
+                continue;
+            }
+            out.push_str("    ");
+            let mut first = true;
+            for (ci, c) in line.calls.iter().enumerate() {
+                if !first {
+                    out.push(' ');
+                }
+                first = false;
+                out.push_str(spec::FIELD_SOURCE);
+                out.push_str(&self.parts[c.part_idx].name);
+                out.push('(');
+                out.push_str(&(c.section_idx + 1).to_string());
+                if let Some(ov) = &c.overrides {
+                    out.push_str(ov);
+                }
+                out.push(')');
+                if let Some(suffix) = line.extra.get(ci) {
+                    out.push_str(suffix);
+                }
+                out.push(';');
+            }
+            out.push('\n');
+        }
+        out.push_str("}\n\n");
+
+        // ── BlockArray ────────────────────────────────────────────
+        out.push_str("BlockArray()\n{\n");
+        let frame = spec::section_frame(num, self.subs);
+        for part in &self.parts {
+            out.push_str(&format!(
+                "    ƒ{}(<{}, {}>)[\n",
+                                  part.name, frame, part.source_arg
+            ));
+            for section in &part.sections {
+                out.push_str(section);
+                out.push('\n');
+            }
+            out.push_str("    ]\n");
+            out.push_str("    ;\n\n");
+        }
+        if out.ends_with("\n\n") {
+            out.pop();
+        }
+        out.push_str("}\n");
+
+        // ── Post-comments ─────────────────────────────────────────
+        for c in &self.post_comments {
+            out.push_str(c);
+            if !c.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+
+        out
+    }
+}

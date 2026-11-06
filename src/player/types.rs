@@ -4,9 +4,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::model::sf2::Sf2File;
-use crate::spec::sf2::units::{attenuation_cb_to_linear, timecents_to_secs};
-use crate::parse::halotext::C5_HZ;
+use crate::formats::sf2::model::Sf2File;
+use crate::formats::sf2::spec::units::{attenuation_cb_to_linear, timecents_to_secs};
+use crate::formats::halotext::parse::C5_HZ;
 
 // ── samples ────────────────────────────────────────────────────────────
 
@@ -305,6 +305,33 @@ pub(crate) fn build_sf2_instrument(
     }
 
     Ok(Sf2Instrument { zones })
+}
+
+// ── Slicex instruments ────────────────────────────────────────────────
+
+use crate::formats::flp::slicex::Points;
+
+pub(crate) struct SlicexSlice {
+    pub(crate) frame_start: u32,
+    pub(crate) frame_end:   u32,
+    pub(crate) key:         u32,
+    pub(crate) pan:         u32,     // 0..128, 64 = centre
+    pub(crate) atten:       u32,     // 0..128, 0 = loud
+    pub(crate) cutoff:      u32,     // 0..12800
+}
+
+pub(crate) struct SlicexInstrument {
+    pub(crate) sample: Arc<Sample>,
+    pub(crate) base_key: u32,
+    pub(crate) slices: Vec<SlicexSlice>,
+    pub(crate) amp_env:   Option<Arc<Points>>,
+    pub(crate) speed_env: Option<Arc<Points>>,
+    pub(crate) cut_env:   Option<Arc<Points>>,
+    pub(crate) amp_amt:   f64,
+    pub(crate) speed_amt: f64,
+    pub(crate) cut_amt:   f64,
+    pub(crate) speed_octaves: f64,
+    pub(crate) loop_flag: bool,
 }
 
 // ── multi-sample instruments ───────────────────────────────────────────

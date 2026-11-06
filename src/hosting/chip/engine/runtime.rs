@@ -2,8 +2,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::hosting::chip::chip::{Chip, Out, Variant};
-use crate::hosting::chip::expr::{self, Context, Expr};
+use crate::formats::chip::chip::{Chip, Out, Variant};
+use crate::formats::chip::expr::{self, Context, Expr};
 use super::primitives::{Divider, Lfsr};
 
 #[derive(Clone, Debug)]
@@ -306,7 +306,7 @@ impl<'a> Context for StepCtx<'a> {
         if let Some(only) = self.only_voice {
             if voice != only {
                 let role = self.chip.fields.get(field).map(|f| f.role);
-                if role == Some(crate::hosting::chip::chip::Role::Volume) {
+                if role == Some(crate::formats::chip::chip::Role::Volume) {
                     return Some(15.0);
                 }
                 return Some(0.0);

@@ -11,9 +11,9 @@
 //! (milestone 6) which will be retired once the chip models are accurate.
 
 use std::collections::BTreeMap;
-use crate::hosting::chip::chip::{ChipModel, LatchDataBus, Route, RouteKind, RouteType};
+use crate::formats::chip::chip::{ChipModel, LatchDataBus, Route, RouteKind, RouteType};
 use crate::hosting::chip::engine::registers::RegisterFile;
-use crate::hosting::chip::expr::{Context, Expr};
+use crate::formats::chip::expr::{Context, Expr};
 
 /// A single write on the bus.
 pub enum BusWrite<'a> {
@@ -171,20 +171,20 @@ fn voice_for_chan(model: &ChipModel, chan: u8, type_: u8) -> Option<String> {
     let _ = type_;
     match chan {
         0..=2 => model.voices.get(chan as usize).map(|v| v.name.clone()),
-        3 => model.voices.iter().find(|v| matches!(v.kind, crate::hosting::chip::chip::VoiceKind::Noise)).map(|v| v.name.clone()),
+        3 => model.voices.iter().find(|v| matches!(v.kind, crate::formats::chip::chip::VoiceKind::Noise)).map(|v| v.name.clone()),
         _ => None,
     }
 }
 
 fn is_tone_voice(model: &ChipModel, chan: u8) -> bool {
     model.voices.get(chan as usize).map(|v|
-        matches!(v.kind, crate::hosting::chip::chip::VoiceKind::Tone)
+        matches!(v.kind, crate::formats::chip::chip::VoiceKind::Tone)
     ).unwrap_or(false)
 }
 
 fn is_noise_voice(model: &ChipModel, chan: u8) -> bool {
     model.voices.get(chan as usize).map(|v|
-        matches!(v.kind, crate::hosting::chip::chip::VoiceKind::Noise)
+        matches!(v.kind, crate::formats::chip::chip::VoiceKind::Noise)
     ).unwrap_or(false)
 }
 

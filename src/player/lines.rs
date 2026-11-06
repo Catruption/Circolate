@@ -6,8 +6,8 @@
 
 use std::collections::HashMap;
 
-use crate::emit::halotext::emit_call;
-use crate::parse::halotext::{BlockCall, CallOverrides, ShimEvent, HalotextPart};
+use crate::formats::halotext::emit::emit_call;
+use crate::formats::halotext::parse::{BlockCall, CallOverrides, ShimEvent, HalotextPart};
 
 #[derive(Clone)]
 pub(crate) struct LineCall {

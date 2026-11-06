@@ -3,8 +3,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::player::Cache;
 use crate::player::project::Project;
 use crate::timing::{TempoMap, AutomationLane};
-use crate::player::engine::{Scheduled, VstNote, gains};
+use crate::player::engine::{Scheduled, SlicexVoiceRef, VstNote, gains};
 use crate::hosting::chip::{ChipNote, ChipAutomation};
+use crate::formats::halotext::parse::C5_HZ;
 
 pub(crate) struct Loaded {
     pub(crate) samples: Vec<Scheduled>,
@@ -169,10 +170,6 @@ pub(crate) fn prepare_line(
         let Some(part) = project.parts.get(&call.name) else { continue };
 
         // ── chip patch branch ─────────────────────────────────────────
-        // Parts sourced from `.patch` files (lifted VGM channels) produce
-        // ChipNote instead of Scheduled / VstNote. Same timing math as
-        // the sample branch, but the pitch is looked up by the chip
-        // player from the patch, not stored here.
         if let Some(patch_iid) = project.patch_iids.get(&part.sample_path).copied() {
             let chip_path: Arc<str> = Arc::from(part.sample_path.as_str());
             let measure_start = call.pattern_measure_start;
@@ -180,8 +177,8 @@ pub(crate) fn prepare_line(
             let call_base_row = line_base_row + call.line_offset;
 
             let events: Vec<_> = project.part_events(&call.name).iter()
-                .filter(|ev| ev.row >= measure_start && ev.row < measure_end)
-                .cloned().collect();
+            .filter(|ev| ev.row >= measure_start && ev.row < measure_end)
+            .cloned().collect();
             let note_rows = crate::player::notes::split_notes(&events, part.subs_per_beat, part.sample_offset);
             for nr in note_rows {
                 let rel_row = nr.start_row;
@@ -195,7 +192,7 @@ pub(crate) fn prepare_line(
 
                 let initial_hz = nr.pitch_points.first().map(|p| p.value);
                 let midi = initial_hz.map(|hz| 69.0 + 12.0 * (hz / 440.0).log2())
-                    .unwrap_or(60.0).round().clamp(0.0, 127.0) as u8;
+                .unwrap_or(60.0).round().clamp(0.0, 127.0) as u8;
                 let vel = nr.vol_points.first().map(|p| p.value).unwrap_or(100.0).clamp(0.0, 127.0) as u8;
                 let mut automation: Vec<ChipAutomation> = Vec::new();
                 for p in nr.pitch_points.iter().skip(1) {
@@ -230,7 +227,80 @@ pub(crate) fn prepare_line(
                     line: li as u32,
                     seq,
                     part_path: Arc::clone(&chip_path),
-                    source_row: rel_row,
+                           source_row: rel_row,
+                });
+            }
+            continue;
+        }
+        // ──────────────────────────────────────────────────────────────
+
+        // ── Slicex sidecar branch ─────────────────────────────────────
+        // Parts referencing `instruments/*.slicex` build Scheduled
+        // directly from note data + slice info; no template cache.
+        if part.sample_path.ends_with(".slicex") {
+            let Some(sx) = project.slicex_for_part(&call.name) else {
+                if debug {
+                    eprintln!("slicex: no instrument for {}", part.sample_path);
+                }
+                continue;
+            };
+
+            let measure_start = call.pattern_measure_start;
+            let measure_end   = call.pattern_measure_start + call.pattern_measure_len;
+            let call_base_row = line_base_row + call.line_offset;
+
+            let events: Vec<_> = part.events.iter()
+            .filter(|ev| ev.row >= measure_start && ev.row < measure_end)
+            .cloned().collect();
+            let note_rows = crate::player::notes::split_notes(
+                &events, part.subs_per_beat, part.sample_offset);
+
+            let n    = sx.slices.len() as i32;
+            let base = sx.base_key as i32;
+            if n == 0 { continue; }
+
+            for nr in note_rows {
+                seq += 1;
+                let rel_row = nr.start_row;
+                let local   = rel_row - measure_start;
+                let start_row = call_base_row + local;
+                let end_row   = call_base_row + (nr.end_row - measure_start);
+                let start = (tempo.time_at_row(start_row) * sr) as i64;
+                let end   = (tempo.time_at_row(end_row).min(project.render_end_sec) * sr) as i64;
+                if end <= start || end <= min_end { continue; }
+
+                let pitch_hz = nr.pitch_points.first().map(|p| p.value).unwrap_or(C5_HZ);
+                let midi = (69.0 + 12.0 * (pitch_hz / 440.0).log2()).round() as i32;
+                let idx  = ((midi - base).rem_euclid(n)) as usize;
+                let slice = &sx.slices[idx];
+
+                let vel              = nr.vol_points.first().map(|p| p.value).unwrap_or(100.0);
+                let slice_pan        = (slice.pan as f64 - 64.0) / 64.0;
+                let slice_atten_gain = 1.0 - (slice.atten as f64 / 128.0);
+                let vol              = vel * slice_atten_gain;
+                let pan              = slice_pan;
+
+                samples.push(Scheduled {
+                    slicex: Some(SlicexVoiceRef {
+                        instrument: Arc::clone(&sx),
+                                 slice_idx:  idx,
+                    }),
+                    start,
+                    end,
+                    line: li as u32,
+                    seq,
+                    sample: Arc::clone(&sx.sample),
+                             pitch_hz: C5_HZ,
+                             offset: slice.frame_start as f64,
+                             vol,
+                             pan,
+                             pitch_lane: None,
+                             vol_lane:   None,
+                             pan_lane:   None,
+                             const_gain: gains(vol, pan, project.song_volume, project.linear_pan),
+                             part_path: part.sample_path.clone(),
+                             source_row: rel_row,
+                             env: None,
                 });
             }
             continue;
@@ -311,6 +381,7 @@ pub(crate) fn prepare_line(
             };
 
             samples.push(Scheduled {
+                slicex: None,
                 start,
                 end,
                 line: li as u32,

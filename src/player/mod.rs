@@ -10,7 +10,6 @@ pub mod project;
 pub mod render;
 pub mod scope;
 pub mod store;
-pub mod stretch;
 pub mod template;
 pub mod transport;
 pub mod types;
@@ -18,7 +17,7 @@ pub mod inserts;
 pub mod analysis;
 pub mod analysis_mir;
 pub mod theory;
-pub mod motion;      // <-- THIS LINE. If it's missing, everything breaks.
+pub mod motion;
 
 pub(crate) use engine::perf;
 

@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::parse::halotext::{HalotextPart, C5_HZ};
+use crate::formats::halotext::parse::{HalotextPart, C5_HZ};
 use crate::timing::Waypoint;
 
 use super::types::{

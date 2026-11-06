@@ -7,21 +7,22 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::asset::{AssetSource, DirSource, ENTRY_KEY};
-use crate::parse::wav::decode_audio;
+use crate::formats::common::audio::decode_audio;
 use crate::deps::index::PluginIndex;
-use crate::fidelity::{Fidelity, FIDELITY_FILENAME};
+use crate::formats::flp::fidelity::{Fidelity, FIDELITY_FILENAME};
 use crate::deps::requires::{self, Requires};
-use crate::parse::halotext::parse_str;
-use crate::hosting::chip::patch::Patch;
-use crate::hosting::chip::patch::parse as parse_patch;
+use crate::formats::halotext::parse::parse_str;
+use crate::formats::chip::patch::Patch;
+use crate::formats::chip::patch::parse as parse_patch;
 use crate::timing::TempoMap;
+use crate::formats::flp::slicex::Points;
 
 use super::super::cache::{fingerprint, hash_part, Cache};
 use super::super::inserts;
 use super::super::lines::{resolve_line, tempo_shims_to_events, LineInfo};
 use super::super::types::{
     build_sf2_instrument, MultiSampleInstrument, Sf2EngineSpec, Sf2Instrument,
-    Sf2InstrumentOverrides, VstInstrument, Sample, Sf2VoiceEnvelope,
+    Sf2InstrumentOverrides, SlicexInstrument, SlicexSlice, VstInstrument, Sample, Sf2VoiceEnvelope,
 };
 use super::assets::{extract_embedded_plugins, materialize_sf2_file, materialize_sf2_reference};
 use super::{LyricLine, LyricSegment, Project, VgmInstrument};
@@ -69,6 +70,79 @@ fn vgm_seconds(bytes: &[u8]) -> Option<f64> {
     }
     let n = u32::from_le_bytes([bytes[0x18], bytes[0x19], bytes[0x1A], bytes[0x1B]]);
     if n > 0 { Some(n as f64 / 44100.0) } else { None }
+}
+
+// ── Slicex sidecar parsing ────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct SlicexSidecarJson {
+    #[allow(dead_code)] version: u32,
+    wav: String,
+    slices: Vec<SidecarSliceJson>,
+    envelopes: SidecarEnvelopesJson,
+    #[serde(default, rename = "loop")] loop_: bool,
+    #[serde(default)] speed_octaves: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct SidecarSliceJson {
+    s: u32, e: u32, k: u32, pan: u32, atten: u32, cut: u32,
+}
+
+#[derive(Deserialize, Default)]
+struct SidecarEnvelopesJson {
+    #[serde(default)] amp:   Option<EnvJson>,
+    #[serde(default)] speed: Option<EnvJson>,
+    #[serde(default)] cut:   Option<EnvJson>,
+    #[serde(default)] lfo:   Option<EnvJson>,
+}
+
+#[derive(Deserialize)]
+struct EnvJson {
+    points: Vec<SidecarPointJson>,
+    amount: f64,
+}
+
+#[derive(Deserialize)]
+struct SidecarPointJson {
+    t: f64, v: f64, tension: f64, kind: u8,
+}
+
+fn parse_slicex_sidecar(
+    text: &str,
+    samples: &HashMap<u32, Arc<Sample>>,
+    path_to_id: &HashMap<String, u32>,
+) -> Option<SlicexInstrument> {
+    let doc: SlicexSidecarJson = serde_json::from_str(text).ok()?;
+    let wav_id = path_to_id.get(&doc.wav)?;
+    let sample = samples.get(wav_id)?.clone();
+    let base_key = doc.slices.first()?.k;
+
+    let to_points = |e: &EnvJson| -> Arc<Points> {
+        Arc::new(Points(e.points.iter().map(|p| crate::formats::flp::slicex::Point {
+            time: p.t, value: p.v, tension: p.tension, kind: p.kind,
+        }).collect()))
+    };
+    let amp_env   = doc.envelopes.amp.as_ref().map(to_points);
+    let speed_env = doc.envelopes.speed.as_ref().map(to_points);
+    let cut_env   = doc.envelopes.cut.as_ref().map(to_points);
+
+    Some(SlicexInstrument {
+        sample,
+         base_key,
+         slices: doc.slices.iter().map(|s| SlicexSlice {
+             frame_start: s.s, frame_end: s.e, key: s.k,
+             pan: s.pan, atten: s.atten, cutoff: s.cut,
+         }).collect(),
+         amp_env,
+         speed_env,
+         cut_env,
+         amp_amt:   doc.envelopes.amp.as_ref().map_or(1.0, |e| e.amount),
+         speed_amt: doc.envelopes.speed.as_ref().map_or(1.0, |e| e.amount),
+         cut_amt:   doc.envelopes.cut.as_ref().map_or(1.0, |e| e.amount),
+         speed_octaves: doc.speed_octaves.unwrap_or(1.0),
+         loop_flag: doc.loop_,
+    })
 }
 
 pub(crate) fn load_project_from_source(
@@ -130,13 +204,11 @@ pub(crate) fn load_project_from_source(
                 fps.insert(s.id, fingerprint(&smp));
                 samples.insert(s.id, Arc::new(smp));
 
-                // Bare-filename alias so `ƒ'X.wav'` resolves.
                 if let Some(base) = Path::new(&rel).file_name().and_then(|f| f.to_str()) {
                     if base != rel.as_str() {
                         path_to_id.entry(base.to_string()).or_insert(s.id);
                     }
                 }
-
                 if let Some(stripped) = rel.strip_prefix("./") {
                     path_to_id.insert(stripped.to_string(), s.id);
                 }
@@ -161,11 +233,24 @@ pub(crate) fn load_project_from_source(
     let mut sf2_engine_specs: HashMap<String, Sf2EngineSpec> = HashMap::new();
     let mut vst_instruments: HashMap<String, Arc<VstInstrument>> = HashMap::new();
     let mut vgm_instruments: HashMap<String, Arc<VgmInstrument>> = HashMap::new();
+    let mut slicex_instruments: HashMap<String, Arc<SlicexInstrument>> = HashMap::new();
 
-    // (sidecar_stem, plugin_name) captured during instrument loop,
-    // consumed after the loop so aliases point at the final Arc.
+    // ── Load Slicex sidecars (independent of .instrument sidecars) ──
+    for entry in source.list("instruments", Some("slicex")) {
+        let rel = if entry.starts_with("instruments/") || entry.starts_with("./instruments/") {
+            entry.trim_start_matches("./").to_string()
+        } else {
+            format!("instruments/{}", entry)
+        };
+        let Some(text) = source.read_text(&rel)? else { continue };
+        if let Some(inst) = parse_slicex_sidecar(&text, &samples, &path_to_id) {
+            slicex_instruments.insert(rel, Arc::new(inst));
+        } else {
+            crate::log_event!("player.slicex.parse_failed", path: rel.clone());
+        }
+    }
+
     let mut vst_aliases: Vec<(String, String)> = Vec::new();
-
     let mut next_sf2_id: u32 = 10_000;
     let mut vst_index: Option<PluginIndex> = None;
 
@@ -209,10 +294,7 @@ pub(crate) fn load_project_from_source(
             if patch_instruments.contains_key(&part.sample_path) { continue; }
 
             let Some(text) = source.read_text(&part.sample_path)? else {
-                crate::log_event!(
-                    "player.patch.missing",
-                    path: part.sample_path.clone(),
-                );
+                crate::log_event!("player.patch.missing", path: part.sample_path.clone());
                 continue;
             };
             match parse_patch(&text) {
@@ -223,20 +305,14 @@ pub(crate) fn load_project_from_source(
                     patch_instruments.insert(part.sample_path.clone(), patch);
                 }
                 Err(e) => {
-                    crate::log_event!(
-                        "player.patch.parse_failed",
-                        path: part.sample_path.clone(),
-                                      err: e,
-                    );
+                    crate::log_event!("player.patch.parse_failed", path: part.sample_path.clone(), err: e);
                 }
             }
         }
         let psg_n = patch_iids.values().filter(|i| **i == 100).count();
         let fm_n = patch_iids.values().filter(|i| **i == 101).count();
-        eprintln!(
-            "loaded {} chip patch instrument(s) ({} PSG, {} FM)",
-                  patch_instruments.len(), psg_n, fm_n,
-        );
+        eprintln!("loaded {} chip patch instrument(s) ({} PSG, {} FM)",
+                  patch_instruments.len(), psg_n, fm_n);
     }
 
     for entry in source.list("instruments", Some("instrument")) {
@@ -334,9 +410,6 @@ pub(crate) fn load_project_from_source(
         }
     }
 
-    // Alias by sidecar stem (intent name) and plugin name so migrated
-    // references resolve. First sidecar with a given key wins. Every alias
-    // shares the same Arc as the sidecar entry.
     for (sidecar, plugin) in vst_aliases {
         let Some(arc) = vst_instruments.get(&sidecar).cloned() else { continue };
         if let Some(stem) = Path::new(&sidecar).file_stem().and_then(|s| s.to_str()) {
@@ -351,13 +424,7 @@ pub(crate) fn load_project_from_source(
         }
     }
 
-    // ── MIGRATION: VST references without .instrument sidecars ──────────
-    // Parts may say `ƒ'ZENOLOGY.vst3'` even when `ZENOLOGY.instrument`
-    // doesn't exist. Resolve each unresolved VST reference by:
-    //   1. Trying the direct name (`ZENOLOGY` → plugin scan)
-    //   2. Falling back to `parsed.fallbacks[key]` (substitute plugin + gain)
-    // Registers under the halotext's reference key so parts resolve.
-
+    // ── VST migration ────────────────────────────────────────────────
     let mut vst_keys_needed = HashSet::new();
     for part in parsed.parts.values() {
         let p = &part.sample_path;
@@ -370,10 +437,7 @@ pub(crate) fn load_project_from_source(
         if vst_instruments.contains_key(&key) { continue; }
 
         let direct_name = Path::new(&key)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_string();
+        .file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
 
         let direct = embedded_plugins.get(&direct_name).cloned().filter(|p| p.exists())
         .or_else(|| {
@@ -385,10 +449,7 @@ pub(crate) fn load_project_from_source(
             (direct_name.clone(), path, 1.0f32, false)
         } else if let Some(spec) = parsed.fallbacks.get(&key) {
             let use_name = Path::new(&spec.use_)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&spec.use_)
-            .to_string();
+            .file_stem().and_then(|s| s.to_str()).unwrap_or(&spec.use_).to_string();
 
             let path = embedded_plugins.get(&use_name).cloned().filter(|p| p.exists())
             .or_else(|| {
@@ -408,13 +469,9 @@ pub(crate) fn load_project_from_source(
             continue;
         };
 
-        // Keep the original iid from fidelity.json so scope mapping stays
-        // intact. If there is no match, pick the lowest id that no VST *or
-        // SF2 engine* already uses (SF2 channels share the 0..15 range).
         let source_iid = fidelity.as_ref().and_then(|f| {
-            f.channels.values().find(|c| {
-                c.name == direct_name || c.name == plugin_name
-            }).map(|c| c.iid as u16)
+            f.channels.values().find(|c| c.name == direct_name || c.name == plugin_name)
+            .map(|c| c.iid as u16)
         }).unwrap_or_else(|| {
             let mut id = 0;
             while vst_instruments.values().any(|v| v.iid == id)
@@ -441,13 +498,7 @@ pub(crate) fn load_project_from_source(
         vst_instruments.insert(direct_name.clone(), inst);
     }
 
-    // ── MIGRATION: SF2 references without .instrument sidecars ─────────
-    // Parts may say `ƒ'samples/X.sf2'(preset)` directly.  Resolve each
-    // unique (path, bank, preset) triple into an Sf2Instrument + Sf2EngineSpec,
-    // keyed by the composite `path#preset` string.  Parts referencing the
-    // old `.instrument` sidecar form are already registered above and are
-    // left alone.
-
+    // ── SF2 migration ────────────────────────────────────────────────
     let mut sf2_keys_needed: HashSet<(String, i16, i16)> = HashSet::new();
     for part in parsed.parts.values() {
         if part.sample_path.ends_with(".sf2") {
@@ -464,9 +515,7 @@ pub(crate) fn load_project_from_source(
             format!("{}#{}:{}", path, bank, preset)
         };
 
-        if sf2_engine_specs.contains_key(&composite) {
-            continue;
-        }
+        if sf2_engine_specs.contains_key(&composite) { continue; }
 
         let sf2_bytes = match source.read_bytes(&path) {
             Ok(Some(b)) => b,
@@ -480,7 +529,6 @@ pub(crate) fn load_project_from_source(
             _ => continue,
         };
 
-        // Allocate iid avoiding VSTs and existing SF2 engines
         let iid = {
             let mut id = 0u16;
             while id < u16::MAX
@@ -493,12 +541,7 @@ pub(crate) fn load_project_from_source(
         };
 
         if let Ok(obj) = build_sf2_instrument(
-            &sf2_bytes,
-            bank as u16,
-            preset as u16,
-            next_sf2_id,
-            &mut samples,
-            None,
+            &sf2_bytes, bank as u16, preset as u16, next_sf2_id, &mut samples, None,
         ) {
             next_sf2_id += obj.zone_count_hint() + 1;
             sf2_instruments.insert(composite.clone(), Arc::new(obj));
@@ -508,14 +551,11 @@ pub(crate) fn load_project_from_source(
             composite.clone(),
                                 Sf2EngineSpec {
                                     sf2_path: sf2_on_disk,
-                                    bank: bank as u8,
-                                    preset: preset as u8,
-                                    gain: 1.0,
-                                    iid,
+                                    bank: bank as u8, preset: preset as u8,
+                                    gain: 1.0, iid,
                                 },
         );
 
-        // Alias basename form so `ƒ'X.sf2'(preset)` also resolves
         if let Some(base) = Path::new(&path).file_name().and_then(|s| s.to_str()) {
             let base_composite = if bank == 0 {
                 format!("{}#{}", base, preset)
@@ -532,13 +572,8 @@ pub(crate) fn load_project_from_source(
             }
         }
     }
-    // ─────────────────────────────────────────────────────────────────────
 
-    // Fallback gain spread, applied once per *unique* instrument. Aliases
-    // share an Arc, so counting map entries overcounts and over-attenuates,
-    // and replacing each entry separately would split one instrument into
-    // several unrelated Arcs. Scale each unique instrument once and point
-    // every alias at the same scaled Arc.
+    // ── Fallback gain spread ────────────────────────────────────────
     {
         let mut unique: HashMap<*const VstInstrument, Arc<VstInstrument>> = HashMap::new();
         for v in vst_instruments.values() {
@@ -569,7 +604,6 @@ pub(crate) fn load_project_from_source(
             }
         }
     }
-    // ───────────────────────────────────────────────────────────────────
 
     let requires: Option<Requires> = match source.read_text(requires::FILENAME)? {
         Some(text) => requires::parse(&text).ok(),
@@ -619,9 +653,6 @@ pub(crate) fn load_project_from_source(
     }
 
     let mut tempo_events = parsed.tempo_events.clone();
-    // Effective shims: call-level shims plus each part\'s declaration chain,
-    // resolved by the halotext layer (the player never interprets syntax).
-    // Must run before `parsed.lyrics` is moved below.
     let shims = parsed.effective_shims();
     let shim_tempo = tempo_shims_to_events(&shims, rows_per_measure);
     if !shim_tempo.is_empty() {
@@ -659,6 +690,19 @@ pub(crate) fn load_project_from_source(
             let Some(part) = parsed.parts.get(&call.name) else { continue };
 
             if is_chip_playable_part(&part.sample_path) {
+                max_end_row = max_end_row.max(rl.duration);
+                let measure_end = call.pattern_measure_start + call.pattern_measure_len;
+                for ev in &part.events {
+                    if ev.is_waypoint() { continue; }
+                    if ev.row >= call.pattern_measure_start && ev.row < measure_end {
+                        total_voices += 1;
+                    }
+                }
+                continue;
+            }
+
+            // Slicex sidecar parts count notes directly, no template cache.
+            if part.sample_path.ends_with(".slicex") {
                 max_end_row = max_end_row.max(rl.duration);
                 let measure_end = call.pattern_measure_start + call.pattern_measure_len;
                 for ev in &part.events {
@@ -721,11 +765,12 @@ pub(crate) fn load_project_from_source(
         sf2_instruments, sf2_engine_specs, vst_instruments, vgm_instruments,
         vgm_dac,
         multi_sample_instruments,
+        slicex_instruments,
         patch_instruments, patch_iids,
         lines, order, tempo, rows_per_measure,
         render_end_sec, total_samples, song_volume: cfg.song_volume / 100.0,
         linear_pan: cfg.panning_law == "linear", sample_rate, title,
-        stereo_width: cfg.stereo_width, // <--- NEW
+        stereo_width: cfg.stereo_width,
         initial_bpm: cfg.bpm, time_signature: cfg.time_signature,
         voice_count: total_voices, source_dir, cover_path, fidelity, requires,
         shims, lyrics, chains, channel_to_insert,

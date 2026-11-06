@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::pipe::AuxFile;
+use crate::conversion::AuxFile;
 use crate::deps::registry::RegistryTable;
 
 pub const FILENAME: &str = "requires.json";

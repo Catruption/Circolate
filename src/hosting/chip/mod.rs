@@ -1,9 +1,6 @@
 //! Data-driven chip backends.
 
-pub mod chip;
-pub mod patch;
-pub mod bank;
-pub mod expr;
+pub use crate::formats::chip::{bank, chip, patch};
 // pub mod bus;  // VGM path, being replaced. Re-enable when bus protocol is wired up.
 pub mod engine;
 pub mod adapter;

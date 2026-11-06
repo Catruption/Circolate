@@ -17,7 +17,6 @@ mod voices;
 mod vst;
 mod shims;
 
-pub(crate) use dsp::gains;
 use dsp::{init_tables, sanitize};
 use perf::PERF;
 
@@ -32,7 +31,8 @@ use crate::hosting::vst::ffi::VstHost;
 use crate::player::project::Project;
 use crate::player::inserts;
 
-pub(crate) use voices::{Scheduled, Active};
+pub(crate) use voices::{Scheduled, SlicexVoiceRef, Active};
+pub(crate) use dsp::gains;
 pub(crate) use vst::HostSlot;
 pub(crate) use shims::ShimHost;
 pub(crate) use crate::player::types::Sample;

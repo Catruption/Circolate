@@ -7,17 +7,17 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::fidelity::Fidelity;
+use crate::formats::flp::fidelity::Fidelity;
 use crate::deps::requires::Requires;
-use crate::parse::halotext::{ShimEvent, HalotextEvent, HalotextPart};
-use crate::hosting::chip::patch::Patch;
+use crate::formats::halotext::parse::{ShimEvent, HalotextEvent, HalotextPart};
+use crate::formats::chip::patch::Patch;
 use crate::hosting::chip::dac::DacTrack;
 use crate::timing::TempoMap;
 
 use super::inserts::ProjectInsertChain;
 use super::lines::{LineCall, LineInfo};
 use super::types::{
-    MultiSampleInstrument, Sf2EngineSpec, Sf2Instrument, VstInstrument,
+    MultiSampleInstrument, Sf2EngineSpec, Sf2Instrument, SlicexInstrument, VstInstrument,
 };
 
 pub(crate) use super::cache::Cache;
@@ -57,6 +57,7 @@ pub(crate) struct Project {
     pub(crate) vst_instruments: HashMap<String, Arc<VstInstrument>>,
     pub(crate) vgm_instruments: HashMap<String, Arc<VgmInstrument>>,
     pub(crate) vgm_dac: Option<DacTrack>,
+    pub(crate) slicex_instruments: HashMap<String, Arc<SlicexInstrument>>,
     pub(crate) multi_sample_instruments: HashMap<String, Arc<MultiSampleInstrument>>,
     pub(crate) patch_instruments: HashMap<String, Patch>,
     pub(crate) patch_iids: HashMap<String, u16>,
@@ -84,7 +85,10 @@ pub(crate) struct Project {
 
 impl Project {
     pub(crate) fn line_count(&self) -> usize { self.lines.len() }
-
+    pub(crate) fn slicex_for_part(&self, part_name: &str) -> Option<Arc<SlicexInstrument>> {
+        let part = self.parts.get(part_name)?;
+        self.slicex_instruments.get(&part.sample_path).cloned()
+    }
     pub(crate) fn empty(sample_rate: u32) -> Self {
         Project {
             source_dir: PathBuf::new(),
@@ -99,6 +103,7 @@ impl Project {
             vst_instruments: HashMap::new(),
             vgm_instruments: HashMap::new(),
             vgm_dac: None,
+            slicex_instruments: HashMap::new(),
             multi_sample_instruments: HashMap::new(),
             patch_instruments: HashMap::new(),
             patch_iids: HashMap::new(),

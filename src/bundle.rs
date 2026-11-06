@@ -4,8 +4,8 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
 use crate::archive::{Entry, EntryKind, Manifest, FORMAT_TAG, FORMAT_VERSION};
-use crate::parse::wav::decode_audio;
-use crate::pipe::{AuxFile, Converted};
+use crate::formats::common::audio::decode_audio;
+use crate::conversion::{AuxFile, Converted};
 
 #[derive(Clone)]
 pub struct BundleFile {
@@ -131,7 +131,7 @@ pub fn build_payload(
 
 fn classify_aux(aux: &AuxFile) -> (EntryKind, bool) {
     let p = aux.rel_path.as_str();
-    if p == crate::fidelity::FIDELITY_FILENAME {
+    if p == crate::formats::flp::fidelity::FIDELITY_FILENAME {
         (EntryKind::Fidelity, false)
     } else if p.starts_with("instruments/") && p.ends_with(".instrument") {
         (EntryKind::Instrument, false)

@@ -348,24 +348,24 @@ fn event_loop(
                                             KeyCode::Enter => {
                                                 match state.menu.selected_index {
                                                     0 => {
-                                                        if let Some(p) = crate::pick::pick_file(
+                                                        if let Some(p) = crate::cli::pick::pick_file(
                                                             &crate::paths::user_halotexts(),
-                                                                                                crate::pick::FILTER_HALOTEXT,
+                                                                                                crate::cli::pick::FILTER_HALOTEXT,
                                                                                                 "Open Halotext",
                                                         ) {
                                                             return Ok(LoopOutcome::Next(p.to_string_lossy().into_owned()));
                                                         }
                                                     }
                                                     1 => {
-                                                        if let Some(p) = crate::pick::pick_file(
+                                                        if let Some(p) = crate::cli::pick::pick_file(
                                                             &crate::paths::user_halotexts(),
-                                                                                                crate::pick::FILTER_HALOTEXT,
+                                                                                                crate::cli::pick::FILTER_HALOTEXT,
                                                                                                 "Dump Halotext",
                                                         ) {
                                                             let path_str = p.to_string_lossy().into_owned();
                                                             crate::log_event!("tui.menu.dump_started", path: path_str.clone());
                                                             std::thread::spawn(move || {
-                                                                let result = crate::dump::run(&[path_str.clone()]);
+                                                                let result = crate::cli::dump::run(&[path_str.clone()]);
                                                                 match result {
                                                                     Ok(_) => crate::log_event!("tui.menu.dump_ok", path: path_str),
                                                                                Err(e) => crate::log_event!("tui.menu.dump_failed", err: format!("{:#}", e)),
@@ -374,15 +374,15 @@ fn event_loop(
                                                         }
                                                     }
                                                     2 => {
-                                                        if let Some(p) = crate::pick::pick_file(
+                                                        if let Some(p) = crate::cli::pick::pick_file(
                                                             &crate::paths::export_dir(),
-                                                                                                crate::pick::FILTER_SOURCE,
+                                                                                                crate::cli::pick::FILTER_SOURCE,
                                                                                                 "Export Source",
                                                         ) {
                                                             let path_str = p.to_string_lossy().into_owned();
                                                             crate::log_event!("tui.menu.export_started", path: path_str.clone());
                                                             std::thread::spawn(move || {
-                                                                let result = crate::export::run(&[path_str.clone()]);
+                                                                let result = crate::cli::export::run(&[path_str.clone()]);
                                                                 match result {
                                                                     Ok(_) => crate::log_event!("tui.menu.export_ok", path: path_str),
                                                                                Err(e) => crate::log_event!("tui.menu.export_failed", err: format!("{:#}", e)),
