@@ -1,6 +1,6 @@
 //! Loads the shipped registry from `share/registry.json`, then overlays
-//! the user's registry from `~/.config/circolate/registry.json` if one
-//! exists.  Merge rules:
+//! the user's registry from localshare, falling back to the old XDG config
+//! path.  Merge rules:
 //!
 //!   * instruments / effects  — user entries prepend; a `match` is only
 //!                              taken from the first table that declares it
@@ -24,8 +24,14 @@ pub fn load_shipped() -> Result<Registry> {
 }
 
 pub fn load_user() -> Option<Registry> {
-    // Use the centralized user config path (e.g., ~/.config/circolate)
+    // Circolate-owned settings now live in localshare.  Old installs kept
+    // them in XDG config, so fall back there when no new file exists.
     let path = crate::paths::user_config().join("registry.json");
+    let path = if path.is_file() {
+        path
+    } else {
+        crate::paths::legacy_user_config().join("registry.json")
+    };
     if !path.is_file() {
         return None;
     }

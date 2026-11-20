@@ -6,6 +6,8 @@
 mod curve;
 pub use curve::shape_by_kind;
 pub mod convert;
+pub mod envelope_state;
+/// Bundled decomp history and address map for this implementation.
 
 #[derive(Debug, Clone, Copy)]
 pub struct Point {

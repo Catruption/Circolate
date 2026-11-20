@@ -15,7 +15,7 @@ use anyhow::{anyhow, bail, Result};
 use std::path::{Path, PathBuf};
 
 use crate::deps::fallbacks::{FallbacksTable, FALLBACKS_FILENAME};
-use crate::deps::index::PluginIndex;
+use crate::deps::plugins::PluginTable;
 use crate::deps::inventory::{PluginInventory, PluginLevel, INVENTORY_FILENAME};
 use crate::hosting::vst::smoke;
 
@@ -89,7 +89,7 @@ pub fn run(argv: &[String]) -> Result<()> {
     }
 
     // Case 2: --only NAME — look up installed plugin, measure it.
-    let index = PluginIndex::scan();
+    let index = PluginTable::get();
     if let Some(name) = only {
         let Some(path) = index.find_any(&name).cloned() else {
             bail!("no plugin found matching {:?}", name);
@@ -122,7 +122,7 @@ fn print_help() {
     println!("         registry.json, write share/plugins_inventory.json");
 }
 
-fn measure_and_write(index: &PluginIndex, out: &Path) -> Result<()> {
+fn measure_and_write(index: &PluginTable, out: &Path) -> Result<()> {
     let names = gather_names();
     if names.is_empty() {
         eprintln!(
@@ -150,11 +150,16 @@ fn measure_and_write(index: &PluginIndex, out: &Path) -> Result<()> {
                     "  {:<30} rms {:>7.1} dB, peak {:>7.1} dB{}",
                     name, rms, peak, tag
                 );
+                // The inventory ships with Circolate, so it must carry
+                // a portable path relative to a known search root —
+                // never the measuring machine's absolute location.
+                let portable = index.relative_path(&path)
+                    .unwrap_or_else(|| path.file_name().map(PathBuf::from).unwrap_or_default());
                 inv.plugins.insert(
                     name.clone(),
                                    PluginLevel::from_measurement(
                                        plugin_kind(&path),
-                                                                 path.display().to_string(),
+                                                                 portable.to_string_lossy().into_owned(),
                                                                  rms,
                                                                  peak,
                                    ),
@@ -186,7 +191,8 @@ fn gather_names() -> Vec<String> {
 
     let mut set: BTreeSet<String> = BTreeSet::new();
 
-    let fb_path = crate::paths::system_data().join(FALLBACKS_FILENAME);
+    let fb_path = crate::paths::layered_file(FALLBACKS_FILENAME)
+    .unwrap_or_else(|| crate::paths::system_data().join(FALLBACKS_FILENAME));
     if let Some(fb) = FallbacksTable::load(&fb_path) {
         for chain in fb.instruments.values() {
             for c in chain {

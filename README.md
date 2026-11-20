@@ -35,6 +35,18 @@ Then build Circolate:
 cargo build --release
 ```
 
+### Fish shell command
+
+To make `circolate` available as a fish function without editing any paths by hand:
+
+```bash
+./target/release/circolate install --fish-command
+```
+
+This writes `~/.config/fish/functions/circolate.fish` (or
+`$XDG_CONFIG_HOME/fish/functions/circolate.fish`) pointing at the exact binary
+that ran the command. Re-run it after moving or rebuilding the binary.
+
 ## Development Notes
 
 This project was built as a directed collaboration with AI. The architecture, language design (Halotext), visualizer, and overall project direction are human-designed. AI was used as a pair-programmer to assist with boilerplate, refactoring, and Rust implementation details.

@@ -6,7 +6,7 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 
 use crate::conversion::AuxFile;
-use crate::deps::index::PluginIndex;
+use crate::deps::plugins::PluginTable;
 use crate::deps::registry::{RegistryTable, Resolution};
 use crate::formats::flp::model::{self as flp_src, Channel};
 
@@ -60,7 +60,7 @@ fn name_candidates(plugin: &flp_src::Plugin) -> Vec<String> {
     out
 }
 
-fn find_loose(wanted: &str, index: &PluginIndex) -> Option<PathBuf> {
+fn find_loose(wanted: &str, index: &PluginTable) -> Option<PathBuf> {
     if let Some(p) = index.find_any(wanted) {
         return Some(p.clone());
     }
@@ -99,7 +99,7 @@ fn find_loose(wanted: &str, index: &PluginIndex) -> Option<PathBuf> {
 
 pub(super) fn resolve_plugin(
     plugin: &flp_src::Plugin,
-    index: &PluginIndex,
+    index: &PluginTable,
     registry: Option<&RegistryTable>,
 ) -> Resolved {
     let canonical = canonical_name(plugin);
@@ -183,18 +183,18 @@ pub(super) fn vst_sidecar(
     ];
 
     match resolved {
-        Resolved::Exact { name, path } => {
+        Resolved::Exact { name, path: _ } => {
+            // No `Path:` field.  The player resolves `Plugin:` by name
+            // through the shared plugin index, so the sidecar stays
+            // portable and never leaks the machine it was made on.
             lines.push(format!("    Plugin: '{}';", name));
-            lines.push(format!("    Path: '{}';", path.display()));
             if !plugin.state.is_empty() {
                 lines.push(format!("    State: '{base_name}.state';"));
             }
         }
         Resolved::Fallback { name, path, replaces, gain, via_default, state } => {
             lines.push(format!("    Plugin: '{}';", name));
-            if let Some(p) = path {
-                lines.push(format!("    Path: '{}';", p.display()));
-            } else {
+            if path.is_none() {
                 lines.push("    Unresolved: true;".to_string());
                 lines.push("    UnresolvedReason: 'fallback plugin not installed';".to_string());
             }
@@ -205,9 +205,14 @@ pub(super) fn vst_sidecar(
                 lines.push("    ViaDefault: true;".to_string());
             }
             if let Some(st) = state {
-                // Write the absolute or relative path. The player will
-                // read this and pass the bytes into the VST host.
-                lines.push(format!("    State: '{}';", st.display())); // <--- NEW
+                // State files travel with the archive.  Only a path
+                // relative to a Circolate root may be recorded; an
+                // absolute path from the converting machine is dropped.
+                if let Some(rel) = crate::deps::plugins::clean_relative(st)
+                    .or_else(|| PluginTable::get().relative_path(st))
+                {
+                    lines.push(format!("    State: '{}';", rel.display()));
+                }
             }
         }
         Resolved::Unresolved { name } => {

@@ -31,6 +31,10 @@ const DEFAULT_BASE_KEY: u32 = 60;
 const SLICEX_IMPLICIT_BPM: f64 = 120.0;
 const MAX_SLICE_KEY: u32 = 127;
 
+fn envelope_scale_secs(is_synced: bool, bpm: f64) -> f64 {
+    if is_synced { 60.0 / bpm.max(1.0) } else { 0.5 }
+}
+
 // ── output ────────────────────────────────────────────────────────────
 
 pub(crate) enum SlicexOut {
@@ -176,19 +180,24 @@ fn parse_state(data: &[u8]) -> Result<ParsedState<'_>, String> {
     }
     let records = SliceRecords::parse(&data[rec_start..rec_end], settings.slice_count, SLICEX_PROFILE.slice_record_len);
 
-    let (wav2, after_wav2) = if rec_end + 16 <= data.len()
-    && &data[rec_end + 4..rec_end + 8] == b"RIFF"
-    && &data[rec_end + 12..rec_end + 16] == b"WAVE"
-    {
-        let w2_len = u32::from_le_bytes(data[rec_end..rec_end + 4].try_into().unwrap()) as usize;
-        let w2_total = 4usize.checked_add(w2_len).ok_or("wav2 length overflow")?;
-        let w2_end = rec_end.saturating_add(w2_total).min(data.len());
+    let has_wav2 = data.get(rec_end + 4..rec_end + 8) == Some(b"RIFF")
+        && data.get(rec_end + 12..rec_end + 16) == Some(b"WAVE");
+    let (wav2, after_wav2) = if has_wav2 {
+        let len_bytes = data.get(rec_end..rec_end + 4)
+            .ok_or("truncated WAV #2 length prefix")?;
+        let w2_len = u32::from_le_bytes(len_bytes.try_into().expect("prefix size checked")) as usize;
+        let w2_total = 4usize.checked_add(w2_len).ok_or("WAV #2 length overflow")?;
+        let w2_end = rec_end.checked_add(w2_total).ok_or("WAV #2 end overflow")?;
+        if w2_end > data.len() {
+            return Err(format!("WAV #2 length {} exceeds remaining {} bytes", w2_len, data.len() - rec_end - 4));
+        }
         (Some(&data[rec_end..w2_end]), w2_end)
     } else {
         (None, rec_end)
     };
 
-    let trest = Trest::parse(&data[after_wav2..]);
+    let trest = Trest::parse(&data[after_wav2..])
+        .map_err(|error| format!("invalid Slicex trest block: {error}"))?;
 
     Ok(ParsedState {
         outer, source_path, wav1, wav1_chunks, settings, records, wav2, trest,
@@ -299,8 +308,7 @@ fn dump_trest(s: &ParsedState<'_>) -> String {
     }
 
     if let Some(prm) = &s.trest.params {
-        let _ = writeln!(out, "  region param block (108 B @ trest+396):");
-        let _ = writeln!(out, "    lead: {}", prm.lead);
+        let _ = writeln!(out, "  first region row (68 B; {} rows total):", s.trest.region_count);
         let _ = writeln!(out, "    17 u32s:");
         for (i, v) in prm.values.iter().enumerate() {
             let hint = match *v {
@@ -382,6 +390,20 @@ fn dump_application(
         let _ = writeln!(out, "    pan_sf2          = {}", p.pan_sf2());
         let _ = writeln!(out, "    levels_raw       = {:?}", p.levels_raw());
         let _ = writeln!(out, "    amp_atten_cb     = {}", p.amp_attenuation_cb());
+
+        let caches = p.derived_caches();
+        let _ = writeln!(out, "    derived caches (decomp-verified, UI-only):");
+        let _ = writeln!(out, "      w[2]/6400   = {:>12.6}", caches.field_2);
+        let _ = writeln!(out, "      curve(w[3]) = {:>12.6}", caches.field_3);
+        let _ = writeln!(out, "      w[5]/12800  = {:>12.6}", caches.field_5);
+        let _ = writeln!(out, "      w[6]/256    = {:>12.6}", caches.field_6);
+        let _ = writeln!(out, "      w[7]/256    = {:>12.6}", caches.field_7);
+        let _ = writeln!(out, "      w[9]/12800  = {:>12.6}", caches.field_9);
+        let _ = writeln!(out, "      w[10]       = {:>12.6}", caches.field_10);
+        let _ = writeln!(out, "      w[12]*8     = {:>12.6}", caches.field_12);
+        let _ = writeln!(out, "      w[13]/12800 = {:>12.6}", caches.field_13);
+        let _ = writeln!(out, "      w[14]/12800 = {:>12.6}", caches.field_14);
+        let _ = writeln!(out, "      w[16]*2     = {:>12.6}", caches.field_16);
     }
     if let Some(fe) = filter_env {
         let _ = writeln!(out, "  filter envelope (tag=2):");
@@ -530,20 +552,20 @@ using {:.3} bpm ({}), project {:.3} bpm",
     .ok()
     .and_then(|s| s.trim().parse::<f64>().ok())
     .filter(|s| *s > 0.0);
-    // Approximation only: this legacy scaling by average slice duration is
-    // not the plugin time base found in SESSION3_NOTES.md. The decomp says
-    // envelope x is a segment delta in seconds (bit0 clear, 0.5 s per x) or
-    // beats (bit0 set, 60/project_bpm seconds per x), with state multipliers.
-    // Sidecar v1 also omits sustain/release/global-state semantics. Keep the
-    // override for investigation, but don't treat this path as bit-exact FL.
-    let env_scale = env_scale_override.unwrap_or(slice_secs);
-
     let amp_hdr = state.trest.item_header(0, trest::TARGET_VOL).unwrap_or_default();
-    let amp_env = state
-    .trest
-    .amp_envelope()
-    .filter(|r| r.enabled())
-    .and_then(|r| AmpEnvelope::from_points(&r.points, env_scale));
+    let amp_record = state.trest.amp_envelope().filter(|r| r.enabled());
+    let speed_record = state.trest.speed_envelope().filter(|r| r.enabled());
+    let filter_record = state.trest.filter_envelope().filter(|r| r.enabled());
+    let lfo_record = state.trest.lfo_envelope(0, trest::TARGET_VOL).filter(|r| r.enabled());
+    let fallback_scale = envelope_scale_secs(false, project_bpm);
+    let amp_scale = env_scale_override.unwrap_or_else(|| amp_record.map_or(fallback_scale, |r| envelope_scale_secs(r.is_synced(), project_bpm)));
+    let speed_scale = env_scale_override.unwrap_or_else(|| speed_record.map_or(fallback_scale, |r| envelope_scale_secs(r.is_synced(), project_bpm)));
+    let cut_scale = env_scale_override.unwrap_or_else(|| filter_record.map_or(fallback_scale, |r| envelope_scale_secs(r.is_synced(), project_bpm)));
+    let lfo_scale = env_scale_override.unwrap_or_else(|| lfo_record.map_or(fallback_scale, |r| envelope_scale_secs(r.is_synced(), project_bpm)));
+    // Kept as the reported primary scale for diagnostics and the SF2 path.
+    let env_scale = amp_scale;
+
+    let amp_env = amp_record.and_then(|r| AmpEnvelope::from_points(&r.points, amp_scale));
 
     let apply_params = std::env::var_os("FLP_SLICEX_NO_PARAMS").is_none();
     let filt = if apply_params {
@@ -561,9 +583,8 @@ using {:.3} bpm ({}), project {:.3} bpm",
 
     let apply_filter_env = std::env::var_os("FLP_SLICEX_NO_FILTER_ENV").is_none();
     let filter_env = if apply_filter_env {
-        state.trest.filter_envelope()
-        .filter(|r| r.enabled())
-        .and_then(|r| FilterEnvelope::from_points(&r.points, env_scale, 4800))
+        filter_record
+        .and_then(|r| FilterEnvelope::from_points(&r.points, cut_scale, 4800))
     } else {
         None
     };
@@ -571,8 +592,7 @@ using {:.3} bpm ({}), project {:.3} bpm",
     let speed_pts: Option<&[trest::EnvelopePoint]> = if std::env::var_os("FLP_SLICEX_NO_SPEED").is_some() {
         None
     } else {
-        state.trest.speed_envelope()
-        .filter(|r| r.enabled())
+        speed_record
         .filter(|r| r.points.iter().any(|p| (p.y - 0.5).abs() > 1e-3))
         .map(|r| r.points.as_slice())
     };
@@ -582,7 +602,8 @@ using {:.3} bpm ({}), project {:.3} bpm",
     .and_then(|s| s.trim().parse::<f64>().ok())
     .unwrap_or(1.0);
 
-    let loop_all = std::env::var_os("FLP_SLICEX_NO_LOOP").is_none();
+    // Default to NO looping. Slicex one-shots should play once.
+    let loop_all = std::env::var_os("FLP_SLICEX_LOOP").is_some();
 
     crate::log_event!("flp.slicex.header",     body: dump_header(chan, &state));
     crate::log_event!("flp.slicex.settings",   body: dump_settings(&state));
@@ -613,7 +634,7 @@ using {:.3} bpm ({}), project {:.3} bpm",
         crate::log_event!("flp.slicex.speed_env", body: sp);
     }
 
-    if let Some(lfo) = state.trest.lfo_envelope(0, trest::TARGET_VOL) {
+    if let Some(lfo) = lfo_record {
         let v = lfo.params[0] as u32;
         let rate = (10_001f64.powf(v as f64 / 65_536.0) - 1.0) / 625.0;
         warnings.push(format!(
@@ -645,7 +666,7 @@ using {:.3} bpm ({}), project {:.3} bpm",
                 Some(p) => {
                     let pan_sf2 = p.pan_sf2() as f64;
                     let pan = ((pan_sf2 + 100.0) * 64.0 / 100.0).round().clamp(0.0, 128.0) as u32;
-                    let atten = (p.amp_attenuation_cb() as f64).clamp(0.0, 128.0) as u32;
+                    let atten = p.amp_attenuation_cb().min(960) as u32;
                     let cents = p.cutoff_sf2_cents() as f64;
                     let cutoff = if cents >= 0.0 {
                         12800
@@ -678,11 +699,15 @@ using {:.3} bpm ({}), project {:.3} bpm",
             let sidecar_bytes = sidecar::build_json(
                 &wav_rel,
                 &slice_specs,
-                state.trest.amp_envelope()   .filter(|r| r.enabled()).map(|r| r.points.as_slice()),
-                                                    speed_pts,
-                                                    state.trest.filter_envelope().filter(|r| r.enabled()).map(|r| r.points.as_slice()),
-                                                    state.trest.lfo_envelope(0, trest::TARGET_VOL).filter(|r| r.enabled()).map(|r| r.points.as_slice()),
-                                                    env_scale,
+                amp_record.map(|r| r.points.as_slice()),
+                amp_record.map(|r| (r.sustain_index(), r.end_release_index())),
+                speed_pts,
+                filter_record.map(|r| r.points.as_slice()),
+                lfo_record.map(|r| r.points.as_slice()),
+                amp_scale,
+                speed_scale,
+                cut_scale,
+                lfo_scale,
                                                     loop_all,
                                                     speed_octaves,
                                                     amp_amt,
@@ -717,7 +742,8 @@ using {:.3} bpm ({}), project {:.3} bpm",
                 &keys,
                 state.trest.amp_envelope().filter(|r| r.enabled()).map(|r| r.points.as_slice()),
                                        amp_hdr,
-                                       env_scale_override,
+                                       amp_scale,
+                                       speed_scale,
                                        speed_pts,
                                        speed_hdr,
                                        speed_octaves,

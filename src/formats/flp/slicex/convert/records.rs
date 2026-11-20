@@ -7,18 +7,24 @@
 //!
 //! ## Provenance
 //!
-//! SRC[loc=slot0.records, count at slot0.params+0x4C+envelopes decomp=TODO conf=verified for size and position (slicex.rs)]
+//! SRC[loc=slot0.records, count at slot0.params+0x4C+envelopes decomp=verified (slicex.rs)]
 //!
 //! Element size 0x44 and "count then elements" are verified (slicex.rs
-//! Slot::slice_records).  The content is not decoded here, but see params.rs: slot
-//! 1's single record is probably the same structure, and it is read there as 17 x
-//! u32 (12800 = 100%, 128 = pan centre).  If that holds, all slot 0 records being
-//! identical means "every slice at the defaults", and a retuned or panned slice
-//! would show up as a varying column here.
+//! Slot::slice_records).  The layout is now **decomp-verified** as 17 × u32
+//! (see `params.rs::RegionParamBlock`); the DLL's loader/saver is
+//! `FUN_00892c90`/`FUN_00893130`, and the derived runtime cache is
+//! `FUN_00882850`.  These are the same 68-byte struct as the trest region
+//! rows — for the matched `chan01_sonk.state` / `untitled.fst` pair, every
+//! row matches the native chunk byte-for-byte.
 //!
-//! To check in the DLL: the slot loader loops count times over a 0x44-byte element;
-//! the function that reads one element names the 17 fields.  FUN_008827d0 (see
-//! params.rs) is the first candidate.  decomp=TODO.
+//! **The labels remain unknown.**  Words are named only by their position
+//! (0..16) and by Circolate's corpus-derived guesses (`cutoff_raw`,
+//! `pan_l_raw`, `levels_raw`).  The decomp gives formulas (see
+//! `params.rs::derived_caches`), not names.
+//!
+//! To check a specific word's meaning empirically: toggle one Slicex control,
+//! save, diff the row against the corpus default
+//! `[0,0,0,8000,0,12800,128,128,0,12800,0,0,12800,0,0,0,12800]`.
 
 use std::collections::BTreeMap;
 

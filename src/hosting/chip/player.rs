@@ -20,6 +20,7 @@ use crate::hosting::chip::adapter::{Adapter, Dispatch, Note};
 use crate::hosting::chip::engine::core::ChipCore;
 use crate::hosting::chip::engine::runtime::CoreState;
 use crate::hosting::chip::dac::{DacState, DacTrack};
+use crate::mixer::state::MixerState;
 
 /// `CIRCOLATE_CHIP_DEBUG=1` turns on per-note dispatch logging. It used to be
 /// unconditional `eprintln!` on the audio thread, which can glitch playback.
@@ -57,6 +58,9 @@ pub struct ChipAutomation {
 }
 
 pub struct ChipPlayer {
+    /// Injected mixer state; `new*` uses the live global for callers that
+    /// don't have an engine (tests, smoke checks).
+    mixer: Arc<MixerState>,
     engine: Box<dyn ChipCore>,
     adapter: Adapter,
     bank: HashMap<String, Patch>,
@@ -92,6 +96,14 @@ pub struct ChipPlayer {
 
 impl ChipPlayer {
     pub fn new(chip: Chip, host_sr: u32) -> Result<Self, String> {
+        Self::with_mixer(chip, host_sr, crate::mixer::state::global())
+    }
+
+    pub fn with_mixer(
+        chip: Chip,
+        host_sr: u32,
+        mixer: Arc<MixerState>,
+    ) -> Result<Self, String> {
         let engine: Box<dyn ChipCore> = Box::new(CoreState::new(chip.clone())?);
         let adapter = Adapter::new(chip.clone());
 
@@ -121,6 +133,7 @@ impl ChipPlayer {
         let voice_count = voice_scope.len();
 
         Ok(Self {
+            mixer,
             engine, adapter,
             bank: HashMap::new(),
             voice_names: voice_names.clone(), voice_parts: HashMap::new(), dac_part: None,
@@ -142,6 +155,14 @@ impl ChipPlayer {
     }
 
     pub fn new_ymfm(clock: u32, host_sr: u32) -> Result<Self, String> {
+        Self::ymfm_with_mixer(clock, host_sr, crate::mixer::state::global())
+    }
+
+    pub fn ymfm_with_mixer(
+        clock: u32,
+        host_sr: u32,
+        mixer: Arc<MixerState>,
+    ) -> Result<Self, String> {
         use crate::hosting::chip::ymfm::YmfmBackend;
 
         let chip = ym2612_chip_shell(clock);
@@ -154,6 +175,7 @@ impl ChipPlayer {
         let adapter = Adapter::new(chip);
 
         Ok(Self {
+            mixer,
             engine: Box::new(backend),
             adapter,
             bank: HashMap::new(),
@@ -361,15 +383,15 @@ impl ChipPlayer {
         self.flush_due(upto);
         for (idx, voice) in self.voice_names.iter().enumerate() {
             let part_gain = self.voice_parts.get(voice).map_or(1.0, |path| {
-                if crate::mixer::mute::is_part_active(path) {
-                    crate::mixer::part_volume::get(path) as f32
+                if self.mixer.is_part_active(path) {
+                    self.mixer.volume(path) as f32
                 } else { 0.0 }
             });
             self.voice_mix_gains[idx] = gain * part_gain;
         }
         let dac_gain = self.dac_part.as_deref().map_or(gain, |path| {
-            if crate::mixer::mute::is_part_active(path) {
-                gain * crate::mixer::part_volume::get(path) as f32
+            if self.mixer.is_part_active(path) {
+                gain * self.mixer.volume(path) as f32
             } else { 0.0 }
         });
         self.now += out_l.len() as i64;
@@ -502,4 +524,85 @@ fn ym2612_chip_shell(clock: u32) -> Chip {
     });
 
     chip
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::formats::chip::patch::{Envelope, Patch, PitchDecl, Requirement, SourceDecl};
+    use crate::hosting::chip::chip::parse as parse_chip;
+    use std::collections::BTreeMap;
+
+    fn fm_patch() -> Patch {
+        let mut native = BTreeMap::new();
+        let mut fields = BTreeMap::new();
+        fields.insert("alg".to_string(), 4);
+        fields.insert("fb".to_string(), 6);
+        native.insert("ym2612".to_string(), fields);
+        Patch {
+            name: "FM1_test".into(),
+            author: String::new(),
+            license: String::new(),
+            origin: String::new(),
+            parent: None,
+            requires: vec![Requirement {
+                capability: "fm.operator".into(),
+                constraints: Default::default(),
+            }],
+            source: SourceDecl { kind: "fm.operator".into(), keys: Default::default() },
+            pitch: PitchDecl::default(),
+            amp: Envelope::None,
+            filter: None,
+            r#mod: None,
+            native,
+        }
+    }
+
+    fn chip_note(name: &str, start: i64, end: i64) -> ChipNote {
+        ChipNote {
+            start,
+            end,
+            iid: 101,
+            note: 60,
+            velocity: 100,
+            pitch_hz: None,
+            automation: vec![],
+            line: 0,
+            seq: 0,
+            part_path: name.into(),
+            source_row: 0.0,
+        }
+    }
+
+    fn render_nonzero(p: &mut ChipPlayer) -> (Vec<f32>, Vec<f32>) {
+        let mut l = vec![0.0f32; 4096];
+        let mut r = vec![0.0f32; 4096];
+        p.render(&mut l, &mut r, 0, 1.0);
+        (l, r)
+    }
+
+    #[test]
+    fn fm_player_renders_audio_for_note() {
+        // Regression: `install_chip_players` keys the bank by part name;
+        // `note_on` looks up `note.part_path`. A mismatch used to drop every
+        // note — the player rendered silence.
+        let mut p = ChipPlayer::new_ymfm(7_670_453, 48000).unwrap();
+        p.add_patch("FM1_test".into(), fm_patch());
+        p.note_on(&chip_note("FM1_test", 0, 48000));
+        let (l, _r) = render_nonzero(&mut p);
+        assert!(l.iter().any(|s| s.abs() > 1e-4), "FM should render nonzero audio");
+    }
+
+    #[test]
+    fn psg_player_renders_audio_for_note() {
+        let text = std::fs::read_to_string("share/chip/sn76489.chip.txt").unwrap();
+        let chip = parse_chip(&text).unwrap();
+        let patch_text = std::fs::read_to_string("share/chip/examples/pluck.patch.txt").unwrap();
+        let patch = crate::formats::chip::patch::parse(&patch_text).unwrap();
+        let mut p = ChipPlayer::new(chip, 48000).unwrap();
+        p.add_patch("PSG1_test".into(), patch);
+        p.note_on(&chip_note("PSG1_test", 0, 48000));
+        let (l, _r) = render_nonzero(&mut p);
+        assert!(l.iter().any(|s| s.abs() > 1e-4), "PSG should render nonzero audio");
+    }
 }

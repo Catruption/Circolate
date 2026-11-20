@@ -20,6 +20,19 @@ use super::types::{
     MultiSampleInstrument, Sf2EngineSpec, Sf2Instrument, SlicexInstrument, VstInstrument,
 };
 
+/// One recorded resolution decision.  Keeping this in `Project` means a
+/// report can be printed after loading without re-scanning or re-guessing
+/// what happened during the load.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct Resolution {
+    pub(crate) part: String,
+    pub(crate) kind: &'static str,
+    pub(crate) name: String,
+    pub(crate) status: &'static str,
+    pub(crate) reason: Option<String>,
+    pub(crate) fallback: bool,
+}
+
 pub(crate) use super::cache::Cache;
 pub(crate) use super::loader::Loader;
 pub(crate) use loader::load_project;
@@ -75,6 +88,7 @@ pub(crate) struct Project {
     pub(crate) initial_bpm: f64,
     pub(crate) time_signature: (u32, u32),
     pub(crate) voice_count: usize,
+    pub(crate) resolution_report: Vec<Resolution>,
     pub(crate) requires: Option<Requires>,
     pub(crate) shims: Vec<ShimEvent>,
     pub(crate) lyrics: Vec<LyricLine>,
@@ -121,6 +135,7 @@ impl Project {
             initial_bpm: 120.0,
             time_signature: (4, 4),
             voice_count: 0,
+            resolution_report: Vec::new(),
             requires: None,
             shims: Vec::new(),
             lyrics: Vec::new(),

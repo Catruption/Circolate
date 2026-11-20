@@ -198,6 +198,10 @@ impl Config {
         let mut cfg = Config::default();
         let sys = crate::paths::system_data().join("player_settings.json");
         cfg.merge_from_file(&sys);
+        // Old installs kept settings under XDG config; read them before the
+        // new localshare copy so a saved override still wins.
+        let legacy = crate::paths::legacy_user_config().join("player_settings.json");
+        cfg.merge_from_file(&legacy);
         let user = crate::paths::user_config().join("player_settings.json");
         cfg.merge_from_file(&user);
         if let Some(dir) = halotext_dir {
@@ -368,7 +372,7 @@ pub(crate) fn reload_config() -> anyhow::Result<Settings> {
 pub(crate) fn save_settings(settings: &Settings) -> anyhow::Result<()> {
     let path = paths::user_config().join("player_settings.json");
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        paths::ensure_dir(parent)?;
     }
 
     // Preserve any existing preset name; this UI doesn't edit it.

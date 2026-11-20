@@ -56,3 +56,34 @@ pub fn parse_pitch_hz(text: &str) -> Option<f64> {
     }
     text.trim().parse::<f64>().ok().filter(|h| *h > 0.0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Halotext note names are scientific pitch: C4 is 261.63 Hz and
+    /// A4 is 440 Hz.  The internal note number for C4 is 48, so the
+    /// reference frequency paired with note 60 must be C5 (523.25 Hz).
+    /// Changing that reference to C4 silently transposes every existing
+    /// halotext down an octave — including VGM slide waypoints.
+    #[test]
+    fn note_names_parse_at_scientific_pitch() {
+        for (name, hz) in [
+            ("C4", 261.6255653005986),
+            ("A4", 440.0),
+            ("C5", 523.2511306),
+        ] {
+            let got = parse_pitch_hz(name).expect(name);
+            assert!((got - hz).abs() < 0.01, "{name} -> {got}, expected {hz}");
+        }
+    }
+
+    #[test]
+    fn vgm_midi_round_trip_uses_legacy_note_names() {
+        // The VGM converter emits note_name(midi - 12) so that standard
+        // MIDI C4 (60) is written as halotext "C4" and parses back to
+        // 261.63 Hz.  Lock that pairing down.
+        let hz = parse_pitch_hz("C4").unwrap();
+        assert!((hz - 261.6255653005986).abs() < 0.01, "C4 -> {hz}");
+    }
+}

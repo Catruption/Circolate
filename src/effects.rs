@@ -8,11 +8,11 @@
 //!   1. `$XDG_CONFIG_HOME/circolate/master_fx.json`  (user override)
 //!   2. `/usr/share/circolate/master_fx.json`         (shipped default)
 //!
-//! Relative `path:` and `state:` fields inside the config are resolved
-//! against the config file's directory, then `system_data()`, then
-//! `user_data()`.  This lets the shipped config name plugins as
-//! `plugins/Foo.vst3` and still find them whether the packager placed
-//! them next to the config or the user installed them via `fetch`.
+//! `path:` is a canonical plugin name or a portable relative path.  It
+//! is resolved through the shared plugin index (the Circolate system
+//! directories) first, then against the config file's directory,
+//! `system_data()`, and `user_data()`.  `state:` is resolved relative
+//! to the config.  Machine-specific absolute paths are never used.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -62,7 +62,7 @@ impl EffectChain {
         let mut labels = Vec::new();
 
         for entry in cfg.chain {
-            let Some(plugin_path) = resolve_relative(&entry.path, config_dir) else {
+            let Some(plugin_path) = resolve_plugin_ref(&entry.path, config_dir) else {
                 crate::log_event!("player.master_fx.missing", path: entry.path.clone());
                 continue;
             };
@@ -132,6 +132,10 @@ fn find_config() -> Option<PathBuf> {
     if user.is_file() {
         return Some(user);
     }
+    let legacy = crate::paths::legacy_user_config().join("master_fx.json");
+    if legacy.is_file() {
+        return Some(legacy);
+    }
     let system = crate::paths::system_data().join("master_fx.json");
     if system.is_file() {
         return Some(system);
@@ -139,14 +143,29 @@ fn find_config() -> Option<PathBuf> {
     None
 }
 
-/// Resolve a possibly-relative path from the config.  Absolute paths
-/// are used as-is.  Relative paths are tried against (in order) the
-/// config file's parent directory, `system_data()`, and `user_data()`,
-/// returning the first candidate that exists.
+/// Resolve a VST named in the master-FX config.  The shared plugin
+/// index is checked first — it is built from the same Circolate system
+/// directories used for every other file.  A config entry may be a
+/// canonical name or a portable relative path; an absolute path is
+/// never used.
+fn resolve_plugin_ref(raw: &str, config_dir: &Path) -> Option<PathBuf> {
+    if let Some(p) = crate::deps::plugins::PluginTable::get().resolve_reference(raw) {
+        return Some(p);
+    }
+    if Path::new(raw).is_absolute() {
+        return None;
+    }
+    resolve_relative(raw, config_dir)
+}
+
+/// Resolve a possibly-relative path from the config.  Relative paths
+/// are tried against (in order) the config file's parent directory,
+/// `system_data()`, and `user_data()`, returning the first candidate
+/// that exists.
 fn resolve_relative(rel: &str, config_dir: &Path) -> Option<PathBuf> {
     let p = Path::new(rel);
     if p.is_absolute() {
-        return if p.exists() { Some(p.to_path_buf()) } else { None };
+        return None;
     }
     [
         config_dir.join(rel),

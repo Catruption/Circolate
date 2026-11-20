@@ -6,10 +6,8 @@ use std::sync::Arc;
 
 use super::engine::Engine;
 use super::project::{Cache, Loader, Project};
-use crate::deps::index::PluginIndex;
-use crate::effects::EffectChain;
-use crate::hosting::sf2::engine::Sf2Engine;
-use crate::hosting::vst::ffi::VstHost;
+use super::runtime::{find_share_dir, install_all, InstallOptions};
+use crate::mixer::state::MixerState;
 
 const BLOCK: usize = 4096;
 
@@ -34,153 +32,28 @@ pub(crate) fn render_offline(
     let start = start.clamp(0, project.total_samples);
 
     let mut loader = Loader::new(Arc::clone(project), cache);
-    let mut engine = Engine::new(project);
+    // A render depends on the project, not on whatever faders the TUI
+    // happened to leave in the global mixer state.
+    let mut engine = Engine::new(project, Arc::new(MixerState::default()));
 
     let fb = vst_fallback_gain();
-    let index = PluginIndex::scan();
-    for (name, vinst) in &project.vst_instruments {
-        let stem = vinst
-        .plugin_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-        let resolved = index
-        .find_vst3(stem)
-        .or_else(|| index.find_vst3(name))
-        .cloned();
-
-        let Some(plugin_path) = resolved else {
-            crate::log_event!(
-                "player.render.vst_skipped",
-                name: name.clone(),
-                              stem: format!("{:?}", stem),
-            );
-            continue;
-        };
-
-        let eff_gain = if vinst.fallback {
-            vinst.gain * fb
-        } else {
-            vinst.gain
-        };
-        match VstHost::load(
-            plugin_path.to_str().unwrap_or(""),
-                            &vinst.state_bytes,
-                            project.sample_rate,
-        ) {
-            Ok(host) => {
-                let tag = if vinst.fallback {
-                    if (eff_gain - 1.0).abs() > 1e-4 {
-                        format!("fallback, gain {:.3}", eff_gain)
-                    } else {
-                        "fallback".to_string()
-                    }
-                } else {
-                    "exact".to_string()
-                };
-                let display_name = if stem.is_empty() { name.as_str() } else { stem };
-                crate::log_event!(
-                    "player.render.vst_loaded",
-                    iid: vinst.iid,
-                    name: display_name,
-                    tag: tag,
-                );
-                engine.install_host_with_gain(vinst.iid, host, eff_gain);
-                engine.register_part_path(vinst.iid, name.clone());
-            }
-            Err(e) => {
-                crate::log_event!(
-                    "player.render.vst_load_failed",
-                    name: name.clone(),
-                                  err: format!("{:#}", e),
-                );
-            }
-        }
-    }
+    let share_dir = find_share_dir();
+    let report = install_all(
+        &mut engine,
+        project,
+        &InstallOptions {
+            no_master_fx,
+            sf2_override,
+            fallback_gain: fb,
+            share_dir: share_dir.as_deref(),
+        },
+    );
     crate::log_event!(
         "player.render.vst_hosts_installed",
-        count: engine.host_count(),
+        count: report.vst.loaded,
     );
     if (fb - 1.0).abs() > 1e-4 {
         crate::log_event!("player.render.vst_fallback_gain", gain: fb);
-    }
-
-    let sf2_debug = std::env::var_os("FLP_DEBUG").is_some();
-    let default_gain = crate::hosting::sf2::engine::DEFAULT_GAIN;
-    for (name, spec) in &project.sf2_engine_specs {
-        let path = sf2_override.unwrap_or(&spec.sf2_path);
-        let mut sf2 = Sf2Engine::new(project.sample_rate);
-        if let Err(e) = sf2.load(path) {
-            crate::log_event!(
-                "player.render.sf2_load_failed",
-                name: name.clone(),
-                              err: format!("{:#}", e),
-            );
-            continue;
-        }
-        sf2.set_preset(spec.bank, spec.preset);
-        let effective = default_gain * spec.gain;
-        if sf2_debug {
-            crate::log_event!(
-                "player.render.sf2_debug",
-                body: format!(
-                    "  sf2 [iid={:>3}] {:<44} DEFAULT_GAIN={:.3} spec.gain={:.3} effective={:.3}",
-                    spec.iid, name, default_gain, spec.gain, effective,
-                ),
-            );
-        }
-        sf2.set_gain(effective);
-        engine.install_sf2_engine(spec.iid, sf2);
-        // PART_VOLUME FIX: `name` here is the composite key from
-        // sf2_engine_specs ("path.sf2#preset" or "path.sf2#bank:preset").
-        // part_volume lookups (TUI fader, voices.rs, this file's own
-        // VST/SF2 mix passes) are keyed by part.sample_path without the
-        // '#preset' suffix. Registering the composite key means the
-        // lookup in the SF2 mix pass below never matches, and every SF2
-        // channel silently ignores per-part volume — which is why dside
-        // (SF2-heavy) doesn't respond to fader changes but nightlight4000
-        // (VST + samples only) does. Strip the suffix so SF2 channels
-        // share a key with the rest of the mixer.
-        let base_path = name.split('#').next().unwrap_or(name.as_str());
-        engine.register_part_path(spec.iid, base_path.to_string());
-    }
-    crate::log_event!(
-        "player.render.sf2_engines_installed",
-        count: engine.sf2_engine_count(),
-    );
-
-    crate::cli::play::install::install_shims(
-        &mut engine,
-        project,
-        crate::cli::play::install::find_share_dir().as_deref(),
-    );
-
-    crate::player::inserts::install_chains(&mut engine, project, project.sample_rate);
-
-    crate::cli::play::install::install_chip_players(
-        &mut engine,
-        project,
-        crate::cli::play::install::find_share_dir().as_deref(),
-    );
-
-    if !no_master_fx {
-        match EffectChain::load_default(project.sample_rate) {
-            Ok(chain) => {
-                if !chain.is_empty() {
-                    crate::log_event!(
-                        "player.master_fx.loaded",
-                        name: chain.describe(),
-                    );
-                }
-                engine.install_master_fx(chain);
-            }
-            Err(e) => {
-                crate::log_event!(
-                    "player.master_fx.chain_failed",
-                    err: format!("{:#}", e),
-                );
-            }
-        }
     }
 
     let first = loader.seek(start, start + lookahead);
@@ -210,7 +83,9 @@ pub(crate) fn render_offline(
     (l, r, cache)
 }
 
-pub(crate) fn write_wav(path: &Path, l: &[f32], r: &[f32], sr: u32) -> Result<()> {
+/// Write a 16-bit stereo WAV and return `(clipped_samples, peak)` so the
+/// CLI can log a real end-of-render summary instead of only a file path.
+pub(crate) fn write_wav(path: &Path, l: &[f32], r: &[f32], sr: u32) -> Result<(usize, f32)> {
     let spec = hound::WavSpec {
         channels: 2,
         sample_rate: sr,
@@ -237,5 +112,5 @@ pub(crate) fn write_wav(path: &Path, l: &[f32], r: &[f32], sr: u32) -> Result<()
             peak: peak,
         );
     }
-    Ok(())
+    Ok((clipped as usize, peak))
 }

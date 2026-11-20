@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::asset::AssetSource;
 
 pub fn cover_cache_dir() -> PathBuf {
-    crate::paths::user_cache().join("covers")
+    crate::paths::user_covers()
 }
 
 pub fn find_cover_path(source: &dyn AssetSource) -> Option<PathBuf> {

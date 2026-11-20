@@ -153,7 +153,9 @@ fn parse_block_line(text: &str, line_idx: usize, subs: u32) -> (Vec<BlockCall>, 
             continue;
         }
 
-        pos += 1;
+        // Skip whole UTF-8 chars.  A bare `pos += 1` can land inside a
+        // multi-byte glyph (e.g. §) and make `text[pos..]` panic.
+        pos = next_char_boundary(text, pos);
     }
 
     (calls, shims)
@@ -521,4 +523,20 @@ fn parse_env_refs(s: &str) -> (
         }
     }
     (amp, speed, cut, lfo)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_line_skips_multibyte_glyphs() {
+        // Regression: advancing one byte at a time landed inside `§`
+        // and panicked on `text[pos..]`.
+        let line = format!("§§ {}lead 2", FIELD_SOURCE);
+        let (calls, shims) = parse_block_line(&line, 0, 4);
+        assert!(shims.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "lead");
+    }
 }

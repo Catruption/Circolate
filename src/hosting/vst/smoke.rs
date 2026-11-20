@@ -57,6 +57,12 @@ pub fn render_stats(
 }
 
 pub fn run(argv: &[String]) -> Result<()> {
+    if argv.iter().any(|a| a == "-h" || a == "--help") {
+        println!("usage: circolate vst-smoke <plugin.vst3> [state.file] [--dump-params]");
+        println!();
+        println!("  --dump-params  list parameter slots instead of rendering");
+        return Ok(());
+    }
     let dump_params = argv.iter().any(|a| a == "--dump-params");
     let args: Vec<&String> = argv.iter().filter(|a| *a != "--dump-params").collect();
 

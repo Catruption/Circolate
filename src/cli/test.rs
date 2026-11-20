@@ -92,6 +92,7 @@ fn print_help() {
     println!("  does not convert.  Supported inputs: .flp, .halotext, .tsz.");
     println!();
     println!("  --json    emit the report as a single JSON object");
+    println!("  --deps    skip the file probe and run the system dependency scan");
     println!();
     println!("  Exit status is 1 if the probe finds missing dependencies.");
 }

@@ -12,6 +12,17 @@ const SECS: usize = 2;
 const BLOCK: usize = 512;
 
 pub fn run(argv: &[String]) -> Result<()> {
+    if argv.iter().any(|a| a == "-h" || a == "--help") {
+        println!("usage: circolate sf2-smoke <file.sf2> [OPTIONS]");
+        println!();
+        println!("  --bank N       bank index (default 0)");
+        println!("  --patch N      patch index (default 0)");
+        println!("  --note N       MIDI note (default 60)");
+        println!("  --rate N       sample rate (default 44100)");
+        println!("  --list         print every preset");
+        println!("  --out FILE     write a float WAV of the test render");
+        return Ok(());
+    }
     let Some(path) = argv.first() else {
         bail!(
             "usage: halotext-player sf2-smoke <file.sf2> \

@@ -6,6 +6,7 @@
 pub mod check;
 pub mod dump;
 pub mod export;
+pub mod inspect;
 pub mod measure;
 pub mod pick;
 pub mod play;

@@ -186,7 +186,8 @@ fn render_slice(
     speed_pts: Option<&[EnvelopePoint]>,
     speed_base: f64,
     speed_amt: f64,
-    scale: f64,
+    amp_scale: f64,
+    speed_scale: f64,
     k: f64,
     speed_octaves: f64,
 ) -> Vec<i16> {
@@ -201,7 +202,7 @@ fn render_slice(
             let mut n = 0usize;
             while pos < (samples.len() - 1) as f64 && n < max_out {
                 out.push(hermite(&samples, pos));
-                let t = (n as f64 / rate_f) / scale;
+                let t = (n as f64 / rate_f) / speed_scale;
                 let env = gain_at(sp, t, k);
                 let y = speed_base + env * speed_amt;
                 pos += speed_mult(y, speed_octaves);
@@ -217,7 +218,7 @@ fn render_slice(
     .enumerate()
     .map(|(j, &x)| {
         let env = match amp_pts {
-            Some(p) if !p.is_empty() => gain_at(p, (j as f64 / rate_f) / scale, k),
+            Some(p) if !p.is_empty() => gain_at(p, (j as f64 / rate_f) / amp_scale, k),
             _ => 1.0,
         };
         let g = amp_base + env * amp_amt;
@@ -233,7 +234,8 @@ pub(super) fn build(
     keys: &[u32],
     amp_pts: Option<&[EnvelopePoint]>,
     amp_hdr: ItemHeader,
-    env_scale: Option<f64>,
+    amp_scale: f64,
+    speed_scale: f64,
     speed_pts: Option<&[EnvelopePoint]>,
     speed_hdr: ItemHeader,
     speed_octaves: f64,
@@ -321,8 +323,6 @@ pub(super) fn build(
     let mut shdr: Vec<u8> = Vec::with_capacity((n + 1) * 46);
     for (i, &(s, e)) in ranges.iter().enumerate() {
         let start = pool.len() as u32;
-        let slice_secs = (e - s) as f64 / pcm.rate.max(1) as f64;
-        let scale = env_scale.unwrap_or(slice_secs).max(0.001);
         let rendered = render_slice(
             &pcm.data[s..e],
             pcm.rate,
@@ -332,7 +332,8 @@ pub(super) fn build(
             speed_pts,
             speed_hdr.base as f64,
             speed_hdr.env_amt as f64,
-            scale,
+            amp_scale.max(0.001),
+            speed_scale.max(0.001),
             k,
             speed_octaves,
         );

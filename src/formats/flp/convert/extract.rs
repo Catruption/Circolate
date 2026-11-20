@@ -3,9 +3,10 @@
 //! and the mixer insert chain.
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 
 use crate::conversion::{identifier, AuxFile};
-use crate::deps::index::PluginIndex;
+use crate::deps::plugins::PluginTable;
 use crate::deps::registry::{RegistryTable, Resolution};
 use crate::formats::flp::fidelity::{
     ChannelFidelity, ChannelPluginFidelity, EnvelopeFidelity, Fidelity, InsertFidelity,
@@ -62,7 +63,6 @@ pub(super) fn build_fidelity(
                 internal_name: p.internal_name.clone(),
                              display_name: p.display_name.clone(),
                              canonical_name: canonical_name(p),
-                             vst_path: p.vst_path.clone(),
                              state_size: p.state.len(),
                              state_path,
                              instrument_path,
@@ -179,7 +179,7 @@ fn insert_volume(_ins: &flp_src::Insert) -> f32 {
 
 pub(super) fn extract_inserts(
     prj: &flp_src::Project,
-    plugin_index: &PluginIndex,
+    plugin_index: &PluginTable,
     registry: Option<&RegistryTable>,
     aux_files: &mut Vec<AuxFile>,
 ) -> BTreeMap<String, InsertFidelity> {
@@ -232,19 +232,16 @@ pub(super) fn extract_inserts(
                         "    Kind: vst3;".to_string(),
                 ];
                 match &resolved {
-                    Resolved::Exact { name, path } => {
+                    Resolved::Exact { name, path: _ } => {
+                        // Name only — see the module docs on `crate::paths`.
                         lines.push(format!("    Plugin: '{}';", name));
-                        lines.push(format!("    Path: '{}';", path.display()));
                         if state_rel.is_some() {
                             lines.push(format!("    State: '{}.state';", base));
                         }
                     }
-                    // FIX: Add `state: _` to this pattern
                     Resolved::Fallback { name, path, replaces, gain, via_default: _, state: _ } => {
                         lines.push(format!("    Plugin: '{}';", name));
-                        if let Some(p) = path {
-                            lines.push(format!("    Path: '{}';", p.display()));
-                        } else {
+                        if path.is_none() {
                             lines.push("    Unresolved: true;".to_string());
                         }
                         lines.push(format!("    Replaces: '{}';", replaces));
@@ -276,11 +273,18 @@ pub(super) fn extract_inserts(
                 if let Some(table) = registry {
                     match table.resolve_effect(plugin_index, internal) {
                         Resolution::NativeArtifact { name: _, path, replaces, gain } => {
+                            // Native artifacts ship under the Circolate data
+                            // dir.  Record only a portable path — never the
+                            // converting machine's absolute location.
+                            let portable = crate::deps::plugins::clean_relative(&path)
+                            .or_else(|| plugin_index.relative_path(&path))
+                            .or_else(|| path.file_name().map(PathBuf::from))
+                            .unwrap_or_default();
                             let mut lines = vec![
                                 format!("Instrument {base}"),
                                     "{".to_string(),
                                     "    Kind: native;".to_string(),
-                                    format!("    Artifact: '{}';", path.display()),
+                                    format!("    Artifact: '{}';", portable.display()),
                                         format!("    Replaces: '{}';", replaces),
                                             format!("    Gain: {};", gain),
                                                 format!("    OriginalPlugin: '{}';", internal),
@@ -309,13 +313,12 @@ pub(super) fn extract_inserts(
                         }
                         // FIX: This is Resolution::Fallback, NOT Resolved::Fallback.
                         // Path is PathBuf (no Option), so we don't use `if let Some(p) = path`
-                        Resolution::Fallback { name, path, replaces, gain, via_default: _, state: _ } => {
+                        Resolution::Fallback { name, path: _, replaces, gain, via_default: _, state: _ } => {
                             let mut lines = vec![
                                 format!("Instrument {base}"),
                                     "{".to_string(),
                                     "    Kind: vst3;".to_string(),
                                     format!("    Plugin: '{}';", name),
-                                        format!("    Path: '{}';", path.display()),
                                             format!("    Replaces: '{}';", replaces),
                                                 "    Fallback: true;".to_string(),
                                                 format!("    Gain: {};", gain),
@@ -366,7 +369,6 @@ pub(super) fn extract_inserts(
                 slot: slot_i as u32,
                 plugin: display,
                 internal_name: plugin.internal_name.clone(),
-                       vst_path: plugin.vst_path.clone(),
                        instrument: instrument_rel,
                        state: state_rel,
                        fallback,

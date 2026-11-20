@@ -24,6 +24,20 @@ pub fn run(argv: &[String]) -> Result<()> {
     let mut it = argv.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
+            "-h" | "--help" => {
+                println!("usage: circolate export <FILE> [OPTIONS]");
+                println!();
+                println!("  -o, --out DIR          output directory");
+                println!("  -a, --archive          write a single .halo.zip");
+                println!("  --include-plugins[=M]  bundle plugins (none|free|all; default free)");
+                println!("  --pitch names|hz       note-name or Hz pitch spelling");
+                println!("  --subdivisions N       pattern subdivision resolution");
+                println!("  --samples-dir DIR      extra sample directory");
+                println!("  --sf2 PATH             force a SoundFont");
+                println!("  --skip-native          skip native effect shims");
+                println!("  --no-message           omit the generated header comment");
+                return Ok(());
+            }
             "-o" | "--out" => {
                 out_dir = Some(PathBuf::from(
                     it.next().ok_or_else(|| anyhow!("{a} needs a path"))?,

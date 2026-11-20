@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::deps::plugins::PluginTable;
 use crate::formats::sf2::model::Sf2File;
 use crate::formats::sf2::spec::units::{attenuation_cb_to_linear, timecents_to_secs};
 use crate::formats::halotext::parse::C5_HZ;
@@ -29,10 +30,33 @@ impl Sample {
 pub(crate) struct VstInstrument {
     pub(crate) iid: u16,
     pub(crate) name: String,
+    /// A path that was already resolved during project loading (an
+    /// extracted embedded bundle or an installed plugin).  Never a
+    /// path copied out of a project file.
     pub(crate) plugin_path: PathBuf,
     pub(crate) state_bytes: Vec<u8>,
     pub(crate) fallback: bool,
     pub(crate) gain: f32,
+}
+
+impl VstInstrument {
+    /// Locate the plugin for this instrument.  Reuses the path resolved
+    /// at load time when it still exists; otherwise looks the plugin up
+    /// by canonical name.  Never falls back to a recorded project path.
+    pub(crate) fn locate(&self, index: &PluginTable) -> Option<PathBuf> {
+        if self.plugin_path.exists() {
+            return Some(self.plugin_path.clone());
+        }
+        let stem = self
+            .plugin_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        index
+            .find_vst3(&self.name)
+            .or_else(|| index.find_vst3(stem))
+            .cloned()
+    }
 }
 
 // ── SF2 instruments ────────────────────────────────────────────────────
@@ -137,25 +161,25 @@ impl Sf2Instrument {
         const MAX_LAYERS: usize = 8;
 
         let mut hits: Vec<&Sf2ZoneEntry> = self
-            .zones
-            .iter()
-            .filter(|z| {
-                key >= z.key_lo && key <= z.key_hi && vel >= z.vel_lo && vel <= z.vel_hi
-            })
-            .collect();
+        .zones
+        .iter()
+        .filter(|z| {
+            key >= z.key_lo && key <= z.key_hi && vel >= z.vel_lo && vel <= z.vel_hi
+        })
+        .collect();
 
         if hits.is_empty() {
             if let Some(z) = nearest_zone(&self.zones, key, vel, true)
                 .or_else(|| nearest_zone(&self.zones, key, vel, false))
-            {
-                hits.push(z);
-            }
+                {
+                    hits.push(z);
+                }
         }
 
         hits.truncate(MAX_LAYERS);
         hits.into_iter()
-            .map(|z| voice_for_zone(z, key, fine_pitch_cents))
-            .collect()
+        .map(|z| voice_for_zone(z, key, fine_pitch_cents))
+        .collect()
     }
 }
 
@@ -190,8 +214,8 @@ fn nearest_zone<'a>(
 
 fn voice_for_zone(z: &Sf2ZoneEntry, key: u8, fine_pitch_cents: f64) -> Sf2VoiceSpec {
     let semitones = (key as i32 - z.root_key as i32) as f64 * (z.scale_tuning as f64 / 100.0)
-        + z.tune_cents as f64 / 100.0
-        + fine_pitch_cents / 100.0;
+    + z.tune_cents as f64 / 100.0
+    + fine_pitch_cents / 100.0;
     Sf2VoiceSpec {
         sample_id: z.sample_id,
         pitch_hz: C5_HZ * 2f64.powf(semitones / 12.0),
@@ -222,7 +246,7 @@ pub(crate) fn build_sf2_instrument(
             if std::env::var_os("FLP_DEBUG").is_some() {
                 eprintln!(
                     "sf2: bank {} preset {} not found, falling back to all zones ({:#})",
-                    bank, preset, e
+                          bank, preset, e
                 );
             }
             Sf2File::load_bytes(bytes)?
@@ -234,14 +258,14 @@ pub(crate) fn build_sf2_instrument(
         let sm = &sf2.samples[z.sample_idx];
         let start = (sm.start as i64 + z.start_offset as i64).clamp(0, sm.end as i64);
         let end = (sm.end as i64 + z.end_offset as i64)
-            .clamp(start, sf2.pcm.len() as i64);
+        .clamp(start, sf2.pcm.len() as i64);
         let ls = (sm.loop_start as i64 + z.loop_start_offset as i64).clamp(start, end);
         let le = (sm.loop_end as i64 + z.loop_end_offset as i64).clamp(ls, end);
 
         let mono: Vec<f32> = sf2.pcm[start as usize..end as usize]
-            .iter()
-            .map(|&s| s as f32 / 32768.0)
-            .collect();
+        .iter()
+        .map(|&s| s as f32 / 32768.0)
+        .collect();
 
         let loop_pts = if z.loop_mode != 0 && le > ls {
             Some(((ls - start) as i64, (le - start) as i64))
@@ -252,9 +276,9 @@ pub(crate) fn build_sf2_instrument(
         let arc = Arc::new(Sample {
             left: mono,
             right: Vec::new(),
-            stereo: false,
-            rate: sm.rate as f64,
-            loop_pts,
+                           stereo: false,
+                           rate: sm.rate as f64,
+                           loop_pts,
         });
         let sid = base_id + zi as u32;
         samples.insert(sid, arc);
@@ -283,8 +307,8 @@ pub(crate) fn build_sf2_instrument(
             env.peak = (env.peak * o.gain).clamp(0.0, 1.0);
             (
                 (o.pan.clamp(-1.0, 1.0) * 500.0).round() as i16,
-                o.tune_cents,
-                env,
+             o.tune_cents,
+             env,
             )
         } else {
             (0, z.tune_cents, env)
@@ -316,7 +340,7 @@ pub(crate) struct SlicexSlice {
     pub(crate) frame_end:   u32,
     pub(crate) key:         u32,
     pub(crate) pan:         u32,     // 0..128, 64 = centre
-    pub(crate) atten:       u32,     // 0..128, 0 = loud
+    pub(crate) atten:       u32,     // centibels, 0 = loud, 960 = -96 dB
     pub(crate) cutoff:      u32,     // 0..12800
 }
 
@@ -325,8 +349,11 @@ pub(crate) struct SlicexInstrument {
     pub(crate) base_key: u32,
     pub(crate) slices: Vec<SlicexSlice>,
     pub(crate) amp_env:   Option<Arc<Points>>,
+    pub(crate) amp_sustain_index: i32,
+    pub(crate) amp_release_index: i32,
     pub(crate) speed_env: Option<Arc<Points>>,
     pub(crate) cut_env:   Option<Arc<Points>>,
+    pub(crate) lfo_env:   Option<Arc<Points>>,
     pub(crate) amp_amt:   f64,
     pub(crate) speed_amt: f64,
     pub(crate) cut_amt:   f64,
@@ -361,11 +388,11 @@ impl MultiSampleInstrument {
         for (zi, file) in files.iter().enumerate() {
             let Some(&sid) = path_to_id.get(file) else { continue };
             let root = root_keys
-                .get(zi)
-                .copied()
-                .flatten()
-                .unwrap_or(60)
-                .clamp(0, 127) as u8;
+            .get(zi)
+            .copied()
+            .flatten()
+            .unwrap_or(60)
+            .clamp(0, 127) as u8;
             let lo = ((zi as u32) * 128 / n) as u8;
             let hi = (((zi as u32 + 1) * 128 / n).saturating_sub(1)).min(127) as u8;
             zones.push(MultiSampleZone {
@@ -391,7 +418,7 @@ impl MultiSampleInstrument {
         for z in &self.zones {
             if key >= z.key_lo && key <= z.key_hi {
                 let semitones = (key as i32 - z.root_key as i32) as f64
-                    + fine_pitch_cents / 100.0;
+                + fine_pitch_cents / 100.0;
                 let pitch_hz = C5_HZ * 2f64.powf(semitones / 12.0);
                 return Some((z.sample_id, pitch_hz));
             }
@@ -406,7 +433,7 @@ impl MultiSampleInstrument {
         }
         let (z, _) = best?;
         let semitones = (key as i32 - z.root_key as i32) as f64
-            + fine_pitch_cents / 100.0;
+        + fine_pitch_cents / 100.0;
         let pitch_hz = C5_HZ * 2f64.powf(semitones / 12.0);
         Some((z.sample_id, pitch_hz))
     }

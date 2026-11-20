@@ -52,6 +52,12 @@ pub fn render(args: &Args) -> Result<()> {
     .song
     .as_ref()
     .ok_or_else(|| anyhow!("--render needs a song file"))?;
+    crate::log_event!(
+        "player.render.started",
+        path: song.display(),
+        rate: args.rate,
+        start: args.start,
+    );
     let (path, _guard) = resolve_source(song, args)?;
     let (project, cache) =
     player::load_project(&path, args.rate, !args.no_cache, false)?;
@@ -64,12 +70,25 @@ pub fn render(args: &Args) -> Result<()> {
         args.no_master_fx,
         args.sf2_override.as_deref(),
     );
-    player::write_wav(out, &l, &r, args.rate)?;
+    let (clipped, peak) = player::write_wav(out, &l, &r, args.rate)?;
+    let audio_secs = l.len() as f64 / args.rate as f64;
+    let elapsed = t0.elapsed().as_secs_f64();
+    let rtf = if elapsed > 0.0 { audio_secs / elapsed } else { 0.0 };
+    crate::log_event!(
+        "player.render.done",
+        frames: l.len(),
+        secs: format!("{audio_secs:.2}"),
+        elapsed: format!("{elapsed:.1}"),
+        rtf: format!("{rtf:.2}"),
+        peak: format!("{peak:.3}"),
+        clipped: clipped,
+    );
     println!(
-        "  wrote {} ({:.2}s of audio in {:.1}s; {})",
+        "  wrote {} ({:.2}s of audio in {:.1}s; {:.2}x realtime; {})",
              out.display(),
-             l.len() as f64 / args.rate as f64,
-             t0.elapsed().as_secs_f64(),
+             audio_secs,
+             elapsed,
+             rtf,
              cache.describe()
     );
     Ok(())

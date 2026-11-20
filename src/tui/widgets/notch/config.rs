@@ -807,7 +807,7 @@ fn reload_config() -> Result<Settings> {
 fn save_settings(settings: &Settings) -> Result<()> {
     let path = paths::user_config().join("player_settings.json");
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        paths::ensure_dir(parent)?;
     }
 
     // Preserve any existing preset name; this UI doesn't edit it.

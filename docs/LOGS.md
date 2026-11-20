@@ -176,6 +176,30 @@ flp: skipping disabled channels {chans}
 
 - Channels disabled in the source project were dropped.
 
+### `pipe.phase` — INFO
+
+```
+{stage}: {ms} ms
+```
+
+- fields: `stage`, `ms`
+
+- since 0.2.0
+
+- Wall-clock duration of one FLP→halotext pipe stage.
+
+### `pipe.progress` — INFO
+
+```
+{stage}: [{current}/{total}] {detail}
+```
+
+- fields: `stage`, `current`, `total`, `detail`
+
+- since 0.2.0
+
+- Per-item progress inside a pipe stage (currently emitted from classify).
+
 ## `flp.slicex`
 
 ### `flp.slicex.header` — DEBUG
@@ -454,17 +478,77 @@ VSTs initialized.
 
 - All VST hosts finished installing.
 
-### `player.perf` — INFO
+### `player.session.device` — INFO
 
 ```
-load={load} worst={worst} overruns={overruns} voices={voices} vst={vst} shim={shim} fx={fx} ui_draw_ms={ui_draw_ms} ui_draw_worst_ms={ui_draw_worst_ms}
+audio device: {name} ({rate} Hz, {channels} ch)
 ```
 
-- fields: `load`, `worst`, `overruns`, `voices`, `vst`, `shim`, `fx`, `ui_draw_ms`, `ui_draw_worst_ms`
+- fields: `name`, `rate`, `channels`
 
-- since 0.1.0
+- since 0.2.0
 
-- Per-second render load and average/worst terminal draw times.
+- The cpal output device and format chosen for live playback.
+
+### `player.session.opening` — INFO
+
+```
+opening {path} at {rate} Hz
+```
+
+- fields: `path`, `rate`
+
+- since 0.2.0
+
+- A live session began loading a source (or opened an empty queue).
+
+### `player.session.loaded` — INFO
+
+```
+project ready: {parts} parts, {voices} voices, {rate} Hz
+```
+
+- fields: `parts`, `voices`, `rate`
+
+- since 0.2.0
+
+- Project parsing finished and the audio engine is about to be installed.
+
+### `player.speed.changed` — INFO
+
+```
+speed: {speed}x
+```
+
+- fields: `speed`
+
+- since 0.2.0
+
+- Playback speed/direction changed through a key or media control.
+
+### `player.install.summary` — INFO
+
+```
+install: {vst} VST host(s), {sf2} SF2 engine(s), {shims} shim(s), {chip} chip player(s), {fx} master FX, {failures} failure(s)
+```
+
+- fields: `vst`, `sf2`, `shims`, `chip`, `fx`, `failures`
+
+- since 0.2.0
+
+- Typed end-of-install summary shared by live playback and offline render.
+
+### `player.install.failed` — ERROR
+
+```
+install: {kind}: {err} ({count}x)
+```
+
+- fields: `kind`, `err`, `count`
+
+- since 0.2.0
+
+- One distinct instrument/effect failure, with how many hosts hit it.
 
 ### `player.load.fidelity_summary` — INFO
 
@@ -658,6 +742,18 @@ vst [{name}] not found (looked up by name {stem})
 
 - A VST referenced by the project wasn't found in the plugin scan; the track is silent.
 
+### `player.install.vst_loaded` — INFO
+
+```
+  vst {name}: loaded {plugin} for {part} (iid {iid})
+```
+
+- fields: `name`, `plugin`, `part`, `iid`
+
+- since 0.2.0
+
+- One VST host actually instantiated. Aliases of the same iid are not loaded twice.
+
 ### `player.install.sf2_load_failed` — ERROR
 
 ```
@@ -681,6 +777,18 @@ sf2 [{name}]: failed to load {path}: {err}
 - since 0.1.0
 
 - Per-SF2-engine gain breakdown at install time (formerly FLP_DEBUG=1).
+
+### `player.install.sf2_engines_installed` — INFO
+
+```
+  installed {count} SF2 engine(s)
+```
+
+- fields: `count`
+
+- since 0.2.0
+
+- Summary at end of the shared SF2 installer.
 
 ### `player.install.shims_no_share` — WARN
 
@@ -766,42 +874,6 @@ vtrace: scheduled sample {sample_id} start={start} end={end} ({len} samples, {se
 
 - Per-voice trace for a specific sample_id, gated by VOICE_TRACE_SAMPLE=<id>.
 
-### `player.render.vst_skipped` — WARN
-
-```
-  skipping VST [{name}]: plugin {stem} not installed
-```
-
-- fields: `name`, `stem`
-
-- since 0.1.0
-
-- A VST referenced by the project was not found on the local plugin scan.
-
-### `player.render.vst_loaded` — INFO
-
-```
-  loaded VST [{iid}] {name} ({tag})
-```
-
-- fields: `iid`, `name`, `tag`
-
-- since 0.1.0
-
-- A VST host was installed for offline rendering.
-
-### `player.render.vst_load_failed` — ERROR
-
-```
-  failed to load VST {name}: {err}
-```
-
-- fields: `name`, `err`
-
-- since 0.1.0
-
-- A VST host failed to instantiate during offline render.
-
 ### `player.render.vst_hosts_installed` — INFO
 
 ```
@@ -826,42 +898,6 @@ vtrace: scheduled sample {sample_id} start={start} end={end} ({len} samples, {se
 
 - Emitted when VST_FALLBACK_GAIN is not 1.0.
 
-### `player.render.sf2_load_failed` — ERROR
-
-```
-  sf2 engine failed to load {name}: {err}
-```
-
-- fields: `name`, `err`
-
-- since 0.1.0
-
-- A SoundFont engine failed to load during offline render.
-
-### `player.render.sf2_debug` — DEBUG
-
-```
-{body}
-```
-
-- fields: `body`
-
-- since 0.1.0
-
-- Per-SF2-engine gain breakdown (formerly FLP_DEBUG=1).
-
-### `player.render.sf2_engines_installed` — INFO
-
-```
-  installed {count} SF2 engine(s)
-```
-
-- fields: `count`
-
-- since 0.1.0
-
-- Summary at end of the offline SF2 install loop.
-
 ### `player.render.wav_clipped` — WARN
 
 ```
@@ -873,6 +909,134 @@ vtrace: scheduled sample {sample_id} start={start} end={end} ({len} samples, {se
 - since 0.1.0
 
 - Offline render wrote samples outside [-1, 1].
+
+### `player.render.started` — INFO
+
+```
+render: {path} at {rate} Hz from {start:.2}s
+```
+
+- fields: `path`, `rate`, `start`
+
+- since 0.2.0
+
+- An offline WAV render began; this is the first line of its progress output.
+
+### `player.render.done` — INFO
+
+```
+render done: {frames} frames ({secs:.2}s audio) in {elapsed:.1}s ({rtf:.2}x realtime), peak {peak:.3}, {clipped} clipped
+```
+
+- fields: `frames`, `secs`, `elapsed`, `rtf`, `peak`, `clipped`
+
+- since 0.2.0
+
+- End-of-render summary with duration, realtime factor and level stats.
+
+### `player.patch.missing` — WARN
+
+```
+  chip patch missing: {path}
+```
+
+- fields: `path`
+
+- since 0.2.0
+
+- A halotext part names a patch file that does not exist.
+
+### `player.patch.parse_failed` — WARN
+
+```
+  chip patch {path} failed to parse: {err}
+```
+
+- fields: `path`, `err`
+
+- since 0.2.0
+
+- A .patch file exists but its text could not be parsed.
+
+### `player.sf2.read_failed` — WARN
+
+```
+  sf2 {path} failed to read
+```
+
+- fields: `path`
+
+- since 0.2.0
+
+- A SoundFont referenced by the project could not be opened.
+
+### `player.slicex.parse_failed` — WARN
+
+```
+  slicex sidecar {path} failed to parse
+```
+
+- fields: `path`
+
+- since 0.2.0
+
+- A Slicex sidecar JSON could not be parsed.
+
+### `player.vst.unresolved` — WARN
+
+```
+  vst {key}: no plugin installed
+```
+
+- fields: `key`
+
+- since 0.2.0
+
+- A VST instrument's plugin could not be resolved on this machine.
+
+### `player.vst.unresolved_fallback` — WARN
+
+```
+  vst {key}: no plugin installed, falling back to {plugin}
+```
+
+- fields: `key`, `plugin`
+
+- since 0.2.0
+
+- A VST instrument's plugin was missing; a fallback plugin was used.
+
+### `playhead.ipc_bind_failed` — WARN
+
+```
+playhead: cannot bind IPC socket: {err}
+```
+
+- fields: `err`
+
+- since 0.2.0
+
+- The playhead IPC listener could not create its socket.
+
+### `playhead.client_connected` — INFO
+
+```
+playhead: client connected
+```
+
+- since 0.2.0
+
+- A TUI client connected to the playhead IPC socket.
+
+### `playhead.client_disconnected` — INFO
+
+```
+playhead: client disconnected
+```
+
+- since 0.2.0
+
+- A TUI client disconnected from the playhead IPC socket.
 
 ### `player.load.vgm_found` — INFO
 
@@ -933,6 +1097,160 @@ vtrace: scheduled sample {sample_id} start={start} end={end} ({len} samples, {se
 - No playable voices. Dumping diagnostics.
 
 ## `deps`
+
+### `deps.doctor.started` — INFO
+
+```
+doctor: scanning directories and dependencies
+```
+
+- since 0.2.0
+
+- `circolate doctor` began its read-only pre-flight.
+
+### `deps.doctor.summary` — INFO
+
+```
+doctor: {missing_dirs} missing dir(s), {plugins} plugin(s), {soundfonts} SoundFont(s), {fallbacks_present}/{fallbacks_total} fallback(s), {problems} problem(s)
+```
+
+- fields: `missing_dirs`, `plugins`, `soundfonts`, `fallbacks_present`, `fallbacks_total`, `problems`
+
+- since 0.2.0
+
+- End-of-run summary from `circolate doctor`.
+
+### `deps.doctor.dir` — DEBUG
+
+```
+  dir {label}: {path} ({count} entries)
+```
+
+- fields: `label`, `path`, `count`
+
+- since 0.2.0
+
+- One existing directory in the doctor catalogue.
+
+### `deps.doctor.dir_missing` — DEBUG
+
+```
+  missing dir {label}: {path}
+```
+
+- fields: `label`, `path`
+
+- since 0.2.0
+
+- An installable directory in the doctor catalogue does not exist.
+
+### `deps.doctor.plugin_root` — INFO
+
+```
+  plugin root {path}: {count} plugin(s)
+```
+
+- fields: `path`, `count`
+
+- since 0.2.0
+
+- One existing plugin search root and how many bundles were found under it.
+
+### `deps.install.started` — INFO
+
+```
+install: creating Circolate directories (dry run: {dry_run})
+```
+
+- fields: `dry_run`
+
+- since 0.2.0
+
+- `circolate install` started. dry_run is `true` or `false`.
+
+### `deps.install.summary` — INFO
+
+```
+install: {created} created, {existing} existing, {files_written} file(s) written, {failed} failed
+```
+
+- fields: `created`, `existing`, `files_written`, `failed`
+
+- since 0.2.0
+
+- End-of-run summary from `circolate install`.
+
+### `deps.install.failed` — ERROR
+
+```
+install: {path}: {err}
+```
+
+- fields: `path`, `err`
+
+- since 0.2.0
+
+- One directory or helper file could not be created.
+
+### `deps.install.created` — INFO
+
+```
+install: created {path}
+```
+
+- fields: `path`
+
+- since 0.2.0
+
+- One directory created by `circolate install`.
+
+### `deps.install.wrote` — INFO
+
+```
+install: wrote {path}
+```
+
+- fields: `path`
+
+- since 0.2.0
+
+- One helper file written by `circolate install`.
+
+### `deps.install.fish_command` — INFO
+
+```
+install: fish command {path}{dry_run}
+```
+
+- fields: `path`, `dry_run`
+
+- since 0.2.0
+
+- The fish autoload command was installed or planned. dry_run is ` (dry run)` or empty.
+
+### `deps.directories.added` — INFO
+
+```
+directories: added {kind} root {path}
+```
+
+- fields: `kind`, `path`
+
+- since 0.2.0
+
+- A search root was added through `circolate directories` or the TUI.
+
+### `deps.directories.removed` — INFO
+
+```
+directories: removed {kind} root {path}
+```
+
+- fields: `kind`, `path`
+
+- since 0.2.0
+
+- A configured search root was cleared.
 
 ### `deps.fetch.step_failed` — ERROR
 
@@ -1103,6 +1421,124 @@ Export failed: {err}
 - since 0.1.0
 
 - Export errored.
+
+### `tui.menu.directories_saved` — INFO
+
+```
+Search roots saved to directories.json
+```
+
+- since 0.2.0
+
+- The idle menu's directory editor wrote the user config layer.
+
+### `tui.menu.directories_failed` — ERROR
+
+```
+Could not save search roots: {err}
+```
+
+- fields: `err`
+
+- since 0.2.0
+
+- The idle menu's directory editor failed to write user config.
+
+### `tui.menu.install_started` — INFO
+
+```
+Installing Circolate directories...
+```
+
+- since 0.2.0
+
+- User chose INSTALL DIRS from the home menu.
+
+### `tui.menu.install_ok` — INFO
+
+```
+Directory install finished; see the log for counts
+```
+
+- since 0.2.0
+
+- The background directory install completed.
+
+### `tui.menu.install_failed` — ERROR
+
+```
+Directory install failed: {err}
+```
+
+- fields: `err`
+
+- since 0.2.0
+
+- The background directory install errored.
+
+### `tui.menu.doctor_started` — INFO
+
+```
+Scanning dependencies...
+```
+
+- since 0.2.0
+
+- User chose DOCTOR from the home menu.
+
+### `tui.menu.doctor_ok` — INFO
+
+```
+Dependency scan finished; see the log for paths
+```
+
+- since 0.2.0
+
+- The background doctor scan completed.
+
+### `tui.menu.doctor_failed` — ERROR
+
+```
+Dependency scan failed: {err}
+```
+
+- fields: `err`
+
+- since 0.2.0
+
+- The background doctor scan errored.
+
+### `tui.menu.fetch_started` — INFO
+
+```
+Fetching fallback plugins...
+```
+
+- since 0.2.0
+
+- User chose FETCH PLUGINS from the home menu.
+
+### `tui.menu.fetch_ok` — INFO
+
+```
+Plugin fetch finished; see the log for counts
+```
+
+- since 0.2.0
+
+- The background plugin fetch completed.
+
+### `tui.menu.fetch_failed` — ERROR
+
+```
+Plugin fetch failed: {err}
+```
+
+- fields: `err`
+
+- since 0.2.0
+
+- The background plugin fetch errored.
 
 ## `ffi`
 

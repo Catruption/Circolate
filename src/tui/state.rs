@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use ratatui::layout::Rect;
@@ -33,23 +34,350 @@ pub struct SpiralCache {
     pub result: Option<(SpiralLayout, QueueLayout)>,
 }
 
+/// Number of keyboard actions in the idle menu.  Keep in sync with
+/// `tui::widgets::notch::menu::draw` and the match in `tui::app`.
+pub const MENU_ITEMS: usize = 7;
+
+/// One idle-menu action and the single argument that can be selected for it.
+/// `values[i]` is passed to the underlying CLI when `args[i]` is displayed.
+#[derive(Debug, Clone, Copy)]
+pub struct MenuOption {
+    pub label: &'static str,
+    pub args: &'static [&'static str],
+    pub values: &'static [&'static str],
+}
+
+pub const MENU_OPTIONS: [MenuOption; MENU_ITEMS] = [
+    MenuOption {
+        label: "PLAY",
+        args: &["normal", "no cache", "no master fx", "no watch"],
+        values: &["", "--no-cache", "--no-master-fx", "--no-watch"],
+    },
+    MenuOption {
+        label: "DUMP",
+        args: &["states", "no states", "raw"],
+        values: &["", "--no-states", "--raw"],
+    },
+    MenuOption {
+        label: "EXPORT",
+        args: &["folder", "archive"],
+        values: &["", "--archive"],
+    },
+    MenuOption {
+        label: "INSTALL DIRS",
+        args: &["dirs", "fish command"],
+        values: &["", "--fish-command"],
+    },
+    MenuOption {
+        label: "DOCTOR",
+        args: &["summary", "dirs"],
+        values: &["--log-only", "--dirs"],
+    },
+    MenuOption {
+        label: "FETCH PLUGINS",
+        args: &["default"],
+        values: &[""],
+    },
+    MenuOption {
+        label: "EDIT DIRS",
+        args: &["normal"],
+        values: &[""],
+    },
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuSubmenu {
+    /// The nested directories editor.  The main idle menu shows logs in its
+    /// place until this is opened.
+    Directories,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct MenuState {
     pub selected_index: usize,
+    /// `None` means the main idle menu; `Some(_)` overlays a nested menu.
+    pub submenu: Option<MenuSubmenu>,
+    /// Which argument is active for each menu option.  Empty until first
+    /// use so `MenuState::default()` stays cheap.
+    pub arg_index: Vec<usize>,
     pub edit_mode: Option<usize>,
+    /// Insertion point inside the current row, counted in characters.
+    pub edit_cursor: usize,
+    /// The row being added, so Esc can discard it.
+    pub edit_is_new: bool,
+    /// Parallel to `directories`: which config group each row belongs to.
+    pub directory_kinds: Vec<&'static str>,
     pub directories: Vec<String>,
+    /// Built-in roots that are always checked; kept separate from the
+    /// editable rows so users can see valid drop locations without copying.
+    pub system_roots: Vec<crate::deps::layout::SearchRoot>,
+    /// First built-in root to show when the list is taller than the panel.
+    pub system_scroll: usize,
+    pub status: Option<String>,
+    /// Background menu actions write here; the event loop lifts the value
+    /// into `status` on the next frame so "done" never overwrites the TUI.
+    pub status_slot: Arc<Mutex<Option<String>>>,
 }
 
 impl MenuState {
     pub fn new() -> Self {
-        let mut directories = Vec::new();
-        directories.push(crate::paths::user_halotexts().to_string_lossy().into_owned());
-        directories.push(crate::paths::bundled_halotexts().to_string_lossy().into_owned());
-        Self {
-            selected_index: 0,
-            edit_mode: None,
-            directories,
+        let mut state = Self::default();
+        state.ensure_arg_index();
+        state.reload_directories();
+        state
+    }
+
+    fn ensure_arg_index(&mut self) {
+        self.arg_index.resize(MENU_ITEMS, 0);
+    }
+
+    pub fn open_directories(&mut self) {
+        self.finish_edit();
+        self.submenu = Some(MenuSubmenu::Directories);
+        self.system_scroll = 0;
+    }
+
+    pub fn close_submenu(&mut self) {
+        self.finish_edit();
+        self.submenu = None;
+    }
+
+    /// Cycle the single active argument for a menu option.  Options with one
+    /// argument are deliberately inert; wrapping keeps Left/Right predictable.
+    pub fn cycle_arg(&mut self, index: usize, delta: isize) {
+        if index >= MENU_ITEMS { return; }
+        self.ensure_arg_index();
+        let count = MENU_OPTIONS[index].args.len();
+        if count <= 1 { return; }
+        let current = self.arg_index[index] as isize;
+        self.arg_index[index] = (current + delta).rem_euclid(count as isize) as usize;
+    }
+
+    /// Visible argument for an option, or `None` when it has no choices.
+    pub fn arg_label(&self, index: usize) -> Option<&'static str> {
+        let option = MENU_OPTIONS.get(index)?;
+        if option.args.len() <= 1 { return None; }
+        let at = self.arg_index.get(index).copied().unwrap_or(0);
+        option.args.get(at).copied()
+    }
+
+    /// CLI flags for the active argument.  Empty for the default choice.
+    pub fn selected_flags(&self, index: usize) -> Vec<String> {
+        let Some(option) = MENU_OPTIONS.get(index) else { return Vec::new() };
+        let at = self.arg_index.get(index).copied().unwrap_or(0);
+        option.values.get(at)
+        .map(|v| if v.is_empty() { Vec::new() } else { vec![(*v).to_string()] })
+        .unwrap_or_default()
+    }
+
+    /// Start editing a row with the cursor at the end of its text.
+    pub fn begin_edit(&mut self, index: usize, is_new: bool) {
+        if index >= self.directories.len() { return; }
+        self.edit_mode = Some(index);
+        self.edit_is_new = is_new;
+        self.edit_cursor = self.directories[index].chars().count();
+    }
+
+    /// Move between editable rows.  Up/Down do this while editing so the
+    /// other roots can be changed without leaving edit mode.
+    pub fn move_edit_row(&mut self, delta: isize) {
+        let Some(index) = self.edit_mode else { return };
+        if self.directories.is_empty() { return; }
+
+        // A blank row from `+ ... DIR` should not linger when the user
+        // navigates away from it.
+        if self.edit_is_new && self.directories[index].trim().is_empty()
+        && self.directories.len() > 1 {
+            self.directories.remove(index);
+            self.directory_kinds.remove(index);
+            let next = if delta > 0 {
+                index.min(self.directories.len() - 1)
+            } else {
+                index.saturating_sub(1)
+            };
+            self.edit_mode = Some(next);
+            self.edit_is_new = false;
+            self.edit_cursor = self.directories[next].chars().count();
+            return;
         }
+
+        let last = self.directories.len() - 1;
+        let next = (index as isize + delta).clamp(0, last as isize) as usize;
+        self.edit_mode = Some(next);
+        self.edit_is_new = false;
+        self.edit_cursor = self.directories[next].chars().count();
+    }
+
+    /// Move the insertion point within the current row.
+    pub fn move_edit_cursor(&mut self, delta: isize) {
+        let Some(index) = self.edit_mode else { return };
+        let len = self.directories[index].chars().count() as isize;
+        self.edit_cursor = (self.edit_cursor as isize + delta).clamp(0, len) as usize;
+    }
+
+    pub fn edit_home(&mut self) { self.edit_cursor = 0; }
+
+    pub fn edit_end(&mut self) {
+        if let Some(index) = self.edit_mode {
+            self.edit_cursor = self.directories[index].chars().count();
+        }
+    }
+
+    pub fn insert_edit_char(&mut self, c: char) {
+        let Some(index) = self.edit_mode else { return };
+        let text = &mut self.directories[index];
+        let byte = char_to_byte_idx(text, self.edit_cursor);
+        text.insert(byte, c);
+        self.edit_cursor += 1;
+    }
+
+    pub fn backspace_edit(&mut self) {
+        let Some(index) = self.edit_mode else { return };
+        if self.edit_cursor == 0 { return; }
+        let text = &mut self.directories[index];
+        let byte = char_to_byte_idx(text, self.edit_cursor - 1);
+        text.remove(byte);
+        self.edit_cursor -= 1;
+    }
+
+    pub fn delete_edit(&mut self) {
+        let Some(index) = self.edit_mode else { return };
+        let text = &mut self.directories[index];
+        if self.edit_cursor >= text.chars().count() { return; }
+        let byte = char_to_byte_idx(text, self.edit_cursor);
+        text.remove(byte);
+    }
+
+    /// Leave edit mode after Enter/Esc commits or discards the pending row.
+    pub fn finish_edit(&mut self) {
+        self.edit_mode = None;
+        self.edit_is_new = false;
+        self.edit_cursor = 0;
+    }
+
+    /// Reload the single editable user root.  Everything else Circolate
+    /// checks is discovered automatically and shown in `system_roots`.
+    pub fn reload_directories(&mut self) {
+        self.finish_edit();
+        self.directory_kinds.clear();
+        self.directories.clear();
+
+        let current = crate::paths::user_root()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+        self.directory_kinds.push("user_root");
+        self.directories.push(current);
+
+        // `always_checked_roots()` already removes anything inside the user
+        // root and legacy roots, so each location appears only once.
+        self.system_roots = crate::deps::layout::always_checked_roots();
+        self.system_scroll = 0;
+    }
+
+    /// Persist the user root to Circolate's localshare settings.
+    pub fn save_directories(&self) -> anyhow::Result<()> {
+        let cfg = crate::paths::DirectoriesConfig {
+            user_root: self.directories.first()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+            ..crate::paths::DirectoriesConfig::default()
+        };
+        crate::paths::save_user_directories(&cfg)
+    }
+}
+
+#[cfg(test)]
+mod menu_edit_tests {
+    use super::*;
+
+    fn fixture() -> MenuState {
+        let mut menu = MenuState::default();
+        menu.directories = vec!["abc".into(), "xy".into()];
+        menu.directory_kinds = vec!["user_root", "user_root"];
+        menu
+    }
+
+    #[test]
+    fn edit_cursor_inserts_and_deletes_at_position() {
+        let mut menu = fixture();
+        menu.begin_edit(0, false);
+        menu.edit_home();
+        menu.insert_edit_char('Z');
+        assert_eq!(menu.directories[0], "Zabc");
+        assert_eq!(menu.edit_cursor, 1);
+
+        menu.move_edit_cursor(1);
+        menu.insert_edit_char('Q');
+        assert_eq!(menu.directories[0], "ZaQbc");
+
+        menu.backspace_edit();
+        assert_eq!(menu.directories[0], "Zabc");
+        assert_eq!(menu.edit_cursor, 2);
+
+        menu.delete_edit();
+        assert_eq!(menu.directories[0], "Zac");
+        assert_eq!(menu.edit_cursor, 2);
+    }
+
+    #[test]
+    fn up_and_down_switch_editable_rows() {
+        let mut menu = fixture();
+        menu.begin_edit(0, false);
+        assert_eq!(menu.edit_cursor, 3);
+
+        menu.move_edit_row(1);
+        assert_eq!(menu.edit_mode, Some(1));
+        assert_eq!(menu.edit_cursor, 2);
+
+        menu.move_edit_row(-1);
+        assert_eq!(menu.edit_mode, Some(0));
+        assert_eq!(menu.edit_cursor, 3);
+    }
+
+    #[test]
+    fn argument_cycling_wraps_and_ignores_single_choice_options() {
+        let mut menu = MenuState::default();
+        assert_eq!(menu.arg_label(1), Some("states"));
+
+        menu.cycle_arg(1, 1);
+        assert_eq!(menu.arg_label(1), Some("no states"));
+        assert_eq!(menu.selected_flags(1), vec!["--no-states"]);
+
+        menu.cycle_arg(1, 1);
+        assert_eq!(menu.arg_label(1), Some("raw"));
+
+        menu.cycle_arg(1, 1);
+        assert_eq!(menu.arg_label(1), Some("states"));
+        assert!(menu.selected_flags(1).is_empty());
+
+        menu.cycle_arg(5, 1);
+        assert_eq!(menu.arg_label(5), None);
+        assert!(menu.selected_flags(5).is_empty());
+    }
+
+    #[test]
+    fn each_option_has_a_matching_argument_and_flag() {
+        for option in MENU_OPTIONS {
+            assert_eq!(option.args.len(), option.values.len());
+            assert!(!option.args.is_empty());
+        }
+    }
+
+    #[test]
+    fn directories_submenu_opens_and_closes_cleanly() {
+        let mut menu = MenuState::default();
+        menu.directories.push(String::new());
+        menu.directory_kinds.push("user_root");
+        assert_eq!(menu.submenu, None);
+
+        menu.open_directories();
+        assert_eq!(menu.submenu, Some(MenuSubmenu::Directories));
+        menu.begin_edit(0, false);
+        assert!(menu.edit_mode.is_some());
+
+        menu.close_submenu();
+        assert_eq!(menu.submenu, None);
+        assert_eq!(menu.edit_mode, None);
     }
 }
 

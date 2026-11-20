@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::conversion::{safe_name, AuxFile, ConvertOptions, Converted, SampleJsonEntry, SampleOut, SamplesJson};
-use crate::deps::index::PluginIndex;
+use crate::deps::plugins::PluginTable;
 use crate::deps::registry::RegistryTable;
 use crate::formats::flp::fidelity::MultiSampleFidelity;
 use crate::formats::flp::model as flp_src;
@@ -103,7 +103,7 @@ pub fn convert(prj: &flp_src::Project, src_path: &Path, opts: &ConvertOptions) -
     let (placed, _used_playlist, dropped_notes) =
     timed("place", || place_notes(prj));
 
-    let plugin_index = PluginIndex::scan();
+    let plugin_index = PluginTable::get();
     let fallback_table = match RegistryTable::load() {
         Ok(t) => Some(t),
         Err(e) => { eprintln!("flp: fallback table unavailable ({e:#})"); None }
@@ -545,7 +545,7 @@ pub fn probe(src_path: &Path, opts: &ConvertOptions) -> Result<ProbeReport> {
     let prj = crate::formats::flp::parse_file(src_path)?;
     let flp_dir = src_path.parent().unwrap_or_else(|| Path::new("."));
     let (placed, _, _) = place_notes(&prj);
-    let plugin_index = PluginIndex::scan();
+    let plugin_index = PluginTable::get();
     let fallback_table = RegistryTable::load().ok();
     let mut aux_files: Vec<AuxFile> = Vec::new();
 

@@ -56,8 +56,6 @@ pub struct ChannelPluginFidelity {
     #[serde(default)]
     pub canonical_name: String,
     #[serde(default)]
-    pub vst_path: String,
-    #[serde(default)]
     pub state_size: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_path: Option<String>,
@@ -215,7 +213,6 @@ pub struct InsertSlotFidelity {
     #[serde(default)] pub slot: u32,
     #[serde(default)] pub plugin: String,
     #[serde(default)] pub internal_name: String,
-    #[serde(default)] pub vst_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instrument: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

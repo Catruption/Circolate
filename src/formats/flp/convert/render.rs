@@ -138,10 +138,10 @@ pub(super) fn render_part(
 
             let pan = (pan_norm(n.pan) + style.pan_offset).clamp(-1.0, 1.0);
             let fp_delta = n.fine_pitch as i16 - 120;
+            let is_slide = n.flags & 0x10 != 0;
             let rel_delta = n.release as i16 - 64;
             let mx_delta = n.mod_x as i16 - 128;
             let my_delta = n.mod_y as i16 - 128;
-
             let mut start_samples = style.sample_start;
             if let Some(ms) = p.clip_offset_ms {
                 if ms > 0.0 && style.sample_rate > 0 {
@@ -151,7 +151,8 @@ pub(super) fn render_part(
 
             events.push(HalotextEvent {
                 env_value: None, env_tension: None, env_kind: None,
-                op: String::new(), row, source_line: 0, source_byte_column: 0, source_end_byte_column: 0,
+                op: if is_slide { "&".to_string() } else { String::new() }, // <-- CHANGE THIS LINE
+                row, source_line: 0, source_byte_column: 0, source_end_byte_column: 0,
                 pitch_midi: Some(key), pitch_hz: None,
                 vol: if (start_vol - 100.0).abs() > 0.5 { Some(start_vol) } else { None },
                 pan: if pan.abs() > 0.01 { Some(pan) } else { None },

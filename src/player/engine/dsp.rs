@@ -1,5 +1,5 @@
 //! Pure DSP helpers used by the engine: pan law, sinc interpolation,
-//! SF2-style volume envelope, and small buffer utilities.
+//! SF2-style volume envelope, biquad filter, and small buffer utilities.
 
 use std::f64::consts::{FRAC_PI_4, PI};
 use std::sync::OnceLock;
@@ -25,7 +25,6 @@ pub(super) fn mix_add(dst_l: &mut [f32], dst_r: &mut [f32], src_l: &[f32], src_r
     }
 }
 
-
 #[inline]
 pub(crate) fn gains(vol_pct: f64, pan: f64, song_volume: f64, linear: bool) -> (f64, f64) {
     let v = vol_pct * song_volume / 100.0;
@@ -35,6 +34,54 @@ pub(crate) fn gains(vol_pct: f64, pan: f64, song_volume: f64, linear: bool) -> (
     } else {
         let theta = (pan + 1.0) * FRAC_PI_4;
         (v * theta.cos(), v * theta.sin())
+    }
+}
+
+// ── biquad lowpass ─────────────────────────────────────────────────────
+
+/// Direct Form I biquad. Used per-voice for Slicex cutoff filtering.
+/// Coeffs are recomputed at ~1/32 of sr by the caller; state is reset
+/// per voice (each note gets its own `Biquad`).
+pub(crate) struct Biquad {
+    x1: f32, x2: f32, y1: f32, y2: f32,
+    b0: f32, b1: f32, b2: f32, a1: f32, a2: f32,
+}
+
+impl Biquad {
+    pub(crate) fn new() -> Self {
+        Self {
+            x1: 0.0, x2: 0.0, y1: 0.0, y2: 0.0,
+            b0: 1.0, b1: 0.0, b2: 0.0, a1: 0.0, a2: 0.0,
+        }
+    }
+
+    /// RBJ cookbook lowpass. `hz` is clamped to [20, 0.49*sr] so the
+    /// bilinear transform stays stable at DC/Nyquist.
+    pub(crate) fn set_lowpass(&mut self, hz: f32, q: f32, sr: f32) {
+        let hz = hz.clamp(20.0, sr * 0.49);
+        let w0 = 2.0 * std::f32::consts::PI * hz / sr;
+        let cw = w0.cos();
+        let alpha = w0.sin() / (2.0 * q);
+        let a0 = 1.0 + alpha;
+        self.b0 = (1.0 - cw) * 0.5 / a0;
+        self.b1 = (1.0 - cw) / a0;
+        self.b2 = self.b0;
+        self.a1 = -2.0 * cw / a0;
+        self.a2 = (1.0 - alpha) / a0;
+    }
+
+    #[inline]
+    pub(crate) fn process(&mut self, x: f32) -> f32 {
+        let y = self.b0 * x
+        + self.b1 * self.x1
+        + self.b2 * self.x2
+        - self.a1 * self.y1
+        - self.a2 * self.y2;
+        self.x2 = self.x1;
+        self.x1 = x;
+        self.y2 = self.y1;
+        self.y1 = y;
+        y
     }
 }
 
@@ -110,7 +157,7 @@ pub(super) fn init_tables() {
 fn dot8(s: &[f32], w: &[f32; SINC_TAPS]) -> f32 {
     let s: &[f32; SINC_TAPS] = s.try_into().unwrap();
     ((s[0] * w[0] + s[4] * w[4]) + (s[1] * w[1] + s[5] * w[5]))
-        + ((s[2] * w[2] + s[6] * w[6]) + (s[3] * w[3] + s[7] * w[7]))
+    + ((s[2] * w[2] + s[6] * w[6]) + (s[3] * w[3] + s[7] * w[7]))
 }
 
 /// Sinc interpolation.  Fast path when the whole 8-sample window lies
@@ -123,11 +170,11 @@ pub(super) fn interpolate(smp: &Sample, pos: f64, _step: f64, raw_pos: f64) -> (
     let hi = lo + SINC_TAPS as i64 - 1;
 
     let clean = lo >= 0
-        && hi < n
-        && match smp.loop_pts {
-            Some((ls, le)) if le > ls => hi < le && !(raw_pos >= le as f64 && lo < ls),
-            _ => true,
-        };
+    && hi < n
+    && match smp.loop_pts {
+        Some((ls, le)) if le > ls => hi < le && !(raw_pos >= le as f64 && lo < ls),
+        _ => true,
+    };
     if clean {
         let frac = pos - center as f64;
         let phase = ((frac * SINC_PHASES as f64) as usize) & (SINC_PHASES - 1);

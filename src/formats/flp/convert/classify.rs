@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 
-use crate::deps::index::PluginIndex;
+use crate::deps::plugins::PluginTable;
 use crate::deps::registry::RegistryTable;
 use crate::formats::flp::fidelity::FIDELITY_FILENAME;
 use crate::formats::flp::model::{self as flp_src, Channel};
@@ -45,7 +45,7 @@ struct Ctx<'a> {
     placed: &'a HashMap<u16, Vec<Placed>>,
     opts: &'a ConvertOptions,
     flp_dir: &'a Path,
-    plugin_index: &'a PluginIndex,
+    plugin_index: &'a PluginTable,
     fallback_table: Option<&'a RegistryTable>,
     tempo: f64,
 }
@@ -104,7 +104,7 @@ pub(super) fn classify_channels<'a>(
     placed: &'a HashMap<u16, Vec<Placed>>,
     opts: &'a ConvertOptions,
     flp_dir: &'a Path,
-    plugin_index: &'a PluginIndex,
+    plugin_index: &'a PluginTable,
     fallback_table: Option<&'a RegistryTable>,
     aux_files: &mut Vec<AuxFile>,
 ) -> Classified<'a> {
@@ -334,6 +334,33 @@ fn try_embedded<'a>(chan: &'a Channel, _cx: &Ctx<'a>, out: &mut Buckets<'a>) -> 
     Some(HandlerOutcome::Done)
 }
 
+/// Warnings are written into exported halotext, so a resolved plugin may
+/// only be described by a path relative to a Circolate search root.
+fn portable_plugin_label(index: &PluginTable, path: &Path) -> Option<String> {
+    index
+    .relative_path(path)
+    .map(|p| p.display().to_string())
+}
+
+/// Portable label for a soundfont search root or source file.  Never let a
+/// machine-specific absolute path reach an exported project.
+fn portable_path_label(path: &Path) -> String {
+    if let Some(root) = crate::paths::repo_root() {
+        if let Ok(rel) = path.strip_prefix(root) {
+            return rel.display().to_string();
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        if let Ok(rel) = path.strip_prefix(home) {
+            return format!("~/{}", rel.display());
+        }
+    }
+    path.file_name()
+    .and_then(|s| s.to_str())
+    .unwrap_or("?")
+    .to_string()
+}
+
 fn try_vst<'a>(chan: &'a Channel, cx: &Ctx<'a>, out: &mut Buckets<'a>) -> HandlerResult {
     if chan.channel_type != "native" {
         return Some(HandlerOutcome::Skipped(format!(
@@ -349,16 +376,21 @@ fn try_vst<'a>(chan: &'a Channel, cx: &Ctx<'a>, out: &mut Buckets<'a>) -> Handle
     let resolved = resolve_plugin(plugin, cx.plugin_index, cx.fallback_table);
     match &resolved {
         Resolved::Exact { name, path } => {
+            let loc = portable_plugin_label(cx.plugin_index, path)
+            .unwrap_or_else(|| name.to_string());
             out.warnings.push(format!(
                 "[{:2}] {}: using installed plugin at {}",
-                chan.iid, name, path.display()));
+                chan.iid, name, loc));
         }
         Resolved::Fallback { name, path, replaces, .. } => {
-            let path_str = path.as_ref().map(|p| p.display().to_string())
-            .unwrap_or_else(|| "<not found>".into());
-            out.warnings.push(format!(
-                "[{:2}] {}: not installed, falling back to {} ({})",
-                                      chan.iid, replaces, name, path_str));
+            match path.as_ref().and_then(|p| portable_plugin_label(cx.plugin_index, p)) {
+                Some(loc) => out.warnings.push(format!(
+                    "[{:2}] {}: not installed, falling back to {} ({})",
+                                          chan.iid, replaces, name, loc)),
+                None => out.warnings.push(format!(
+                    "[{:2}] {}: not installed, falling back to {}",
+                                          chan.iid, replaces, name)),
+            }
         }
         Resolved::Unresolved { name } => {
             out.warnings.push(format!(
@@ -437,7 +469,7 @@ fn handle_sf2(
         p
     } else {
         let roots: Vec<String> = crate::paths::soundfont_roots().iter().map(|p| {
-            format!("  {}{}", p.display(), if p.is_dir() { "" } else { " (missing)" })
+            format!("  {}{}", portable_path_label(p), if p.is_dir() { "" } else { " (missing)" })
         }).collect();
         return Sf2Outcome::Skip(format!(
             "SF2 not found: {}\nsearched:\n{}\nset CIRCOLATE_SOUNDFONT_DIR to override",
@@ -516,7 +548,8 @@ fn write_sf2_sidecar(
             }
             Err(e) => {
                 warnings.push(format!(
-                    "[{:2}] SF2 {} read failed: {:#}", chan.iid, src.display(), e));
+                    "[{:2}] SF2 {} read failed: {:#}",
+                    chan.iid, portable_path_label(src), e));
                 None
             }
         },
@@ -530,7 +563,7 @@ fn write_sf2_sidecar(
     aux_files.push(AuxFile { rel_path: inst_rel.clone(), bytes: inst_text.into_bytes() });
     warnings.push(format!(
         "[{:2}] {}: SF2 {} bank {} patch {}",
-        chan.iid, chan.name, src.display(), bank, preset));
+        chan.iid, chan.name, rel, bank, preset));
     Some(inst_rel)
 }
 
@@ -577,4 +610,33 @@ fn extract_embedded(
          raw_len: found[0].data.len(),
          all_zones,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plugin_warning_labels_are_portable() {
+        let table = PluginTable {
+            vst3: Vec::new(),
+            lv2: Vec::new(),
+            clap: Vec::new(),
+            vst2: Vec::new(),
+            roots: vec![PathBuf::from("/share/circolate/plugins")],
+        };
+
+        assert_eq!(
+            portable_plugin_label(
+                &table,
+                Path::new("/share/circolate/plugins/Surge XT.vst3")
+            )
+            .as_deref(),
+            Some("Surge XT.vst3")
+        );
+        assert_eq!(
+            portable_plugin_label(&table, Path::new("/home/me/.vst3/Surge XT.vst3")),
+            None
+        );
+    }
 }

@@ -2,9 +2,9 @@
 
 use super::*;
 use rayon::prelude::*;
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use crate::hosting::vst::ffi::VstHost;
-use crate::mixer::mute;
 
 /// Output below this peak (about -80 dBFS) counts as silent for tail purposes.
 const TAIL_SILENCE: f32 = 1.0e-4;
@@ -109,6 +109,107 @@ fn render_host(slot: &mut HostSlot, on: bool, n: usize) {
     }
 }
 
+/// Render and mix the native SF2 engines for one chunk.  Kept separate
+/// from VST hosts so the SF2 gain path is easy to inspect in isolation.
+fn mix_sf2_chunk(
+    mixer: &MixerState,
+    sf2_engines: &mut BTreeMap<u16, crate::hosting::sf2::engine::Sf2Engine>,
+    sf2_scratch: &mut BTreeMap<u16, (Vec<f32>, Vec<f32>)>,
+    iid_to_part_path: &BTreeMap<u16, String>,
+    channel_to_insert: &BTreeMap<u16, u8>,
+    insert_chains: &mut BTreeMap<u8, crate::player::inserts::InsertChain>,
+    vst_scratch_l: &mut [f32],
+    vst_scratch_r: &mut [f32],
+    chunk_len: usize,
+) {
+    for (iid, eng) in sf2_engines.iter_mut() {
+        let (sl, sr) = sf2_scratch
+        .entry(*iid)
+        .or_insert_with(|| (vec![0.0; VST_BLOCK as usize], vec![0.0; VST_BLOCK as usize]));
+        if sl.len() < chunk_len {
+            sl.resize(chunk_len, 0.0);
+            sr.resize(chunk_len, 0.0);
+        }
+        sl[..chunk_len].fill(0.0);
+        sr[..chunk_len].fill(0.0);
+        eng.process(&mut sl[..chunk_len], &mut sr[..chunk_len]);
+
+        let gain = part_gain(mixer, *iid, iid_to_part_path);
+        super::super::scope::scope_push_block(*iid as usize, &sl[..chunk_len], &sr[..chunk_len], gain);
+
+        let insert = channel_to_insert.get(iid).copied();
+        match insert.and_then(|ins| insert_chains.get_mut(&ins)) {
+            Some(chain) => super::dsp::mix_add(&mut chain.buf_l[..chunk_len], &mut chain.buf_r[..chunk_len], &sl[..chunk_len], &sr[..chunk_len], gain),
+            None => super::dsp::mix_add(&mut vst_scratch_l[..chunk_len], &mut vst_scratch_r[..chunk_len], &sl[..chunk_len], &sr[..chunk_len], gain),
+        }
+    }
+}
+
+/// Process insert chains and write the chunk into the caller's output.
+fn mix_inserts_chunk(
+    insert_chains: &mut BTreeMap<u8, crate::player::inserts::InsertChain>,
+    vst_scratch_l: &mut [f32],
+    vst_scratch_r: &mut [f32],
+    out_l: &mut [f32],
+    out_r: &mut [f32],
+    chunk_len: usize,
+    out_off: usize,
+) {
+    let n_chains = insert_chains.values().filter(|c| !c.is_empty()).count();
+    if n_chains >= 2 {
+        audio_pool().install(|| {
+            insert_chains.values_mut().par_bridge().for_each(|chain| {
+                if !chain.is_empty() {
+                    chain.process_scratch(chunk_len);
+                }
+            });
+        });
+    } else {
+        for chain in insert_chains.values_mut() {
+            if !chain.is_empty() {
+                chain.process_scratch(chunk_len);
+            }
+        }
+    }
+    for chain in insert_chains.values() {
+        if chain.is_empty() {
+            continue;
+        }
+        super::dsp::mix_add(&mut vst_scratch_l[..chunk_len], &mut vst_scratch_r[..chunk_len], &chain.buf_l[..chunk_len], &chain.buf_r[..chunk_len], 1.0);
+    }
+    super::dsp::mix_add(&mut out_l[out_off..out_off + chunk_len], &mut out_r[out_off..out_off + chunk_len], &vst_scratch_l[..chunk_len], &vst_scratch_r[..chunk_len], 1.0);
+}
+
+/// Append one chunk to the ring buffer used by `render_vsts_history`.
+fn update_history(
+    hist_l: &mut [f32],
+    hist_r: &mut [f32],
+    scratch_l: &[f32],
+    scratch_r: &[f32],
+    chunk_start: i64,
+    chunk_len: usize,
+) {
+    let hlen = hist_l.len();
+    if hlen == 0 { return; }
+    if chunk_len <= hlen {
+        let start = chunk_start.rem_euclid(hlen as i64) as usize;
+        let first = chunk_len.min(hlen - start);
+        hist_l[start..start + first].copy_from_slice(&scratch_l[..first]);
+        hist_r[start..start + first].copy_from_slice(&scratch_r[..first]);
+        if first < chunk_len {
+            let rest = chunk_len - first;
+            hist_l[..rest].copy_from_slice(&scratch_l[first..chunk_len]);
+            hist_r[..rest].copy_from_slice(&scratch_r[first..chunk_len]);
+        }
+    } else {
+        for j in 0..chunk_len {
+            let idx = (chunk_start + j as i64).rem_euclid(hlen as i64) as usize;
+            hist_l[idx] = scratch_l[j];
+            hist_r[idx] = scratch_r[j];
+        }
+    }
+}
+
 impl Engine {
     pub(crate) fn panic_hosts(&mut self) {
         for (iid, mask) in self.vst_held.iter_mut() {
@@ -151,6 +252,7 @@ impl Engine {
         let block_end = block_start + block_len;
 
         let Self {
+            mixer,
             hosts,
             iid_to_host_idx,
             vst_gains,
@@ -186,7 +288,7 @@ impl Engine {
             // 1. Pull pending events
             while vst_pending.front().map_or(false, |n| n.start < chunk_end) {
                 let n = vst_pending.pop_front().unwrap();
-                if !mute::is_note_active(&n.part_path, n.line as usize, n.source_row as i64) {
+                if !mixer.is_note_active(&n.part_path, n.line as usize, n.source_row as i64) {
                     continue;
                 }
                 let off = (n.start - chunk_start).max(0) as i32;
@@ -291,10 +393,7 @@ impl Engine {
                 }
                 let rendered = render_flags[idx];
                 let host_gain = vst_gains.get(&slot.iid).copied().unwrap_or(1.0);
-                let part_scale = iid_to_part_path
-                .get(&slot.iid)
-                .map(|p| crate::mixer::part_volume::get(p) as f32)
-                .unwrap_or(1.0);
+                let part_scale = part_gain(mixer, slot.iid, iid_to_part_path);
                 let gain = host_gain * part_scale;
 
                 super::super::scope::scope_push_block(
@@ -325,84 +424,37 @@ impl Engine {
             }
 
             // 7. SF2 engines (sequential)
-            for (iid, eng) in sf2_engines.iter_mut() {
-                let (sl, sr) = sf2_scratch
-                .entry(*iid)
-                .or_insert_with(|| (vec![0.0; VST_BLOCK as usize], vec![0.0; VST_BLOCK as usize]));
-                if sl.len() < chunk_len {
-                    sl.resize(chunk_len, 0.0);
-                    sr.resize(chunk_len, 0.0);
-                }
-                sl[..chunk_len].fill(0.0);
-                sr[..chunk_len].fill(0.0);
-                eng.process(&mut sl[..chunk_len], &mut sr[..chunk_len]);
+            mix_sf2_chunk(
+                mixer,
+                sf2_engines,
+                sf2_scratch,
+                iid_to_part_path,
+                channel_to_insert,
+                insert_chains,
+                &mut vst_scratch_l[..chunk_len],
+                &mut vst_scratch_r[..chunk_len],
+                chunk_len,
+            );
 
-                let part_scale = iid_to_part_path
-                .get(iid)
-                .map(|p| crate::mixer::part_volume::get(p) as f32)
-                .unwrap_or(1.0);
-                super::super::scope::scope_push_block(
-                    *iid as usize,
-                    &sl[..chunk_len],
-                    &sr[..chunk_len],
-                    part_scale,
-                );
-
-                let insert = channel_to_insert.get(iid).copied();
-                match insert.and_then(|ins| insert_chains.get_mut(&ins)) {
-                    Some(chain) => super::dsp::mix_add(&mut chain.buf_l[..chunk_len], &mut chain.buf_r[..chunk_len], &sl[..chunk_len], &sr[..chunk_len], part_scale),
-                    None => super::dsp::mix_add(&mut vst_scratch_l[..chunk_len], &mut vst_scratch_r[..chunk_len], &sl[..chunk_len], &sr[..chunk_len], part_scale),
-                }
-            }
-
-            // 8. Insert chains: parallel across chains, then sequential mix-down
-            let n_chains = insert_chains.values().filter(|c| !c.is_empty()).count();
-            if n_chains >= 2 {
-                audio_pool().install(|| {
-                    insert_chains.values_mut().par_bridge().for_each(|chain| {
-                        if !chain.is_empty() {
-                            chain.process_scratch(chunk_len);
-                        }
-                    });
-                });
-            } else {
-                for chain in insert_chains.values_mut() {
-                    if !chain.is_empty() {
-                        chain.process_scratch(chunk_len);
-                    }
-                }
-            }
-            for chain in insert_chains.values() {
-                if chain.is_empty() {
-                    continue;
-                }
-                super::dsp::mix_add(&mut vst_scratch_l[..chunk_len], &mut vst_scratch_r[..chunk_len], &chain.buf_l[..chunk_len], &chain.buf_r[..chunk_len], 1.0);
-            }
-
+            // 8. Insert chains, output mix, and history ring.
             let out_off = (chunk_start - block_start) as usize;
-            super::dsp::mix_add(&mut out_l[out_off..out_off + chunk_len], &mut out_r[out_off..out_off + chunk_len], &vst_scratch_l[..chunk_len], &vst_scratch_r[..chunk_len], 1.0);
-
-            // History ring: block copies instead of a per-sample modulo.
-            let hlen = vst_hist_l.len();
-            if hlen > 0 {
-                if chunk_len <= hlen {
-                    let start = chunk_start.rem_euclid(hlen as i64) as usize;
-                    let first = chunk_len.min(hlen - start);
-                    vst_hist_l[start..start + first].copy_from_slice(&vst_scratch_l[..first]);
-                    vst_hist_r[start..start + first].copy_from_slice(&vst_scratch_r[..first]);
-                    if first < chunk_len {
-                        let rest = chunk_len - first;
-                        vst_hist_l[..rest].copy_from_slice(&vst_scratch_l[first..chunk_len]);
-                        vst_hist_r[..rest].copy_from_slice(&vst_scratch_r[first..chunk_len]);
-                    }
-                } else {
-                    for j in 0..chunk_len {
-                        let idx = (chunk_start + j as i64).rem_euclid(hlen as i64) as usize;
-                        vst_hist_l[idx] = vst_scratch_l[j];
-                        vst_hist_r[idx] = vst_scratch_r[j];
-                    }
-                }
-            }
+            mix_inserts_chunk(
+                insert_chains,
+                &mut vst_scratch_l[..chunk_len],
+                &mut vst_scratch_r[..chunk_len],
+                out_l,
+                out_r,
+                chunk_len,
+                out_off,
+            );
+            update_history(
+                vst_hist_l,
+                vst_hist_r,
+                &vst_scratch_l[..chunk_len],
+                &vst_scratch_r[..chunk_len],
+                chunk_start,
+                chunk_len,
+            );
 
             chunk_start = chunk_end;
         }

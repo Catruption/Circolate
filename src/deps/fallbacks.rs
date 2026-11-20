@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::deps::index::PluginIndex;
+use crate::deps::plugins::PluginTable;
 use crate::deps::inventory::PluginInventory;
 use crate::deps::registry::schema::{Mapping, MasterEntry, MissingPolicy, SearchPaths};
 
@@ -116,7 +116,7 @@ impl FallbacksTable {
     pub fn pick(
         &self,
         name: &str,
-        index: &PluginIndex,
+        index: &PluginTable,
         inventory: &PluginInventory,
     ) -> Option<PickedFallback> {
         let specific = self
@@ -151,7 +151,7 @@ impl FallbacksTable {
     fn try_chain(
         &self,
         candidates: &[FallbackCandidate],
-        index: &PluginIndex,
+        index: &PluginTable,
         inventory: &PluginInventory,
         via_default: bool,
     ) -> Option<PickedFallback> {

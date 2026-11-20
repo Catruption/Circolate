@@ -1,6 +1,7 @@
 //! The heavy lifting for loading a project from an AssetSource.
 
 use anyhow::{bail, Context, Result};
+use rayon::prelude::*;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -8,7 +9,7 @@ use std::sync::Arc;
 
 use crate::asset::{AssetSource, DirSource, ENTRY_KEY};
 use crate::formats::common::audio::decode_audio;
-use crate::deps::index::PluginIndex;
+use crate::deps::plugins::PluginTable;
 use crate::formats::flp::fidelity::{Fidelity, FIDELITY_FILENAME};
 use crate::deps::requires::{self, Requires};
 use crate::formats::halotext::parse::parse_str;
@@ -32,6 +33,28 @@ const VST_TRIM: f32 = 0.6;
 const FALLBACK_VST_TRIM: f32 = 0.7;
 
 const PATCH_IID_BASE: u16 = 20_000;
+
+/// Resolve a VST reference written in a sidecar.  Packaged bundles win
+/// so a shared archive can point at its own `plugins/` copy; otherwise
+/// the same Circolate search roots used for every other asset decide.
+/// `reference` may be a canonical name or a portable relative path —
+/// absolute paths are never accepted by `PluginTable`.
+fn resolve_vst_reference(
+    reference: &str,
+    embedded: &HashMap<String, PathBuf>,
+) -> Option<PathBuf> {
+    let lookup = if crate::deps::plugins::looks_like_bundle_path(reference) {
+        Path::new(reference)
+            .file_stem().and_then(|s| s.to_str()).unwrap_or(reference)
+    } else {
+        reference
+    };
+
+    if let Some(p) = embedded.get(lookup).filter(|p| p.exists()) {
+        return Some(p.clone());
+    }
+    PluginTable::get().resolve_reference(reference)
+}
 
 fn is_chip_playable_part(sample_path: &str) -> bool {
     sample_path.to_lowercase().contains("vgm") || sample_path.ends_with(".patch")
@@ -101,7 +124,11 @@ struct SidecarEnvelopesJson {
 struct EnvJson {
     points: Vec<SidecarPointJson>,
     amount: f64,
+    #[serde(default = "default_env_marker")] sustain: i32,
+    #[serde(default = "default_env_marker")] release: i32,
 }
+
+fn default_env_marker() -> i32 { -1 }
 
 #[derive(Deserialize)]
 struct SidecarPointJson {
@@ -126,6 +153,7 @@ fn parse_slicex_sidecar(
     let amp_env   = doc.envelopes.amp.as_ref().map(to_points);
     let speed_env = doc.envelopes.speed.as_ref().map(to_points);
     let cut_env   = doc.envelopes.cut.as_ref().map(to_points);
+    let lfo_env   = doc.envelopes.lfo.as_ref().map(to_points);
 
     Some(SlicexInstrument {
         sample,
@@ -135,8 +163,11 @@ fn parse_slicex_sidecar(
              pan: s.pan, atten: s.atten, cutoff: s.cut,
          }).collect(),
          amp_env,
+         amp_sustain_index: doc.envelopes.amp.as_ref().map_or(-1, |e| e.sustain),
+         amp_release_index: doc.envelopes.amp.as_ref().map_or(-1, |e| e.release),
          speed_env,
          cut_env,
+         lfo_env,
          amp_amt:   doc.envelopes.amp.as_ref().map_or(1.0, |e| e.amount),
          speed_amt: doc.envelopes.speed.as_ref().map_or(1.0, |e| e.amount),
          cut_amt:   doc.envelopes.cut.as_ref().map_or(1.0, |e| e.amount),
@@ -235,7 +266,7 @@ pub(crate) fn load_project_from_source(
     let mut vgm_instruments: HashMap<String, Arc<VgmInstrument>> = HashMap::new();
     let mut slicex_instruments: HashMap<String, Arc<SlicexInstrument>> = HashMap::new();
 
-    // ── Load Slicex sidecars (independent of .instrument sidecars) ──
+    // ── Load Slicex sidecars ──
     for entry in source.list("instruments", Some("slicex")) {
         let rel = if entry.starts_with("instruments/") || entry.starts_with("./instruments/") {
             entry.trim_start_matches("./").to_string()
@@ -251,8 +282,159 @@ pub(crate) fn load_project_from_source(
     }
 
     let mut vst_aliases: Vec<(String, String)> = Vec::new();
+    let mut resolution_report = Vec::new();
     let mut next_sf2_id: u32 = 10_000;
-    let mut vst_index: Option<PluginIndex> = None;
+
+    // ── Load Instrument Sidecars (Parallelized) ──
+    let instrument_entries: Vec<String> = source.list("instruments", Some("instrument"));
+    let loaded_instruments: Vec<(String, crate::deps::instruments::Instrument)> = instrument_entries
+    .into_par_iter()
+    .filter_map(|entry| {
+        let rel = if entry.starts_with("instruments/") || entry.starts_with("./instruments/") {
+            entry.trim_start_matches("./").to_string()
+        } else {
+            format!("instruments/{}", entry)
+        };
+        let text = source.read_text(&rel).ok()??;
+        let inst = crate::deps::instruments::parse(&text, &rel).ok()?;
+        Some((rel, inst))
+    })
+    .collect();
+
+    for (rel, inst) in loaded_instruments {
+        let stem = rel.rsplit('/').next()
+        .and_then(|n| n.strip_suffix(".instrument")).unwrap_or("instrument");
+        let sidecar_rel = format!("instruments/{}.instrument", stem);
+
+        if inst.is_sf2() {
+            let sf2_rel = inst.sf2_path.to_string_lossy().trim_start_matches("./").to_string();
+            let Some(sf2_bytes) = source.read_bytes(&sf2_rel)? else {
+                resolution_report.push(super::Resolution {
+                    part: inst.name.clone(), kind: "sf2", name: sf2_rel,
+                    status: "missing", reason: Some("file absent from source".into()),
+                    fallback: inst.fallback,
+                });
+                continue;
+            };
+            let sf2_on_disk = match materialize_sf2_file(source, &sf2_rel) {
+                Ok(Some(p)) => p,
+                _ => {
+                    resolution_report.push(super::Resolution {
+                        part: inst.name.clone(), kind: "sf2", name: sf2_rel,
+                        status: "missing", reason: Some("could not materialize file".into()),
+                        fallback: inst.fallback,
+                    });
+                    continue;
+                }
+            };
+            resolution_report.push(super::Resolution {
+                part: inst.name.clone(), kind: "sf2", name: sf2_rel,
+                status: "resolved", reason: None, fallback: inst.fallback,
+            });
+
+            if let Ok(obj) = build_sf2_instrument(
+                &sf2_bytes, inst.sf2_bank as u16, inst.sf2_preset as u16,
+                next_sf2_id, &mut samples,
+                if inst.slicex {
+                    Some(Sf2InstrumentOverrides {
+                        pan: inst.slicex_pan as f64,
+                        gain: inst.slicex_gain,
+                        tune_cents: inst.slicex_tune_cents,
+                        env: Sf2VoiceEnvelope {
+                            peak: 1.0,
+                            delay_sec: inst.slicex_delay_sec,
+                            attack_sec: inst.slicex_attack_sec,
+                            hold_sec: inst.slicex_hold_sec,
+                            decay_sec: inst.slicex_decay_sec,
+                            sustain_fraction: inst.slicex_sustain_fraction,
+                            release_sec: inst.slicex_release_sec,
+                        },
+                    })
+                } else { None },
+            ) {
+                next_sf2_id += obj.zone_count_hint() + 1;
+                sf2_instruments.insert(sidecar_rel.clone(), Arc::new(obj));
+            }
+
+            sf2_engine_specs.insert(
+                sidecar_rel,
+                Sf2EngineSpec {
+                    sf2_path: sf2_on_disk,
+                    bank: inst.sf2_bank as u8, preset: inst.sf2_preset as u8,
+                    gain: inst.gain * if inst.slicex { inst.slicex_gain } else { 1.0 },
+                    iid: inst.source_channel,
+                },
+            );
+        } else if inst.is_vst3() {
+            if inst.unresolved {
+                resolution_report.push(super::Resolution {
+                    part: inst.name.clone(), kind: "vst", name: inst.plugin.clone(),
+                    status: "missing", reason: Some("sidecar marked unresolved".into()),
+                    fallback: inst.fallback,
+                });
+                continue;
+            }
+
+            // Embedded bundle first, then the same Circolate search
+            // roots used by the converter and `plugins --explain`.
+            // Any `Path:` recorded in an old sidecar was discarded at
+            // parse time: it is a machine path, not a location.
+            let plugin_path = resolve_vst_reference(&inst.plugin, &embedded_plugins);
+
+            let Some(plugin_path) = plugin_path else {
+                resolution_report.push(super::Resolution {
+                    part: inst.name.clone(), kind: "vst", name: inst.plugin.clone(),
+                    status: "missing",
+                    reason: Some("not embedded and no installed VST3 with that name".into()),
+                    fallback: inst.fallback,
+                });
+                continue;
+            };
+            resolution_report.push(super::Resolution {
+                part: inst.name.clone(), kind: "vst", name: inst.plugin.clone(),
+                status: "resolved", reason: None, fallback: inst.fallback,
+            });
+
+            let mut state_bytes = if inst.state_path.as_os_str().is_empty() {
+                Vec::new()
+            } else {
+                let name = inst.state_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                let state_rel = format!("instruments/{}", name);
+                source.read_bytes(&state_rel)?.unwrap_or_default()
+            };
+
+            if inst.plugin == "SFLT" && !state_bytes.is_empty() {
+                let _ = materialize_sf2_reference(source, &mut state_bytes);
+            }
+
+            vst_aliases.push((sidecar_rel.clone(), inst.plugin.clone()));
+
+            vst_instruments.insert(
+                sidecar_rel,
+                Arc::new(VstInstrument {
+                    iid: inst.source_channel,
+                    name: inst.plugin.clone(),
+                         plugin_path, state_bytes,
+                         fallback: inst.fallback,
+                         gain: inst.gain * VST_TRIM * if inst.fallback { FALLBACK_VST_TRIM } else { 1.0 },
+                }),
+            );
+        }
+    }
+
+    for (sidecar, plugin) in vst_aliases {
+        let Some(arc) = vst_instruments.get(&sidecar).cloned() else { continue };
+        if let Some(stem) = Path::new(&sidecar).file_stem().and_then(|s| s.to_str()) {
+            vst_instruments
+            .entry(format!("{}.vst3", stem))
+            .or_insert_with(|| arc.clone());
+        }
+        if !plugin.is_empty() {
+            vst_instruments
+            .entry(format!("{}.vst3", plugin))
+            .or_insert_with(|| arc.clone());
+        }
+    }
 
     let has_patch_parts = parsed.parts.values()
     .any(|p| p.sample_path.ends_with(".patch"));
@@ -315,115 +497,6 @@ pub(crate) fn load_project_from_source(
                   patch_instruments.len(), psg_n, fm_n);
     }
 
-    for entry in source.list("instruments", Some("instrument")) {
-        let rel = if entry.starts_with("instruments/") || entry.starts_with("./instruments/") {
-            entry.trim_start_matches("./").to_string()
-        } else {
-            format!("instruments/{}", entry)
-        };
-        let Some(text) = source.read_text(&rel)? else { continue };
-        let Ok(inst) = crate::deps::instruments::parse(&text, &rel) else { continue };
-        let stem = rel.rsplit('/').next()
-        .and_then(|n| n.strip_suffix(".instrument")).unwrap_or("instrument");
-        let sidecar_rel = format!("instruments/{}.instrument", stem);
-
-        if inst.is_sf2() {
-            let sf2_rel = inst.sf2_path.to_string_lossy().trim_start_matches("./").to_string();
-            let Some(sf2_bytes) = source.read_bytes(&sf2_rel)? else { continue };
-            let sf2_on_disk = match materialize_sf2_file(source, &sf2_rel) {
-                Ok(Some(p)) => p,
-                _ => continue,
-            };
-
-            if let Ok(obj) = build_sf2_instrument(
-                &sf2_bytes, inst.sf2_bank as u16, inst.sf2_preset as u16,
-                next_sf2_id, &mut samples,
-                if inst.slicex {
-                    Some(Sf2InstrumentOverrides {
-                        pan: inst.slicex_pan as f64,
-                        gain: inst.slicex_gain,
-                        tune_cents: inst.slicex_tune_cents,
-                        env: Sf2VoiceEnvelope {
-                            peak: 1.0,
-                            delay_sec: inst.slicex_delay_sec,
-                            attack_sec: inst.slicex_attack_sec,
-                            hold_sec: inst.slicex_hold_sec,
-                            decay_sec: inst.slicex_decay_sec,
-                            sustain_fraction: inst.slicex_sustain_fraction,
-                            release_sec: inst.slicex_release_sec,
-                        },
-                    })
-                } else { None },
-            ) {
-                next_sf2_id += obj.zone_count_hint() + 1;
-                sf2_instruments.insert(sidecar_rel.clone(), Arc::new(obj));
-            }
-
-            sf2_engine_specs.insert(
-                sidecar_rel,
-                Sf2EngineSpec {
-                    sf2_path: sf2_on_disk,
-                    bank: inst.sf2_bank as u8, preset: inst.sf2_preset as u8,
-                    gain: inst.gain * if inst.slicex { inst.slicex_gain } else { 1.0 },
-                    iid: inst.source_channel,
-                },
-            );
-        } else if inst.is_vst3() {
-            if inst.unresolved { continue; }
-
-            let plugin_path = embedded_plugins.get(&inst.plugin).cloned().filter(|p| p.exists())
-            .or_else(|| {
-                let r = PathBuf::from(&inst.vst_path);
-                if r.exists() { Some(r) } else { None }
-            })
-            .or_else(|| {
-                let idx = vst_index.get_or_insert_with(PluginIndex::scan);
-                idx.find_vst3(&inst.plugin).cloned()
-            });
-
-            let Some(plugin_path) = plugin_path else { continue };
-
-            let mut state_bytes = if inst.state_path.as_os_str().is_empty() {
-                Vec::new()
-            } else {
-                let name = inst.state_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                let state_rel = format!("instruments/{}", name);
-                source.read_bytes(&state_rel)?.unwrap_or_default()
-            };
-
-            if inst.plugin == "SFLT" && !state_bytes.is_empty() {
-                let _ = materialize_sf2_reference(source, &mut state_bytes);
-            }
-
-            vst_aliases.push((sidecar_rel.clone(), inst.plugin.clone()));
-
-            vst_instruments.insert(
-                sidecar_rel,
-                Arc::new(VstInstrument {
-                    iid: inst.source_channel,
-                    name: inst.plugin.clone(),
-                         plugin_path, state_bytes,
-                         fallback: inst.fallback,
-                         gain: inst.gain * VST_TRIM * if inst.fallback { FALLBACK_VST_TRIM } else { 1.0 },
-                }),
-            );
-        }
-    }
-
-    for (sidecar, plugin) in vst_aliases {
-        let Some(arc) = vst_instruments.get(&sidecar).cloned() else { continue };
-        if let Some(stem) = Path::new(&sidecar).file_stem().and_then(|s| s.to_str()) {
-            vst_instruments
-            .entry(format!("{}.vst3", stem))
-            .or_insert_with(|| arc.clone());
-        }
-        if !plugin.is_empty() {
-            vst_instruments
-            .entry(format!("{}.vst3", plugin))
-            .or_insert_with(|| arc.clone());
-        }
-    }
-
     // ── VST migration ────────────────────────────────────────────────
     let mut vst_keys_needed = HashSet::new();
     for part in parsed.parts.values() {
@@ -439,33 +512,44 @@ pub(crate) fn load_project_from_source(
         let direct_name = Path::new(&key)
         .file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
 
-        let direct = embedded_plugins.get(&direct_name).cloned().filter(|p| p.exists())
-        .or_else(|| {
-            let idx = vst_index.get_or_insert_with(PluginIndex::scan);
-            idx.find_vst3(&direct_name).cloned()
-        });
+        let direct = resolve_vst_reference(&direct_name, &embedded_plugins);
 
         let (plugin_name, plugin_path, gain_mult, is_fallback) = if let Some(path) = direct {
+            resolution_report.push(super::Resolution {
+                part: key.clone(), kind: "vst", name: direct_name.clone(),
+                status: "resolved", reason: None, fallback: false,
+            });
             (direct_name.clone(), path, 1.0f32, false)
         } else if let Some(spec) = parsed.fallbacks.get(&key) {
             let use_name = Path::new(&spec.use_)
             .file_stem().and_then(|s| s.to_str()).unwrap_or(&spec.use_).to_string();
 
-            let path = embedded_plugins.get(&use_name).cloned().filter(|p| p.exists())
-            .or_else(|| {
-                let idx = vst_index.get_or_insert_with(PluginIndex::scan);
-                idx.find_vst3(&use_name).cloned()
-            });
+            let path = resolve_vst_reference(&use_name, &embedded_plugins);
 
             let Some(path) = path else {
                 crate::log_event!("player.vst.unresolved_fallback", key: key.clone(), plugin: use_name.clone());
+                resolution_report.push(super::Resolution {
+                    part: key.clone(), kind: "vst", name: use_name.clone(),
+                    status: "missing", reason: Some("fallback plugin not installed".into()),
+                    fallback: true,
+                });
                 continue;
             };
 
+            resolution_report.push(super::Resolution {
+                part: key.clone(), kind: "vst", name: use_name.clone(),
+                status: "resolved", reason: Some(format!("fallback for {key}")),
+                fallback: true,
+            });
             let g = spec.gain.unwrap_or(1.0) as f32;
             (use_name, path, g, true)
         } else {
             crate::log_event!("player.vst.unresolved", key: key.clone());
+            resolution_report.push(super::Resolution {
+                part: key.clone(), kind: "vst", name: direct_name,
+                status: "missing", reason: Some("no installed plugin or fallback".into()),
+                fallback: false,
+            });
             continue;
         };
 
@@ -497,7 +581,6 @@ pub(crate) fn load_project_from_source(
         }
         vst_instruments.insert(direct_name.clone(), inst);
     }
-
     // ── SF2 migration ────────────────────────────────────────────────
     let mut sf2_keys_needed: HashSet<(String, i16, i16)> = HashSet::new();
     for part in parsed.parts.values() {
@@ -772,7 +855,7 @@ pub(crate) fn load_project_from_source(
         linear_pan: cfg.panning_law == "linear", sample_rate, title,
         stereo_width: cfg.stereo_width,
         initial_bpm: cfg.bpm, time_signature: cfg.time_signature,
-        voice_count: total_voices, source_dir, cover_path, fidelity, requires,
+        voice_count: total_voices, resolution_report, source_dir, cover_path, fidelity, requires,
         shims, lyrics, chains, channel_to_insert,
         note_rows_cache: std::sync::OnceLock::new(),
     };

@@ -39,7 +39,9 @@ const PERF_POLL_MS: u128 = 1000;
 pub enum LoopOutcome {
     Quit,
     Home,
-    Next(String),
+    /// Load another track.  `flags` are the arguments chosen in the idle
+    /// menu for PLAY; normal queue advancement supplies none.
+    Next { path: String, flags: Vec<String> },
 }
 
 macro_rules! tui_dbg {
@@ -84,7 +86,13 @@ pub fn setup() -> Result<Terminal<TuiBackend>> {
     if std::env::var_os("CIRCOLATE_QUIET").is_none() {
         let mut f = (*crate::log::filter()).clone();
         let mut changed = false;
-        for cat in [crate::log::Category::Tui, crate::log::Category::Player] {
+        for cat in [
+            crate::log::Category::Tui,
+            crate::log::Category::Player,
+            // Menu actions run CLI helpers that report through Deps; show
+            // their structured events in the idle log panel.
+            crate::log::Category::Deps,
+        ] {
             if f.get(cat) < crate::log::Level::Info {
                 f.set(cat, crate::log::Level::Info);
                 changed = true;
@@ -179,6 +187,13 @@ fn event_loop(
     let mut seen_wraps = tp.loop_wraps.load(Ordering::Acquire);
 
     loop {
+        // Background menu actions report through a slot so completion text
+        // is shown on the next frame instead of being written to the TUI.
+        if let Ok(mut slot) = state.menu.status_slot.lock() {
+            if let Some(message) = slot.take() {
+                state.menu.status = Some(message);
+            }
+        }
         let frame_started = std::time::Instant::now();
         let draw_started = std::time::Instant::now();
         term.draw(|f| views::draw(f, tp, project, sample_rate, state))?;
@@ -225,22 +240,11 @@ fn event_loop(
         // ──────────────────────────────────
 
         // ── PERF POLL (once per second) ──
+        // Feeds the on-demand perf widget only; logging this every second
+        // would drown the idle log panel with numbers nobody reads.
         let perf_now = std::time::Instant::now();
         if perf_now.duration_since(state.perf_last_poll).as_millis() >= PERF_POLL_MS {
-            let snap = crate::player::perf::perf_snapshot();
-            crate::log_event!(
-                "player.perf",
-                load: format!("{:.3}", snap.load),
-                              worst: format!("{:.3}", snap.worst),
-                              overruns: snap.overruns,
-                              voices: format!("{:.3}", snap.voices),
-                              vst: format!("{:.3}", snap.vst),
-                              shim: format!("{:.3}", snap.shim),
-                              fx: format!("{:.3}", snap.fx),
-                              ui_draw_ms: format!("{:.3}", snap.ui_avg_ms),
-                              ui_draw_worst_ms: format!("{:.3}", snap.ui_worst_ms),
-            );
-            state.perf_snapshot = Some(snap);
+            state.perf_snapshot = Some(crate::player::perf::perf_snapshot());
             state.perf_last_poll = perf_now;
         }
         // ────────────────────────────────
@@ -254,7 +258,7 @@ fn event_loop(
 
         if state.play_request.is_some() {
             let req = state.play_request.take().unwrap();
-            return Ok(LoopOutcome::Next(req));
+            return Ok(LoopOutcome::Next { path: req, flags: Vec::new() });
         }
 
         let speed = tp.speed.load(Ordering::Relaxed);
@@ -276,7 +280,7 @@ fn event_loop(
                         tp.seek_to.store(0, Ordering::Release);
                     }
                     Some(next) => {
-                        return Ok(LoopOutcome::Next(next));
+                        return Ok(LoopOutcome::Next { path: next, flags: Vec::new() });
                     }
                     None => stop_at_start(tp),
                 }
@@ -296,7 +300,12 @@ fn event_loop(
                         && k.modifiers.contains(KeyModifiers::CONTROL);
 
                         // ── ANALYSIS MODAL ──
-                        if k.kind != KeyEventKind::Release {
+                        // While editing a path, every character belongs to
+                        // the editor.  In particular `a` must not open the
+                        // analysis overlay and swallow part of the path.
+                        if k.kind != KeyEventKind::Release
+                        && state.menu.edit_mode.is_none()
+                        {
                             if state.player.show_analysis {
                                 if k.code == KeyCode::Esc
                                     || k.code == KeyCode::Char('A')
@@ -328,12 +337,57 @@ fn event_loop(
                                 }
 
                                 if k.kind == KeyEventKind::Press {
-                                    if let Some(edit_idx) = state.menu.edit_mode {
+                                    if state.menu.edit_mode.is_some() {
                                         match k.code {
-                                            KeyCode::Esc => state.menu.edit_mode = None,
-                                            KeyCode::Enter => state.menu.edit_mode = None,
-                                            KeyCode::Char(c) => state.menu.directories[edit_idx].push(c),
-                                            KeyCode::Backspace => { state.menu.directories[edit_idx].pop(); },
+                                            KeyCode::Esc | KeyCode::Enter => {
+                                                let edit_idx = state.menu.edit_mode.unwrap();
+                                                let value = state.menu.directories[edit_idx].trim().to_string();
+                                                if state.menu.edit_is_new && value.is_empty() {
+                                                    state.menu.directories.pop();
+                                                    state.menu.directory_kinds.pop();
+                                                } else {
+                                                    state.menu.directories[edit_idx] = value;
+                                                    match state.menu.save_directories() {
+                                                        Ok(()) => {
+                                                            state.menu.status = Some("user root saved".into());
+                                                            crate::log_event!("tui.menu.directories_saved");
+                                                        }
+                                                        Err(e) => {
+                                                            state.menu.status = Some(format!("save failed: {e:#}"));
+                                                            crate::log_event!("tui.menu.directories_failed", err: format!("{:#}", e));
+                                                        }
+                                                    }
+                                                }
+                                                state.menu.finish_edit();
+                                                state.queue.focused = false;
+                                            }
+                                            KeyCode::Up => state.menu.move_edit_row(-1),
+                                            KeyCode::Down => state.menu.move_edit_row(1),
+                                            KeyCode::Left => state.menu.move_edit_cursor(-1),
+                                            KeyCode::Right => state.menu.move_edit_cursor(1),
+                                            KeyCode::Home => state.menu.edit_home(),
+                                            KeyCode::End => state.menu.edit_end(),
+                                            KeyCode::Char(c) => state.menu.insert_edit_char(c),
+                                            KeyCode::Backspace => state.menu.backspace_edit(),
+                                            KeyCode::Delete => state.menu.delete_edit(),
+                                            _ => {}
+                                        }
+                                    } else if state.menu.submenu.is_some() {
+                                        match k.code {
+                                            KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('q') => {
+                                                state.menu.close_submenu();
+                                                state.menu.status = None;
+                                            }
+                                            KeyCode::Enter => {
+                                                state.menu.begin_edit(0, false);
+                                                state.queue.focused = false;
+                                            }
+                                            KeyCode::PageDown | KeyCode::Char(']') => {
+                                                state.menu.system_scroll = state.menu.system_scroll.saturating_add(1);
+                                            }
+                                            KeyCode::PageUp | KeyCode::Char('[') => {
+                                                state.menu.system_scroll = state.menu.system_scroll.saturating_sub(1);
+                                            }
                                             _ => {}
                                         }
                                     } else {
@@ -343,32 +397,52 @@ fn event_loop(
                                                 if state.menu.selected_index > 0 { state.menu.selected_index -= 1; }
                                             }
                                             KeyCode::Down => {
-                                                if state.menu.selected_index < 3 { state.menu.selected_index += 1; }
+                                                if state.menu.selected_index + 1 < crate::tui::state::MENU_ITEMS {
+                                                    state.menu.selected_index += 1;
+                                                }
+                                            }
+                                            KeyCode::Left => state.menu.cycle_arg(state.menu.selected_index, -1),
+                                            KeyCode::Right => state.menu.cycle_arg(state.menu.selected_index, 1),
+                                            KeyCode::Char('r') => {
+                                                state.menu.reload_directories();
+                                                state.menu.status = Some("user root reloaded".into());
+                                            }
+                                            KeyCode::PageDown | KeyCode::Char(']') => {
+                                                state.menu.system_scroll = state.menu.system_scroll.saturating_add(1);
+                                            }
+                                            KeyCode::PageUp | KeyCode::Char('[') => {
+                                                state.menu.system_scroll = state.menu.system_scroll.saturating_sub(1);
                                             }
                                             KeyCode::Enter => {
                                                 match state.menu.selected_index {
                                                     0 => {
                                                         if let Some(p) = crate::cli::pick::pick_file(
                                                             &crate::paths::user_halotexts(),
-                                                                                                crate::cli::pick::FILTER_HALOTEXT,
-                                                                                                "Open Halotext",
+                                                            crate::cli::pick::FILTER_HALOTEXT,
+                                                            "Open Halotext",
                                                         ) {
-                                                            return Ok(LoopOutcome::Next(p.to_string_lossy().into_owned()));
+                                                            let flags = state.menu.selected_flags(0);
+                                                            return Ok(LoopOutcome::Next {
+                                                                path: p.to_string_lossy().into_owned(),
+                                                                flags,
+                                                            });
                                                         }
                                                     }
                                                     1 => {
                                                         if let Some(p) = crate::cli::pick::pick_file(
                                                             &crate::paths::user_halotexts(),
-                                                                                                crate::cli::pick::FILTER_HALOTEXT,
-                                                                                                "Dump Halotext",
+                                                            crate::cli::pick::FILTER_HALOTEXT,
+                                                            "Dump Halotext",
                                                         ) {
                                                             let path_str = p.to_string_lossy().into_owned();
+                                                            let mut args = vec![path_str.clone()];
+                                                            args.extend(state.menu.selected_flags(1));
                                                             crate::log_event!("tui.menu.dump_started", path: path_str.clone());
                                                             std::thread::spawn(move || {
-                                                                let result = crate::cli::dump::run(&[path_str.clone()]);
+                                                                let result = crate::cli::dump::run(&args);
                                                                 match result {
                                                                     Ok(_) => crate::log_event!("tui.menu.dump_ok", path: path_str),
-                                                                               Err(e) => crate::log_event!("tui.menu.dump_failed", err: format!("{:#}", e)),
+                                                                    Err(e) => crate::log_event!("tui.menu.dump_failed", err: format!("{:#}", e)),
                                                                 }
                                                             });
                                                         }
@@ -376,22 +450,92 @@ fn event_loop(
                                                     2 => {
                                                         if let Some(p) = crate::cli::pick::pick_file(
                                                             &crate::paths::export_dir(),
-                                                                                                crate::cli::pick::FILTER_SOURCE,
-                                                                                                "Export Source",
+                                                            crate::cli::pick::FILTER_SOURCE,
+                                                            "Export Source",
                                                         ) {
                                                             let path_str = p.to_string_lossy().into_owned();
+                                                            let mut args = vec![path_str.clone()];
+                                                            args.extend(state.menu.selected_flags(2));
                                                             crate::log_event!("tui.menu.export_started", path: path_str.clone());
                                                             std::thread::spawn(move || {
-                                                                let result = crate::cli::export::run(&[path_str.clone()]);
+                                                                let result = crate::cli::export::run(&args);
                                                                 match result {
                                                                     Ok(_) => crate::log_event!("tui.menu.export_ok", path: path_str),
-                                                                               Err(e) => crate::log_event!("tui.menu.export_failed", err: format!("{:#}", e)),
+                                                                    Err(e) => crate::log_event!("tui.menu.export_failed", err: format!("{:#}", e)),
                                                                 }
                                                             });
                                                         }
                                                     }
                                                     3 => {
-                                                        state.menu.edit_mode = Some(0);
+                                                        state.menu.status = Some("installing directories...".into());
+                                                        crate::log_event!("tui.menu.install_started");
+                                                        let mut flags = vec!["--log-only".to_string()];
+                                                        flags.extend(state.menu.selected_flags(3));
+                                                        let slot = std::sync::Arc::clone(&state.menu.status_slot);
+                                                        std::thread::spawn(move || {
+                                                            match crate::deps::setup::run_install(&flags) {
+                                                                Ok(()) => {
+                                                                    crate::log_event!("tui.menu.install_ok");
+                                                                    if let Ok(mut s) = slot.lock() {
+                                                                        *s = Some("directory install finished — see log".into());
+                                                                    }
+                                                                }
+                                                                Err(e) => {
+                                                                    crate::log_event!("tui.menu.install_failed", err: format!("{:#}", e));
+                                                                    if let Ok(mut s) = slot.lock() {
+                                                                        *s = Some(format!("install failed: {e:#}"));
+                                                                    }
+                                                                }
+                                                            }
+                                                        });
+                                                    }
+                                                    4 => {
+                                                        state.menu.status = Some("scanning dependencies...".into());
+                                                        crate::log_event!("tui.menu.doctor_started");
+                                                        let mut args = vec!["--log-only".to_string()];
+                                                        args.extend(state.menu.selected_flags(4));
+                                                        let slot = std::sync::Arc::clone(&state.menu.status_slot);
+                                                        std::thread::spawn(move || {
+                                                            match crate::deps::doctor::run(&args) {
+                                                                Ok(()) => {
+                                                                    crate::log_event!("tui.menu.doctor_ok");
+                                                                    if let Ok(mut s) = slot.lock() {
+                                                                        *s = Some("dependency scan finished — see log".into());
+                                                                    }
+                                                                }
+                                                                Err(e) => {
+                                                                    crate::log_event!("tui.menu.doctor_failed", err: format!("{:#}", e));
+                                                                    if let Ok(mut s) = slot.lock() {
+                                                                        *s = Some(format!("scan failed: {e:#}"));
+                                                                    }
+                                                                }
+                                                            }
+                                                        });
+                                                    }
+                                                    5 => {
+                                                        state.menu.status = Some("fetching plugins...".into());
+                                                        crate::log_event!("tui.menu.fetch_started");
+                                                        let flags = state.menu.selected_flags(5);
+                                                        let slot = std::sync::Arc::clone(&state.menu.status_slot);
+                                                        std::thread::spawn(move || {
+                                                            match crate::deps::fetch::run(&flags) {
+                                                                Ok(()) => {
+                                                                    crate::log_event!("tui.menu.fetch_ok");
+                                                                    if let Ok(mut s) = slot.lock() {
+                                                                        *s = Some("plugin fetch finished — see log".into());
+                                                                    }
+                                                                }
+                                                                Err(e) => {
+                                                                    crate::log_event!("tui.menu.fetch_failed", err: format!("{:#}", e));
+                                                                    if let Ok(mut s) = slot.lock() {
+                                                                        *s = Some(format!("fetch failed: {e:#}"));
+                                                                    }
+                                                                }
+                                                            }
+                                                        });
+                                                    }
+                                                    6 => {
+                                                        state.menu.open_directories();
                                                         state.queue.focused = false;
                                                     }
                                                     _ => {}
@@ -536,14 +680,18 @@ fn handle_direction(code: KeyCode, state: &mut RenderState, tp: &Arc<Transport>)
     let cur = tp.speed.load(Ordering::Relaxed);
     let want_sign: i64 = if code == KeyCode::Left { -1 } else { 1 };
 
-    if is_hold {
+    let next = if is_hold {
         let mag = if cur.signum() == want_sign { cur.unsigned_abs() as i64 } else { 0 };
-        let next = SPEED_STEPS.iter().copied().find(|s| *s > mag)
-        .unwrap_or(*SPEED_STEPS.last().unwrap());
-        tp.speed.store(want_sign * next, Ordering::Release);
+        SPEED_STEPS.iter().copied().find(|s| *s > mag)
+        .unwrap_or(*SPEED_STEPS.last().unwrap()) * want_sign
+    } else if cur.signum() == want_sign {
+        0
     } else {
-        let already = cur.signum() == want_sign;
-        tp.speed.store(if already { 0 } else { want_sign }, Ordering::Release);
+        want_sign
+    };
+    if next != cur {
+        tp.speed.store(next, Ordering::Release);
+        crate::log_event!("player.speed.changed", speed: next);
     }
 }
 

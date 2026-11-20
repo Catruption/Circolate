@@ -19,10 +19,7 @@ use crate::tui::state as queue;
 
 use super::audio::{soft_clip, Silence};
 use super::cli::Args;
-use super::install::{
-    find_share_dir, install_chip_players, install_master_fx, install_sf2_engines,
-    install_shims, install_vst_hosts,
-};
+use crate::player::runtime::{find_share_dir, install_all, InstallOptions};
 use super::resolve::{is_archive, resolve_source};
 use super::worker::{watch_for_changes, worker, ReloadSlot};
 
@@ -72,10 +69,22 @@ pub fn play_one(
 
         let sample_rate = stream_config.sample_rate.0;
         let channels = stream_config.channels as usize;
+        let device_name = device.name().unwrap_or_else(|_| "<unknown>".into());
+        crate::log_event!(
+            "player.session.device",
+            name: device_name,
+            rate: sample_rate,
+            channels: channels,
+        );
 
         let is_watchable_halotext = song.map_or(false, |p| {
             !is_archive(p) && matches!(SourceKind::from_path(p), Ok(SourceKind::Halotext))
         });
+
+        let opening = song
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<empty queue>".to_string());
+        crate::log_event!("player.session.opening", path: opening, rate: sample_rate);
 
         let (project, cache_owned, project_path, _guard) = match song {
             Some(p) => {
@@ -92,6 +101,13 @@ pub fn play_one(
                 (project, cache, std::path::PathBuf::new(), None)
             }
         };
+
+        crate::log_event!(
+            "player.session.loaded",
+            parts: project.order.len(),
+            voices: project.voice_count,
+            rate: sample_rate,
+        );
 
         let cache = Arc::new(Mutex::new(cache_owned));
 
@@ -180,17 +196,22 @@ pub fn play_one(
             std::thread::spawn(move || worker(loader, tx, tp, lookahead, slot, total, wrap_tx));
         }
 
-        let mut engine = Engine::new(&project);
+        // Live playback follows the UI's faders and mute/solo.
+        let mut engine = Engine::new(&project, crate::mixer::state::global());
 
+        let share_dir = find_share_dir();
         crate::log_event!("play.session.init_started");
-        install_vst_hosts(&mut engine, &project);
+        install_all(
+            &mut engine,
+            &project,
+            &InstallOptions {
+                no_master_fx: args.no_master_fx,
+                sf2_override: args.sf2_override.as_deref(),
+                fallback_gain: 1.0,
+                share_dir: share_dir.as_deref(),
+            },
+        );
         crate::log_event!("play.session.init_done");
-
-        install_sf2_engines(&mut engine, &project, args.sf2_override.as_deref());
-        install_master_fx(&mut engine, &project, args.no_master_fx);
-        install_shims(&mut engine, &project, find_share_dir().as_deref());
-        crate::player::inserts::install_chains(&mut engine, &project, sample_rate);
-        install_chip_players(&mut engine, &project, find_share_dir().as_deref());
 
         let tp = Arc::clone(&transport);
         let mut left = vec![0f32; 8192];

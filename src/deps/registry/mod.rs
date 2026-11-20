@@ -3,7 +3,7 @@
 pub mod paths;
 pub mod schema;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub use schema::{
     Acquire, FallbackTarget, Mapping, MasterEntry, MissingPolicy,
@@ -11,7 +11,7 @@ pub use schema::{
 pub use paths::native_fx_dir;
 
 use crate::deps::fallbacks::{FallbacksTable, FALLBACKS_FILENAME};
-use crate::deps::index::PluginIndex;
+use crate::deps::plugins::PluginTable;
 use crate::deps::inventory::{PluginInventory, INVENTORY_FILENAME};
 
 #[derive(Debug, Clone)]
@@ -48,12 +48,12 @@ pub struct RegistryTable {
 
 impl RegistryTable {
     pub fn load() -> anyhow::Result<Self> {
-        // The fallbacks table is loaded from the system data directory
-        // (e.g., /usr/share/circolate/fallbacks.json).
-        // If we need to support user overrides for fallbacks specifically,
-        // they would be checked in crate::paths::user_config() first.
+        // fallbacks.json follows the same layered tree as plugins and
+        // SoundFonts: user root, localshare, then shipped system data.
+        // A user can copy it into their root and carry it to another machine.
         let share = crate::paths::system_data();
-        let fb_path = share.join(FALLBACKS_FILENAME);
+        let fb_path = crate::paths::layered_file(FALLBACKS_FILENAME)
+        .unwrap_or_else(|| share.join(FALLBACKS_FILENAME));
 
         let fallbacks = FallbacksTable::load(&fb_path)
         .ok_or_else(|| anyhow::anyhow!(
@@ -88,7 +88,7 @@ impl RegistryTable {
         self.fallbacks.effects.iter()
     }
 
-    pub fn resolve_instrument(&self, index: &PluginIndex, name: &str) -> Resolution {
+    pub fn resolve_instrument(&self, index: &PluginTable, name: &str) -> Resolution {
         if let Some(p) = index.find_any(name) {
             return Resolution::Exact { name: name.to_string(), path: p.clone() };
         }
@@ -107,7 +107,7 @@ impl RegistryTable {
         Resolution::NoMatch
     }
 
-    pub fn resolve_effect(&self, index: &PluginIndex, internal_name: &str) -> Resolution {
+    pub fn resolve_effect(&self, index: &PluginTable, internal_name: &str) -> Resolution {
         if let Some(m) = find_mapping(&self.fallbacks.effects, internal_name) {
             if m.is_skip() {
                 return Resolution::Skipped {
@@ -146,7 +146,7 @@ impl RegistryTable {
         &self,
         fb: &FallbackTarget,
         replaces: &str,
-        index: &PluginIndex,
+        index: &PluginTable,
     ) -> Resolution {
         if fb.kind == "native" {
             let Some(dir) = paths::native_fx_dir() else {
@@ -171,19 +171,10 @@ impl RegistryTable {
             };
         }
 
-        if !fb.path.is_empty() {
-            let p = PathBuf::from(&fb.path);
-            if p.exists() {
-                return Resolution::Fallback {
-                    name: fb.name.clone(),
-                    path: p,
-                    replaces: replaces.to_string(),
-                    gain: fb.gain,
-                    via_default: false,
-                    state: None,
-                };
-            }
-        }
+        // The installed plugin table is checked first: it is built from
+        // the Circolate search roots, the same places every other asset
+        // is found.  A path in the registry is only a portable relative
+        // hint, never a machine-specific absolute location.
         if let Some(p) = index.find_any(&fb.name) {
             return Resolution::Fallback {
                 name: fb.name.clone(),
@@ -193,6 +184,18 @@ impl RegistryTable {
                 via_default: false,
                 state: None,
             };
+        }
+        if !fb.path.is_empty() {
+            if let Some(p) = index.find_relative(Path::new(&fb.path)) {
+                return Resolution::Fallback {
+                    name: fb.name.clone(),
+                    path: p,
+                    replaces: replaces.to_string(),
+                    gain: fb.gain,
+                    via_default: false,
+                    state: None,
+                };
+            }
         }
         Resolution::FallbackMissing {
             name: fb.name.clone(),

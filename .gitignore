@@ -1,19 +1,6 @@
 # ── Rust build output ──────────────────────────────────────────
 /target/
 
-# ── Large SoundFonts ───────────────────────────────────────────
-# Users install their own (FluidR3 lives at /usr/share/soundfonts/
-# on most distros).  Do not ship 148 MB banks in the repo.
-/soundfonts/
-/plugins/
-/music/
-/share/plugins/
-# ── Trackscript extractions ────────────────────────────────────
-# The .tsz is the canonical artifact; extracted directories are
-# working copies.  Town/ is committed deliberately, so this stays
-# commented.  Uncomment to ignore all of them:
-# /trackscripts/*/
-
 # ── Editor / OS cruft ──────────────────────────────────────────
 desktop.ini
 .DS_Store
@@ -33,26 +20,10 @@ Thumbs.db
 # ── Local scratch ──────────────────────────────────────────────
 *.tmp
 *.bak
-/trackscripts/*.tsz
-
-# ── Generated data files ───────────────────────────────────────
-/share/plugins_inventory.json
-/share/required_plugins.json
-/system (ignore)/
-/share/soundfonts/
-/share/soundfonts/
-/share/circolate/trackscripts/no villains.tsz
-/share/circolate/trackscripts/Carol Roll.tsz
-
-# Personal covers and memes
-share/circolate/cover/
-
-# User-provided third-party soundfonts
-share/soundfonts/
 
 # Temporary archives
 *.tar.gz
 
-# Large example archives (these go in GitHub Releases, not the repo)
-*.halo.zip
-*.hlz
+
+# Vendor
+/target/

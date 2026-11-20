@@ -171,7 +171,7 @@ pub(crate) fn prepare_line(
 
         // ── chip patch branch ─────────────────────────────────────────
         if let Some(patch_iid) = project.patch_iids.get(&part.sample_path).copied() {
-            let chip_path: Arc<str> = Arc::from(part.sample_path.as_str());
+            let chip_path: Arc<str> = Arc::from(crate::player::mixer_key(part));
             let measure_start = call.pattern_measure_start;
             let measure_end = call.pattern_measure_start + call.pattern_measure_len;
             let call_base_row = line_base_row + call.line_offset;
@@ -193,7 +193,8 @@ pub(crate) fn prepare_line(
                 let initial_hz = nr.pitch_points.first().map(|p| p.value);
                 let midi = initial_hz.map(|hz| 69.0 + 12.0 * (hz / 440.0).log2())
                 .unwrap_or(60.0).round().clamp(0.0, 127.0) as u8;
-                let vel = nr.vol_points.first().map(|p| p.value).unwrap_or(100.0).clamp(0.0, 127.0) as u8;
+                let base_vol = part.default_vol.unwrap_or(100.0);
+                let vel = nr.vol_points.first().map(|p| p.value).unwrap_or(base_vol).clamp(0.0, 127.0) as u8;
                 let mut automation: Vec<ChipAutomation> = Vec::new();
                 for p in nr.pitch_points.iter().skip(1) {
                     let at_row = call_base_row + (p.row - measure_start);
@@ -271,12 +272,16 @@ pub(crate) fn prepare_line(
 
                 let pitch_hz = nr.pitch_points.first().map(|p| p.value).unwrap_or(C5_HZ);
                 let midi = (69.0 + 12.0 * (pitch_hz / 440.0).log2()).round() as i32;
-                let idx  = ((midi - base).rem_euclid(n)) as usize;
+                let idx = (midi - base).clamp(0, n - 1) as usize;
                 let slice = &sx.slices[idx];
 
-                let vel              = nr.vol_points.first().map(|p| p.value).unwrap_or(100.0);
+                let base_vol         = part.default_vol.unwrap_or(100.0);
+                let vel              = nr.vol_points.first().map(|p| p.value).unwrap_or(base_vol);
                 let slice_pan        = (slice.pan as f64 - 64.0) / 64.0;
-                let slice_atten_gain = 1.0 - (slice.atten as f64 / 128.0);
+                // CHANGED: `atten` is centibels (0 = full, 960 = -96 dB).
+                // Matches the Slicex row-to-dB conversion in
+                // params.rs::amp_attenuation_cb.
+                let slice_atten_gain = 10.0f64.powf(-(slice.atten as f64) / 200.0);
                 let vol              = vel * slice_atten_gain;
                 let pan              = slice_pan;
 
@@ -290,7 +295,7 @@ pub(crate) fn prepare_line(
                     line: li as u32,
                     seq,
                     sample: Arc::clone(&sx.sample),
-                             pitch_hz: C5_HZ,
+                             pitch_hz,
                              offset: slice.frame_start as f64,
                              vol,
                              pan,
@@ -298,7 +303,7 @@ pub(crate) fn prepare_line(
                              vol_lane:   None,
                              pan_lane:   None,
                              const_gain: gains(vol, pan, project.song_volume, project.linear_pan),
-                             part_path: part.sample_path.clone(),
+                             part_path: crate::player::mixer_key(part).to_owned(),
                              source_row: rel_row,
                              env: None,
                 });
@@ -395,7 +400,7 @@ pub(crate) fn prepare_line(
                          vol_lane: mk(&tv.vol_wp, vol),
                          pan_lane: mk(&tv.pan_wp, pan),
                          const_gain: gains(vol, pan, project.song_volume, project.linear_pan),
-                         part_path: part.sample_path.clone(),
+                         part_path: crate::player::mixer_key(part).to_owned(),
                          source_row: tv.rel_row,
                          env: tv.env,
             });
@@ -412,7 +417,7 @@ pub(crate) fn prepare_line(
         }
 
         if !tpl.vst_notes.is_empty() {
-            let vst_path: Arc<str> = Arc::from(part.sample_path.as_str());
+            let vst_path: Arc<str> = Arc::from(crate::player::mixer_key(part));
             for vn in &tpl.vst_notes {
                 if vn.rel_row < measure_start || vn.rel_row >= measure_end {
                     continue;

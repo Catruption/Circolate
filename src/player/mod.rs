@@ -7,9 +7,9 @@ pub mod lines;
 pub mod loader;
 pub mod notes;
 pub mod project;
+pub mod runtime;
 pub mod render;
 pub mod scope;
-pub mod store;
 pub mod template;
 pub mod transport;
 pub mod types;
@@ -28,3 +28,10 @@ pub(crate) use project::{load_project, Project};
 pub(crate) use render::{render_offline, write_wav};
 pub(crate) use transport::Transport;
 pub(crate) use types::Sample;
+
+/// The canonical key for faders, mute/solo, iid registration and note
+/// scheduling.  A halotext call name is a *part name*, not a mixer key;
+/// every audio-side lookup must go through this function.
+pub(crate) fn mixer_key(part: &crate::formats::halotext::model::HalotextPart) -> &str {
+    &part.sample_path
+}

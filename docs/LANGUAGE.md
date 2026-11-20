@@ -8,6 +8,7 @@
 - `Fallbacks { ... }`: Per-project fallback overrides. Each entry maps a reference name (`'ZENOLOGY.vst3'`) to a substitution (`Use: 'Odin2.vst3'`). Consulted by the resolver when the primary file isn't found. The global fallback registry (`share/fallbacks.json`) supplies the default chain; this section adds project-specific entries. `Gain:` on a fallback is a loudness compensation for the substitution, not the original plugin's gain.
 - `BlockList [ ... ]`: A cursor over song time. Each line places its calls starting at the current cursor position; a call occupies as many measures as its selections sum to, and the cursor advances past it. A line's duration is the maximum duration of its calls, so parallel calls line up on the same measure. An empty line (`;`) advances the cursor by one measure. Effect shims (`@<...>`) attach effects to windows of song time and may share the line with the calls they modify. Square brackets signal measure-semantics: every line is a unit of song time.
 - `BlockArray { ... }`: Definitions. `ƒName(<|N/D, ƒsource, ...>)[ events ];` for a part, `ƒName(ƒA, ƒB);` for a composite block. A part's body may contain multiple `|N/D[...]` sections; each section is one measure, laid end to end.
+- `Lyrics [ ... ]`: A subtitle row, one measure per line. Each line is a comma-separated list of `<§pos, ♫"text">` segments. A semicolon (`;`) on its own line advances one measure. Square brackets signal measure-semantics, matching BlockList and part bodies.
 
 ## Contexts
 
@@ -127,6 +128,8 @@ When a shim's window ends, its effect is removed abruptly unless the writer supp
 
 | Key | Type | Default | Meaning | Parser |
 |---|---|---|---|---|
+| `PanningLaw` | linear \| equal_power | equal_power | How pan maps to left/right gain. | reads |
+| `StereoWidth` | number | 1.0 | Mid/Side stereo widening. 1.0 is normal, 1.5 is wide, 2.0 is very wide. | reads |
 | `HalotextVersion` | number | - | Format version the file was written for. | stores only |
 | `BeatsPerMinute` | number | 120 | Starting tempo. Time-varying tempo is the `ƒTempo` shim. | reads |
 | `TimeSignature` | a/b | 4/4 | Time signature. | reads |

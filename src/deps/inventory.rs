@@ -93,7 +93,7 @@ impl PluginInventory {
     }
 
     /// Exact match, then normalized (same rules as
-    /// `deps::index::normalize_plugin_key`, so `"DecentSampler"` finds
+    /// `deps::plugins::normalize_plugin_key`, so `"DecentSampler"` finds
     /// a stored `"Decent Sampler"` entry).
     pub fn level_for(&self, name: &str) -> Option<&PluginLevel> {
         if let Some(l) = self.plugins.get(name) {

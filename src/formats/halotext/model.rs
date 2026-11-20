@@ -14,7 +14,7 @@ pub struct HalotextWaypoint {
     pub ramp_beats: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct HalotextEvent {
     pub op: String,
     pub row: f64,

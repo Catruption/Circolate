@@ -5,7 +5,6 @@
 
 pub mod audio;
 pub mod cli;
-pub mod install;
 pub mod offline;
 pub mod resolve;
 pub mod session;

@@ -17,10 +17,14 @@ pub(super) fn build_json(
     wav_rel: &str,
     slices: &[SliceSpec],
     amp_env:   Option<&[EnvelopePoint]>,
+    amp_markers: Option<(i32, i32)>,
     speed_env: Option<&[EnvelopePoint]>,
     cut_env:   Option<&[EnvelopePoint]>,
     lfo_env:   Option<&[EnvelopePoint]>,
-    env_scale_secs: f64,
+    amp_scale_secs: f64,
+    speed_scale_secs: f64,
+    cut_scale_secs: f64,
+    lfo_scale_secs: f64,
     loop_flag: bool,
     speed_octaves: f64,
     amp_amt:   f64,
@@ -38,16 +42,16 @@ pub(super) fn build_json(
             pan: s.pan, atten: s.atten, cut: s.cutoff,
         }).collect(),
         envelopes: EnvelopesJson {
-            amp:   amp_env  .map(|p| env_json(p, env_scale_secs, amp_amt)),
-            speed: speed_env.map(|p| env_json(p, env_scale_secs, speed_amt)),
-            cut:   cut_env  .map(|p| env_json(p, env_scale_secs, cut_amt)),
-            lfo:   lfo_env  .map(|p| env_json(p, env_scale_secs, lfo_amt)),
+            amp:   amp_env  .map(|p| env_json(p, amp_scale_secs, amp_amt, amp_markers)),
+            speed: speed_env.map(|p| env_json(p, speed_scale_secs, speed_amt, None)),
+            cut:   cut_env  .map(|p| env_json(p, cut_scale_secs, cut_amt, None)),
+            lfo:   lfo_env  .map(|p| env_json(p, lfo_scale_secs, lfo_amt, None)),
         },
     };
     serde_json::to_vec_pretty(&doc).unwrap_or_default()
 }
 
-fn env_json(pts: &[EnvelopePoint], scale: f64, amount: f64) -> EnvJson {
+fn env_json(pts: &[EnvelopePoint], scale: f64, amount: f64, markers: Option<(i32, i32)>) -> EnvJson {
     let mut t = 0.0f64;
     let mut points = Vec::with_capacity(pts.len());
     for (i, p) in pts.iter().enumerate() {
@@ -59,7 +63,8 @@ fn env_json(pts: &[EnvelopePoint], scale: f64, amount: f64) -> EnvJson {
             kind:    if i == 0 { 0   } else { p.kind() },
         });
     }
-    EnvJson { points, amount }
+    let (sustain, release) = markers.unwrap_or((-1, -1));
+    EnvJson { points, amount, sustain, release }
 }
 
 #[derive(Serialize)]
@@ -89,6 +94,8 @@ struct EnvelopesJson {
 struct EnvJson {
     points: Vec<PointJson>,
     amount: f64,
+    sustain: i32,
+    release: i32,
 }
 
 #[derive(Serialize)]

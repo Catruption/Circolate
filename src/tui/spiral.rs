@@ -137,7 +137,11 @@ impl SpiralLayout {
 fn leg_len(i: usize, aspect_x: usize) -> usize {
     let base = i / 2 + 1;
     if i % 2 == 0 {
-        (base * aspect_x * 3 + 3) / 4
+        // A horizontal leg must never be shorter than the vertical leg
+        // that follows it.  The aspect-scaled formula alone drops below
+        // `base` from base=4 onward, which makes the walk overlap itself
+        // and leaves cells in the layout map unset.
+        ((base * aspect_x * 3 + 3) / 4).max(base)
     } else {
         base
     }

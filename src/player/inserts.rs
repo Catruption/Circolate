@@ -8,7 +8,7 @@
 //!   are opened, so this works for `.tsz` archives and directory
 //!   sources alike, and it makes chain info available to the views.
 //! * **Audio** — `install_chains` walks `Project.chains`, resolves
-//!   each slot's plugin by name via `PluginIndex`, opens the host, and
+//!   each slot's plugin by name via `PluginTable`, opens the host, and
 //!   hands the resulting `InsertChain` to `Engine`.
 //!
 //! ## Plugin resolution
@@ -28,7 +28,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::asset::AssetSource;
-use crate::deps::index::PluginIndex;
+use crate::deps::plugins::PluginTable;
 use crate::hosting::vst::ffi::VstHost;
 
 use super::engine::{Engine, VST_BLOCK};
@@ -316,7 +316,7 @@ pub fn install_chains(engine: &mut Engine, project: &Project, sample_rate: u32) 
     if project.chains.is_empty() {
         return;
     }
-    let index = PluginIndex::scan();
+    let index = PluginTable::get();
 
     for (&insert_idx, chain) in &project.chains {
         let mut slots: Vec<InsertSlot> = Vec::new();

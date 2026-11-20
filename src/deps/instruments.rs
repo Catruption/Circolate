@@ -4,7 +4,6 @@
 //!     {
 //!         Kind: vst3;
 //!         Plugin: 'Surge XT';
-//!         Path: '/path/to/Surge XT.vst3';
 //!         State: 'Foo.state';
 //!         OriginalPlugin: 'ZENOLOGY';
 //!         Replaces: 'ZENOLOGY';
@@ -25,7 +24,6 @@ pub struct Instrument {
     pub name: String,
     pub kind: String,
     pub plugin: String,
-    pub vst_path: String,
     pub state_path: PathBuf,
     pub sf2_path: PathBuf,
     pub sf2_bank: u32,
@@ -71,7 +69,6 @@ pub fn parse(text: &str, hint: &str) -> Result<Instrument> {
     let mut name = String::new();
     let mut kind = String::new();
     let mut plugin = String::new();
-    let mut vst_path = String::new();
     let mut state = String::new();
     let mut sf2 = String::new();
     let mut sf2_bank: u32 = 0;
@@ -105,7 +102,10 @@ pub fn parse(text: &str, hint: &str) -> Result<Instrument> {
         match key.trim() {
             "Kind" => kind = value,
             "Plugin" => plugin = value,
-            "Path" => vst_path = value,
+            // Legacy field, accepted and discarded.  Old sidecars still
+            // load, but no resolver may use the recorded path: `Plugin:`
+            // is the only key.
+            "Path" => {}
             "State" => state = value,
             "File" => sf2 = value,
             "Bank" => { sf2_bank = value.parse().unwrap_or(0); sf2_bank_set = true; }
@@ -144,7 +144,7 @@ pub fn parse(text: &str, hint: &str) -> Result<Instrument> {
     if kind == "sf2" && sf2.is_empty() { return Err(anyhow!("sf2 sidecar missing File: {}", hint)); }
 
     Ok(Instrument {
-        name, kind, plugin, vst_path,
+        name, kind, plugin,
         state_path: if state.is_empty() { PathBuf::new() } else { PathBuf::from(state) },
         sf2_path: if sf2.is_empty() { PathBuf::new() } else { PathBuf::from(&sf2) },
         sf2_bank, sf2_preset, fallback, unresolved, replaces, gain, source_channel,

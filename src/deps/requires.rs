@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::conversion::AuxFile;
+use crate::deps::plugins::PluginTable;
 use crate::deps::registry::RegistryTable;
 
 pub const FILENAME: &str = "requires.json";
@@ -70,16 +71,18 @@ pub struct Bundle {
     pub homepage: Option<String>,
     pub download: Option<String>,
     pub redistributable: bool,
-    /// Path to the `.vst3` bundle on disk, if it still exists.  None
-    /// means the plugin was missing at convert time.
+    /// Resolved location of the `.vst3` bundle on *this* machine.
+    /// `None` means the plugin is not installed here.  Never copied
+    /// from a sidecar's recorded `Path:`.
     pub path: Option<PathBuf>,
 }
 
 /// Extract every VST3 bundle referenced by the conversion output.
-/// Reads the `.instrument` sidecars; each carries the plugin's display
-/// name and its path on the machine that made the file.
+/// Reads the `.instrument` sidecars and resolves each `Plugin:` name
+/// against the local plugin index.
 pub fn bundles_from_aux(aux: &[AuxFile]) -> Vec<Bundle> {
     let table = RegistryTable::load().ok();
+    let index = PluginTable::get();
     let mut out: Vec<Bundle> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
@@ -122,12 +125,11 @@ pub fn bundles_from_aux(aux: &[AuxFile]) -> Vec<Bundle> {
             })
             .unwrap_or_default();
 
-        let path = if inst.vst_path.is_empty() {
-            None
-        } else {
-            let p = PathBuf::from(&inst.vst_path);
-            if p.exists() { Some(p) } else { None }
-        };
+        // Resolve by canonical name.  `Path:` in an old sidecar was
+        // written on whatever machine did the conversion; trusting it
+        // produces broken archives and leaks the author's home
+        // directory.
+        let path = index.find_vst3(&name).cloned();
 
         out.push(Bundle {
             name,

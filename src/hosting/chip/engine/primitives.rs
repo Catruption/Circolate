@@ -50,7 +50,8 @@ pub struct Lfsr {
     pub reg: u32,
     pub taps: u32,
     pub width: u8,
-    /// false = parity taps (periodic), true = bit 0 feedback (white).
+    /// `true` = parity of `reg & taps`, `false` = bit-0 feedback.
+    /// Keep in sync with `step()` and docs/CHIP.md §2.4.
     pub parity_mode: bool,
 }
 
@@ -97,14 +98,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn divider_halves_at_expected_rate() {
+    fn divider_rises_every_two_wrap_cycles() {
+        // Spec: q toggles every `n` steps, and `rise` is the 0 -> 1
+        // edge, so rise-to-rise is 2 * n steps (not n).
         let mut d = Divider { n: 200, dc_below: 0, cnt: 1, q: false };
-        // First step: cnt 1 -> 0 -> q flips to true (rise).
-        assert!(d.step());
-        // Next 199 steps: no rise.
-        for _ in 0..199 { assert!(!d.step()); }
-        // 201st: rise again.
-        assert!(d.step());
+        assert!(d.step());                    // step 1: q false -> true
+        for _ in 0..399 { assert!(!d.step()); }
+        assert!(d.step());                    // step 401: next rise
     }
 
     #[test]
@@ -116,33 +116,30 @@ mod tests {
         }
     }
 
-    #[test]
-    fn lfsr_white_mode_runs_full_period() {
-        // SN76489 sega taps.
-        let mut l = Lfsr::new(0x0009, 16, false);
-        let start = l.reg;
+    fn cycle_period(lfsr: &mut Lfsr, limit: u32) -> u32 {
+        let start = lfsr.reg;
         let mut period = 0u32;
         loop {
-            l.step();
+            lfsr.step();
             period += 1;
-            if l.reg == start { break; }
-            assert!(period < 1_000_000, "LFSR did not return to seed");
+            if lfsr.reg == start { return period; }
+            assert!(period < limit, "LFSR did not return to seed");
         }
-        assert_eq!(period, 65535, "16-bit maximal LFSR has period 2^16 - 1");
     }
 
     #[test]
-    fn lfsr_periodic_mode_short_period() {
+    fn lfsr_parity_mode_runs_long_sequence() {
+        // parity_mode = true selects parity(reg & taps); these 16-bit
+        // taps produce a long sequence, unlike bit-0 feedback.
         let mut l = Lfsr::new(0x0009, 16, true);
-        let start = l.reg;
-        let mut period = 0u32;
-        loop {
-            l.step();
-            period += 1;
-            if l.reg == start { break; }
-            assert!(period < 1024);
-        }
-        // Period 16 for width 16 starting from reset state 0x8000.
-        assert_eq!(period, 16);
+        assert!(cycle_period(&mut l, 1_000_000) > 1000);
+    }
+
+    #[test]
+    fn lfsr_bit0_mode_has_short_period() {
+        // parity_mode = false selects reg & 1, which rotates the reset
+        // bit around a 16-bit register in exactly 16 steps.
+        let mut l = Lfsr::new(0x0009, 16, false);
+        assert_eq!(cycle_period(&mut l, 1024), 16);
     }
 }

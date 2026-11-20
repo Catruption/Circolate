@@ -2,12 +2,12 @@
 
 use super::*;
 use crate::formats::halotext::parse::C5_HZ;
-use crate::mixer::mute;
 use crate::timing::AutomationLane;
 use crate::player::project::Sf2VoiceEnvelope;
 use crate::formats::flp::slicex::speed_mult;
+use crate::formats::flp::slicex::envelope_state::EnvState as SlicexEnvState;
 use crate::player::types::SlicexInstrument;
-use dsp::{env_level_at, gains, interpolate, EnvState};
+use dsp::{env_level_at, gains, interpolate, Biquad, EnvState};
 
 pub(crate) struct SlicexVoiceRef {
     pub(crate) instrument: Arc<SlicexInstrument>,
@@ -44,7 +44,34 @@ pub(crate) struct Active {
     pub(crate) v: Scheduled,
     pub(crate) raw_pos: f64,
     pub(crate) env_state: Option<EnvState>,
+    pub(crate) slicex_env_state: Option<SlicexEnvState>,
+    pub(crate) slicex_release_sec: f64,
     pub(crate) prev_vol: f64,
+    pub(crate) filt_l: Biquad,
+    pub(crate) filt_r: Biquad,
+    pub(crate) filt_cooldown: u32,
+}
+
+impl Active {
+    pub(crate) fn new(v: Scheduled, raw_pos: f64, env_state: Option<EnvState>) -> Self {
+        let (slicex_env_state, slicex_release_sec) = v.slicex.as_ref()
+        .and_then(|sx| sx.instrument.amp_env.as_ref().map(|env| (
+            SlicexEnvState::new(env, sx.instrument.amp_sustain_index, sx.instrument.amp_release_index),
+                                                                 SlicexEnvState::release_duration(env, sx.instrument.amp_release_index),
+        )))
+        .map_or((None, 0.020), |(state, release)| (Some(state), release));
+        Self {
+            v,
+            raw_pos,
+            env_state,
+            slicex_env_state,
+            slicex_release_sec,
+            prev_vol: f64::NAN,
+            filt_l: Biquad::new(),
+            filt_r: Biquad::new(),
+            filt_cooldown: 0,
+        }
+    }
 }
 
 impl Engine {
@@ -55,11 +82,18 @@ impl Engine {
         let speed_env = v.slicex.as_ref().and_then(|s| s.instrument.speed_env.as_ref());
         let octaves = v.slicex.as_ref().map_or(0.0, |s| s.instrument.speed_octaves);
         let amt = v.slicex.as_ref().map_or(1.0, |s| s.instrument.speed_amt);
+
+        let root_hz = match v.slicex.as_ref() {
+            Some(sx) => {
+                let sl = &sx.instrument.slices[sx.slice_idx];
+                440.0 * 2f64.powf((sl.key as f64 - 69.0) / 12.0)
+            }
+            None => C5_HZ,
+        };
+
         match (&v.pitch_lane, speed_env) {
             (None, None) => {
-                v.offset
-                + (to - v.start) as f64
-                * (v.sample.rate * (v.pitch_hz / C5_HZ) / self.sr)
+                v.offset + (to - v.start) as f64 * (v.sample.rate * (v.pitch_hz / root_hz) / self.sr)
             }
             _ => {
                 let mut p = v.offset;
@@ -67,8 +101,8 @@ impl Engine {
                     let t = f as f64 / self.sr;
                     let t_rel = (f - v.start) as f64 / self.sr;
                     let pitch_m = match &v.pitch_lane {
-                        Some(l) => l.value_at(t) / C5_HZ,
-                        None => v.pitch_hz / C5_HZ,
+                        Some(l) => l.value_at(t) / root_hz,
+                        None => v.pitch_hz / root_hz,
                     };
                     let rate_m = match speed_env {
                         Some(e) => {
@@ -133,20 +167,23 @@ impl Engine {
         block_end: i64,
     ) {
         let sr = self.sr;
+        let sr_f32 = sr as f32;
         let block_len = out_l.len() as i64;
         let dir: i64 = if speed > 0 { 1 } else if speed < 0 { -1 } else { 0 };
         let dir_f = dir as f64;
+
+        let disable_cut_env = std::env::var_os("SLICEX_NO_CUT_ENV").is_some();
 
         if speed != 0 {
             if speed > 0 {
                 while self.pending.front().map_or(false, |v| v.start < block_end) {
                     let v = self.pending.pop_front().unwrap();
-                    if !mute::is_note_active(&v.part_path, v.line as usize, v.source_row as i64) {
+                    if !self.mixer.is_note_active(&v.part_path, v.line as usize, v.source_row as i64) {
                         continue;
                     }
                     let raw_pos = v.offset;
                     let env_state = self.env_state_for(&v);
-                    self.active.push(Active { v, raw_pos, env_state, prev_vol: f64::NAN });
+                    self.active.push(Active::new(v, raw_pos, env_state));
                 }
             } else {
                 let mut i = 0;
@@ -157,13 +194,20 @@ impl Engine {
                     };
                     if activate {
                         let v = self.pending.remove(i).unwrap();
-                        if !mute::is_note_active(&v.part_path, v.line as usize, v.source_row as i64) {
+                        if !self.mixer.is_note_active(&v.part_path, v.line as usize, v.source_row as i64) {
                             continue;
                         }
-                        let step = v.sample.rate * (v.pitch_hz / C5_HZ) / sr;
+                        let root_hz = match v.slicex.as_ref() {
+                            Some(sx) => {
+                                let sl = &sx.instrument.slices[sx.slice_idx];
+                                440.0 * 2f64.powf((sl.key as f64 - 69.0) / 12.0)
+                            }
+                            None => C5_HZ,
+                        };
+                        let step = v.sample.rate * (v.pitch_hz / root_hz) / sr;
                         let note_len = (v.end - v.start).max(0) as f64;
                         let raw_pos = v.offset + (note_len - 1.0).max(0.0) * step;
-                        self.active.push(Active { v, raw_pos, env_state: None, prev_vol: f64::NAN });
+                        self.active.push(Active::new(v, raw_pos, None));
                     } else {
                         i += 1;
                     }
@@ -175,17 +219,24 @@ impl Engine {
         let linear = self.linear;
         let pause_fade = self.pause_fade;
 
-        let Self { active, shim_by_line, shim_scratch, .. } = self;
+        let Self { active, shim_by_line, shim_scratch, mixer, .. } = self;
         active.retain_mut(|a| {
-            if !mute::is_note_active(&a.v.part_path, a.v.line as usize, a.v.source_row as i64) {
+            if !mixer.is_note_active(&a.v.part_path, a.v.line as usize, a.v.source_row as i64) {
                 return false;
             }
             let v = &a.v;
             let smp = &*v.sample;
             let len = smp.len() as f64;
-            let const_step = smp.rate * (v.pitch_hz / C5_HZ) / sr;
 
-            // Playable bounds: Slicex = slice frame range; otherwise whole sample.
+            let root_hz = match v.slicex.as_ref() {
+                Some(sx) => {
+                    let sl = &sx.instrument.slices[sx.slice_idx];
+                    440.0 * 2f64.powf((sl.key as f64 - 69.0) / 12.0)
+                }
+                None => C5_HZ,
+            };
+            let const_step = smp.rate * (v.pitch_hz / root_hz) / sr;
+
             let (play_lo, play_hi) = match v.slicex.as_ref() {
                 Some(sx) => {
                     let sl = &sx.instrument.slices[sx.slice_idx];
@@ -210,7 +261,11 @@ impl Engine {
 
             let automated_gain = v.vol_lane.is_some() || v.pan_lane.is_some();
 
-            let release_sec = a.env_state.as_ref().map_or(0.020, |s| s.release_end - s.release_start);
+            let release_sec = if v.slicex.is_some() {
+                a.slicex_release_sec
+            } else {
+                a.env_state.as_ref().map_or(0.020, |s| s.release_end - s.release_start)
+            };
             let actual_end = v.end + (release_sec * sr) as i64;
 
             let (i_lo, i_hi) = if speed > 0 {
@@ -234,7 +289,7 @@ impl Engine {
             let first_shim: Option<u32> =
             shim_by_line.get(&v.line).and_then(|s| s.first().copied());
 
-            let part_vol = crate::mixer::part_volume::get(&v.part_path);
+            let part_vol = mixer.volume(&v.part_path);
             let pv0 = if a.prev_vol.is_nan() { part_vol } else { a.prev_vol };
             let dpv = (part_vol - pv0) / block_len.max(1) as f64;
 
@@ -249,14 +304,24 @@ impl Engine {
             for i in i_lo..i_hi {
                 let f = block_start + i * speed;
                 let t = f as f64 / sr;
-                let t_rel = (f - v.start) as f64 / sr;   // ← time since note start
+                let t_rel = (f - v.start) as f64 / sr;
                 let pv = pv0 + dpv * i as f64;
 
-                // Slicex speed-envelope multiplier (per frame).
+                let slicex_amp_value = if let (Some(sx), Some(state)) =
+                (v.slicex.as_ref(), a.slicex_env_state.as_mut()) {
+                    if f >= v.end {
+                        state.note_off(&sx.instrument.amp_env.as_ref().expect("state requires amp envelope"));
+                    }
+                    state.advance(&sx.instrument.amp_env.as_ref().expect("state requires amp envelope"), 1.0 / sr);
+                    Some(state.value())
+                } else {
+                    None
+                };
+
                 let speed_m = match v.slicex.as_ref() {
                     Some(sx) => match sx.instrument.speed_env.as_ref() {
                         Some(env) => {
-                            let y = env.eval_at(t_rel);      // ← was t
+                            let y = env.eval_at(t_rel);
                             let m = speed_mult(y, sx.instrument.speed_octaves);
                             1.0 + (m - 1.0) * sx.instrument.speed_amt
                         }
@@ -266,7 +331,7 @@ impl Engine {
                 };
 
                 let step = match &v.pitch_lane {
-                    Some(l) => smp.rate * (l.value_at(t) / C5_HZ) / sr * speed_m,
+                    Some(l) => smp.rate * (l.value_at(t) / root_hz) / sr * speed_m,
                           None => const_step * speed_m,
                 };
 
@@ -299,12 +364,14 @@ impl Engine {
                         g *= pause_fade;
                     }
                     if let Some(sx) = v.slicex.as_ref() {
-                        if let Some(env) = sx.instrument.amp_env.as_ref() {
-                            let y = env.eval_at(t_rel);          // ← was t
+                        if let Some(y) = slicex_amp_value {
                             let mix = 1.0 + (y - 1.0) * sx.instrument.amp_amt;
                             g *= mix as f32;
-                        }
-                        if f > v.end {
+                            if f > v.end && sx.instrument.amp_release_index < 0 {
+                                let over = ((f - v.end) as f64 / sr) as f32;
+                                g *= (1.0_f32 - over / 0.020_f32).clamp(0.0, 1.0);
+                            }
+                        } else if f > v.end {
                             let over = ((f - v.end) as f64 / sr) as f32;
                             g *= (1.0_f32 - over / 0.020_f32).clamp(0.0, 1.0);
                         }
@@ -327,7 +394,42 @@ impl Engine {
                 };
 
                 if p >= play_lo && p < play_hi {
-                    let (sl, sr_) = interpolate(smp, p, step, a.raw_pos);
+                    let (mut sl, mut sr_) = interpolate(smp, p, step, a.raw_pos);
+
+                    if let Some(sx) = v.slicex.as_ref() {
+                        let sl_slice = &sx.instrument.slices[sx.slice_idx];
+                        let cutoff_raw = sl_slice.cutoff;
+                        let has_cut_env = !disable_cut_env
+                        && sx.instrument.cut_env.is_some()
+                        && sx.instrument.cut_amt > 0.0;
+                        // FIXED: Only filter if the cutoff is below max, or if there is an active cut envelope.
+                        let needs_filter = cutoff_raw < 12799 || has_cut_env;
+                        if needs_filter {
+                            let base_norm = (cutoff_raw as f64 / 12800.0).clamp(0.0, 1.0);
+                            // Changed mapping to be less aggressive than 100 * 200^x.
+                            // Maps 0->20Hz, 12800->20000Hz.
+                            let base_hz = (20.0 * 1000.0f64.powf(base_norm)) as f32;
+                            let mod_hz = if has_cut_env {
+                                let ce = sx.instrument.cut_env.as_ref().unwrap();
+                                let y = ce.eval_at(t_rel).clamp(0.0, 1.0);
+                                let amount = sx.instrument.cut_amt.clamp(0.0, 1.0);
+                                let mult = 2f64.powf((y - 0.5) * 4.0 * amount);
+                                (base_hz as f64 * mult).clamp(20.0, sr * 0.49) as f32
+                            } else {
+                                base_hz
+                            };
+                            if a.filt_cooldown == 0 {
+                                a.filt_l.set_lowpass(mod_hz, 0.707, sr_f32);
+                                a.filt_r.set_lowpass(mod_hz, 0.707, sr_f32);
+                                a.filt_cooldown = 32;
+                            } else {
+                                a.filt_cooldown -= 1;
+                            }
+                            sl = a.filt_l.process(sl);
+                            sr_ = a.filt_r.process(sr_);
+                        }
+                    }
+
                     let (gl, gr) = gain_pair();
                     let eg = env_gain();
                     let o = i as usize;
@@ -336,8 +438,6 @@ impl Engine {
                     dst_l[o] += cl;
                     dst_r[o] += cr;
                 } else if v.slicex.is_none() && p >= len && loop_f.is_none() && len > 0.0 {
-                    // SF2/sample hold-tail fade — skip for Slicex; slice_end
-                    // bounds playback naturally.
                     let over = p - len;
                     let fade_len = HOLD_TAIL_SECS * sr;
                     if over < fade_len {

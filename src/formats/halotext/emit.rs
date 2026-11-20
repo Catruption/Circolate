@@ -398,6 +398,10 @@ fn emit_block_def(out: &mut String, p: &HalotextPart) {
         args.push(source_ref);
     }
 
+    if let Some(v) = p.default_vol {
+        args.push(format!("{}{}", GLYPH_VOLUME, fmt_num(v)));
+    }
+
     if let Some(sx) = &p.slicex {
         if !sx.slices.is_empty() {
             let gamma: String = sx.slices.iter().map(|s| format!(

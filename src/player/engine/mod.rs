@@ -26,6 +26,7 @@ use std::time::Instant;
 
 use crate::effects::EffectChain;
 use crate::hosting::chip::{ChipNote, ChipPlayer};
+use crate::mixer::state::MixerState;
 use crate::hosting::sf2::engine::Sf2Engine;
 use crate::hosting::vst::ffi::VstHost;
 use crate::player::project::Project;
@@ -79,6 +80,9 @@ pub(crate) const HOLD_TAIL_SECS: f64 = 0.020;
 pub(crate) const VST_TAIL_BLOCKS: u32 = 20;
 
 pub(crate) struct Engine {
+    /// Injected mixer state.  Live playback receives the global handle;
+    /// offline rendering receives a fresh default so renders are stable.
+    pub(crate) mixer: Arc<MixerState>,
     pub(crate) sr: f64,
     pub(crate) song_volume: f64,
     pub(crate) linear: bool,
@@ -139,12 +143,27 @@ pub(crate) struct Engine {
     pub(crate) chip_log: Vec<ChipNote>,
 }
 
+/// Per-part gain for one continuous engine (VST or SF2).  Both mix passes
+/// use this so a fader change applies through the same canonical
+/// `part.sample_path` the scheduler and TUI use.
+pub(crate) fn part_gain(
+    mixer: &MixerState,
+    iid: u16,
+    iid_to_part_path: &BTreeMap<u16, String>,
+) -> f32 {
+    iid_to_part_path
+    .get(&iid)
+    .map(|p| mixer.volume(p) as f32)
+    .unwrap_or(1.0)
+}
+
 impl Engine {
-    pub(crate) fn new(p: &Project) -> Self {
+    pub(crate) fn new(p: &Project, mixer: Arc<MixerState>) -> Self {
         init_tables();
         vst::init_audio_pool();
         let hist_len = (VST_HISTORY_SECS * p.sample_rate as f64).max(1.0) as usize;
         Engine {
+            mixer,
             sr: p.sample_rate as f64,
             song_volume: p.song_volume,
             linear: p.linear_pan,
@@ -264,10 +283,10 @@ impl Engine {
             Some(p) => p.as_str(),
             None => return 0.0,
         };
-        if !crate::mixer::mute::is_note_active(path, 0, 0) {
+        if !self.mixer.is_note_active(path, 0, 0) {
             return 0.0;
         }
-        let v = crate::mixer::part_volume::get(path);
+        let v = self.mixer.volume(path);
         (self.song_volume * v) as f32
     }
 
@@ -298,7 +317,7 @@ impl Engine {
                 continue;
             }
             if n.iid != 100 && n.iid != 101 {
-                if !crate::mixer::mute::is_note_active(&n.part_path, n.line as usize, n.source_row as i64) {
+                if !self.mixer.is_note_active(&n.part_path, n.line as usize, n.source_row as i64) {
                     continue;
                 }
             }
@@ -383,12 +402,12 @@ impl Engine {
                 continue;
             }
             if v.start < self.pos {
-                if !crate::mixer::mute::is_note_active(&v.part_path, v.line as usize, v.source_row as i64) {
+                if !self.mixer.is_note_active(&v.part_path, v.line as usize, v.source_row as i64) {
                     continue;
                 }
                 let raw_pos = self.raw_pos_at(&v, self.pos);
                 let env_state = self.env_state_for(&v);
-                self.active.push(Active { v, raw_pos, env_state, prev_vol: f64::NAN });
+                self.active.push(Active::new(v, raw_pos, env_state));
             } else {
                 let key = v.key();
                 if self.pending.back().map_or(true, |b| b.key() <= key) {
@@ -607,5 +626,27 @@ impl Engine {
         } else {
             self.pos = block_end.clamp(0, self.total);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn part_gain_uses_canonical_registered_path() {
+        let path = "samples/EngineTest.sf2#part-gain";
+        let mut paths = BTreeMap::new();
+        paths.insert(12u16, path.to_string());
+        let mixer = MixerState::default();
+
+        assert_eq!(part_gain(&mixer, 12, &paths), 1.0);
+        for _ in 0..10 {
+            mixer.step_volume(path, -1);
+        }
+        let gained = part_gain(&mixer, 12, &paths);
+        mixer.reset_volume(path);
+        assert!((gained - 0.5).abs() < 1e-6, "fader did not reach SF2 iid");
+        assert_eq!(part_gain(&mixer, 12, &paths), 1.0);
     }
 }

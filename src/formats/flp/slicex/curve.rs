@@ -7,15 +7,15 @@
 //!
 //! ## Reverse-engineering provenance
 //!
-//! Ported against `slicex-decomp-session3/slicex_curve.py`: evaluator
+//! Ported against the decomp notes and Python oracle recorded in `HISTORY.md`: evaluator
 //! `TCustomMEnvelope.vslot25` at VA `0x793950`, precompute at `0x791610`,
 //! coefficient setter at `0x6168e0`, and cycle-count helper at `0x792f80`.
 //! The notes classify kinds 0, 1, 2, 3, 5, 7, 8, 9, 11, and 12 as high
 //! confidence; kinds 4 and 6 as medium; kind 10's tangent construction is
 //! still low confidence. Our kind-10 path supplies zero tangents, so it is
 //! a smoothstep approximation, not a verified Hermite reconstruction.
-//! See `slicex-decomp-session3/SLICEX_IMPLEMENTATION_MAP.md` for scope and
-//! known gaps.
+//! `HISTORY.md` is the canonical record of scope, superseded findings, and
+//! known gaps. Kind 10 remains an approximation pending evidence.
 
 fn sgn(t: f64) -> f64 {
     if t == 0.0 { 0.0 } else if t > 0.0 { 1.0 } else { -1.0 }

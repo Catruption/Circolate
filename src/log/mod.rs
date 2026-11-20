@@ -148,6 +148,30 @@ impl LogFilter {
         spec.level <= self.per_category[spec.category.index()]
     }
 
+    /// Apply a CLI spec: `info`, `player:debug,deps:info`, or a mix.
+    /// Returns the first invalid token so the caller can report it.
+    pub fn apply_spec(&mut self, spec: &str) -> std::result::Result<(), String> {
+        for part in spec.split(',') {
+            let part = part.trim();
+            if part.is_empty() { continue; }
+            if let Some((name, level_name)) = part.split_once(':') {
+                let level = Level::parse(level_name)
+                .ok_or_else(|| format!("bad level in {part:?}"))?;
+                if let Some(cat) = Category::parse(name) {
+                    self.set(cat, level);
+                } else {
+                    return Err(format!("unknown log category {name:?}"));
+                }
+            } else {
+                // A bare level applies to every category.
+                let level = Level::parse(part)
+                .ok_or_else(|| format!("bad log spec {part:?} (try info or player:debug)"))?;
+                for cat in CATEGORIES { self.set(*cat, level); }
+            }
+        }
+        Ok(())
+    }
+
     pub fn from_env() -> Self {
         let mut f = Self::default_warn();
         if let Some(g) = std::env::var_os("CIRCOLATE_LOG")

@@ -108,7 +108,7 @@ pub(crate) fn build_template(
                             rel_row: ev.row,
                             dur_rows: dur_beats * subs,
                             pitch_hz,
-                            vol: ev.vol.unwrap_or(100.0),
+                            vol: ev.vol.or(part.default_vol).unwrap_or(100.0),
                             pan: ev.pan.unwrap_or(0.0),
                             sample_id: sid,
                             offset: ev.offset.unwrap_or(part.sample_offset),
@@ -132,7 +132,7 @@ pub(crate) fn build_template(
                         rel_row: ev.row,
                         dur_rows: dur_beats * subs,
                         pitch_hz: base_hz * fp_ratio,
-                        vol: ev.vol.unwrap_or(100.0),
+                        vol: ev.vol.or(part.default_vol).unwrap_or(100.0),
                         pan: ev.pan.unwrap_or(0.0),
                         sample_id: sid,
                         offset: ev.offset.unwrap_or(part.sample_offset),
@@ -150,7 +150,7 @@ pub(crate) fn build_template(
             // Path 2: VST instrument sidecar.
             if let Some(inst) = vst_instruments.get(lookup_path) {
                 let pitch = ev.pitch_midi.unwrap_or(60).clamp(0, 127) as u8;
-                let vol_pct = ev.vol.unwrap_or(100.0).clamp(0.0, 100.0);
+                let vol_pct = ev.vol.or(part.default_vol).unwrap_or(100.0).clamp(0.0, 100.0);
                 let vel = (vol_pct * 127.0 / 100.0).round().clamp(1.0, 127.0) as u8;
                 vst_notes.push(VstNoteProto {
                     rel_row: ev.row,
@@ -166,7 +166,7 @@ pub(crate) fn build_template(
             // Path 3: SF2 engine spec — composite key.
             if let Some(spec) = sf2_engine_specs.get(&sf2_key_str) {
                 let pitch = ev.pitch_midi.unwrap_or(60).clamp(0, 127) as u8;
-                let vol_pct = ev.vol.unwrap_or(100.0).clamp(0.0, 100.0);
+                let vol_pct = ev.vol.or(part.default_vol).unwrap_or(100.0).clamp(0.0, 100.0);
                 let vel = (vol_pct * 127.0 / 100.0).round().clamp(1.0, 127.0) as u8;
                 vst_notes.push(VstNoteProto {
                     rel_row: ev.row,
@@ -182,7 +182,7 @@ pub(crate) fn build_template(
             // Fallback: internal renderer — composite key.
             if let Some(inst) = sf2_instruments.get(&sf2_key_str) {
                 let key = ev.pitch_midi.unwrap_or(60).clamp(0, 127) as u8;
-                let vel_pct = ev.vol.unwrap_or(100.0).clamp(0.0, 100.0);
+                let vel_pct = ev.vol.or(part.default_vol).unwrap_or(100.0).clamp(0.0, 100.0);
                 let vel = (vel_pct * 127.0 / 100.0).round().clamp(0.0, 127.0) as u8;
                 if let Some(spec) = inst.resolve(key, vel, fp_cents) {
                     if samples.contains_key(&spec.sample_id) {
@@ -190,7 +190,7 @@ pub(crate) fn build_template(
                             rel_row: ev.row,
                             dur_rows: dur_beats * subs,
                             pitch_hz: spec.pitch_hz,
-                            vol: ev.vol.unwrap_or(100.0),
+                            vol: ev.vol.or(part.default_vol).unwrap_or(100.0),
                             pan: ev.pan.unwrap_or(0.0),
                             sample_id: spec.sample_id,
                             offset: ev.offset.unwrap_or(part.sample_offset),
@@ -223,4 +223,67 @@ pub(crate) fn build_template(
         }
     }
     PartTemplate { voices, vst_notes }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::formats::halotext::model::HalotextEvent;
+
+    fn part(default_vol: Option<f64>) -> HalotextPart {
+        HalotextPart {
+            name: "P".into(),
+            sample_path: "P.wav".into(),
+            beats_per_measure: 4,
+            subs_per_beat: 4,
+            len_beats: None,
+            sample_offset: 0,
+            preset: None,
+            bank: None,
+            src_bpm: None,
+            events: vec![HalotextEvent { row: 0.0, ..Default::default() }],
+            measures: Vec::new(),
+            section_lengths: Vec::new(),
+            default_vol,
+            default_pan: None,
+            default_dur: None,
+            shims: Vec::new(),
+            slicex: None,
+        }
+    }
+
+    fn build(p: &HalotextPart) -> PartTemplate {
+        let sample = Arc::new(Sample {
+            left: vec![0.0; 4],
+            right: vec![0.0; 4],
+            stereo: false,
+            rate: 44_100.0,
+            loop_pts: None,
+        });
+        build_template(
+            p,
+            &HashMap::from([(p.sample_path.clone(), 1)]),
+            &HashMap::from([(1, sample)]),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+    }
+
+    #[test]
+    fn part_default_volume_applies_when_note_omits_it() {
+        let p = part(Some(50.0));
+        let tpl = build(&p);
+        assert_eq!(tpl.voices.len(), 1);
+        assert_eq!(tpl.voices[0].vol, 50.0);
+    }
+
+    #[test]
+    fn note_volume_overrides_part_default() {
+        let mut p = part(Some(50.0));
+        p.events[0].vol = Some(80.0);
+        let tpl = build(&p);
+        assert_eq!(tpl.voices[0].vol, 80.0);
+    }
 }
