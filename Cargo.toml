@@ -1,6 +1,6 @@
 [package]
 name = "circolate"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Halotext player and FL Studio/tracker converter"
 repository = "https://github.com/yourusername/circolate"
